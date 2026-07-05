@@ -1,0 +1,11 @@
+[package]
+name = "GorgeCompiler"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "GorgeCompiler"
+path = "src/main.rs"
+
+[dependencies]
+gorge_core = { path = "../GorgeCore" }

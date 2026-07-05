@@ -1,0 +1,12 @@
+# Rust
+/target/
+
+# 知识库
+/references/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
