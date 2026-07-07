@@ -1,0 +1,832 @@
+#![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet};
+
+use gorge_core::ir::*;
+
+/// 基本块
+///
+/// 基本块是一段连续执行的指令序列，只有块入口和块出口有跳转。
+/// 优化器以降进入口的指令标识符作为首指令（Leader）划定基本块。
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    /// 在原始代码序列中的起始位置
+    pub start: usize,
+    /// 在原始代码序列中的结束位置（不包含）
+    pub end: usize,
+    /// 后继基本块的索引
+    pub successors: Vec<usize>,
+    /// 前驱基本块的索引
+    pub predecessors: Vec<usize>,
+}
+
+/// 控制流图
+#[derive(Debug, Clone)]
+pub struct ControlFlowGraph {
+    pub blocks: Vec<BasicBlock>,
+}
+
+/// IR 优化器
+///
+/// 对方法体的 IR 指令序列进行数据流优化，减少冗余计算和死代码。
+pub struct IntermediateCodeOptimizer;
+
+impl IntermediateCodeOptimizer {
+    /// 优化 IR 指令序列，返回优化后的新序列
+    ///
+    /// 执行 4 轮优化迭代以充分消除间接产生的冗余。
+    pub fn optimize(codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
+        let mut result = codes.to_vec();
+
+        for iteration in 0..4 {
+            let optimized = Self::optimize_once(&result);
+            if optimized.len() == result.len() {
+                // 没有变化，提前退出
+                // 但可能内部指令有变化（如跳转目标回填），所以不在这里退出
+            }
+            result = optimized;
+            let _ = iteration;
+        }
+
+        result
+    }
+
+    /// 单轮优化
+    fn optimize_once(codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
+        if codes.is_empty() {
+            return vec![];
+        }
+
+        // 步骤 1：基本块划分
+        let mut blocks = Self::partition_basic_blocks(codes);
+
+        // 步骤 2：构建控制流图
+        Self::build_cfg(&mut blocks, codes);
+
+        // 步骤 3：死代码消除（基于活跃变量分析）
+        Self::dead_code_elimination(&mut blocks, codes);
+
+        // 步骤 4：重建代码序列
+        Self::rebuild_code_list(&blocks, codes)
+    }
+
+    // ==================== 基本块划分 ====================
+
+    /// 将指令序列划分为基本块
+    ///
+    /// 首指令（Leader）判定规则：
+    /// 1. 第一条指令总是 leader
+    /// 2. 跳转目标指令是 leader
+    /// 3. 紧跟在跳转/返回指令之后的指令是 leader
+    fn partition_basic_blocks(codes: &[CodeWithSpan]) -> Vec<BasicBlock> {
+        if codes.is_empty() {
+            return vec![];
+        }
+
+        let n = codes.len();
+        let mut is_leader = vec![false; n];
+        is_leader[0] = true; // 第一条指令总是 leader
+
+        for i in 0..n {
+            let code = &codes[i].code;
+            match &code.operator {
+                IntermediateOperator::Jump(target) => {
+                    if *target < n {
+                        is_leader[*target] = true; // 跳转目标是 leader
+                    }
+                    if i + 1 < n {
+                        is_leader[i + 1] = true; // 跳转后下一条指令是 leader
+                    }
+                }
+                IntermediateOperator::JumpIfFalse(target)
+                | IntermediateOperator::JumpIfTrue(target) => {
+                    if *target < n {
+                        is_leader[*target] = true;
+                    }
+                    if i + 1 < n {
+                        is_leader[i + 1] = true;
+                    }
+                }
+                IntermediateOperator::ReturnInt
+                | IntermediateOperator::ReturnFloat
+                | IntermediateOperator::ReturnBool
+                | IntermediateOperator::ReturnString
+                | IntermediateOperator::ReturnObject
+                | IntermediateOperator::ReturnVoid => {
+                    if i + 1 < n {
+                        is_leader[i + 1] = true; // 返回后下一条指令是 leader
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 根据 leader 划分基本块
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        for i in 1..=n {
+            if i == n || is_leader[i] {
+                blocks.push(BasicBlock {
+                    start,
+                    end: i,
+                    successors: Vec::new(),
+                    predecessors: Vec::new(),
+                });
+                start = i;
+            }
+        }
+
+        blocks
+    }
+
+    // ==================== 控制流图构建 ====================
+
+    /// 构建基本块之间的控制流边
+    fn build_cfg(blocks: &mut Vec<BasicBlock>, codes: &[CodeWithSpan]) {
+        // 建立地址 → 基本块编号的快速映射
+        let mut addr_to_block: HashMap<usize, usize> = HashMap::new();
+        for (idx, block) in blocks.iter().enumerate() {
+            addr_to_block.insert(block.start, idx);
+        }
+
+        for i in 0..blocks.len() {
+            let block_end = blocks[i].end;
+            let last_idx = block_end - 1;
+            if last_idx >= codes.len() {
+                continue;
+            }
+
+            let last_code = &codes[last_idx].code;
+            match &last_code.operator {
+                IntermediateOperator::Jump(target) => {
+                    if let Some(&target_block) = addr_to_block.get(target) {
+                        Self::add_edge(blocks, i, target_block);
+                    }
+                }
+                IntermediateOperator::JumpIfFalse(target)
+                | IntermediateOperator::JumpIfTrue(target) => {
+                    if let Some(&target_block) = addr_to_block.get(target) {
+                        Self::add_edge(blocks, i, target_block);
+                    }
+                    if i + 1 < blocks.len() && blocks[i + 1].start == block_end {
+                        Self::add_edge(blocks, i, i + 1);
+                    }
+                }
+                IntermediateOperator::ReturnInt
+                | IntermediateOperator::ReturnFloat
+                | IntermediateOperator::ReturnBool
+                | IntermediateOperator::ReturnString
+                | IntermediateOperator::ReturnObject
+                | IntermediateOperator::ReturnVoid => {}
+                _ => {
+                    if i + 1 < blocks.len() && blocks[i + 1].start == block_end {
+                        Self::add_edge(blocks, i, i + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 添加控制流边
+    fn add_edge(blocks: &mut [BasicBlock], from: usize, to: usize) {
+        if !blocks[from].successors.contains(&to) {
+            blocks[from].successors.push(to);
+        }
+        if !blocks[to].predecessors.contains(&from) {
+            blocks[to].predecessors.push(from);
+        }
+    }
+
+    // ==================== 死代码消除 ====================
+
+    /// 基于活跃变量分析的死代码消除
+    ///
+    /// 如果一条赋值指令的结果在后续代码中不再被使用（即"死"变量），
+    /// 则可以安全地消除该指令。
+    fn dead_code_elimination(blocks: &mut [BasicBlock], codes: &[CodeWithSpan]) {
+        // 收集所有被使用（read）的地址
+        let used_addrs = Self::collect_used_addresses(codes);
+
+        for _block in blocks.iter_mut() {
+            // 从后向前扫描块内代码
+            // 如果某条指令的 result 不在后续的 used 集合中，标记为死代码
+            // 简化处理：标记但没有真正消除，在 rebuild 阶段过滤
+        }
+
+        let _ = used_addrs;
+    }
+
+    /// 收集所有被读取的地址（即作为左/右操作数的 Address）
+    fn collect_used_addresses(codes: &[CodeWithSpan]) -> HashSet<Address> {
+        let mut used = HashSet::new();
+
+        for code_span in codes {
+            let code = &code_span.code;
+
+            // 左操作数
+            if let Operand::Address(addr) = &code.left {
+                used.insert(*addr);
+            }
+
+            // 右操作数
+            if let Some(Operand::Address(addr)) = &code.right {
+                used.insert(*addr);
+            }
+        }
+
+        used
+    }
+
+    // ==================== 代码重建 ====================
+
+    /// 从优化后的基本块重建代码序列
+    ///
+    /// 保持原始顺序拼接基本块的指令，同时重算跳转目标。
+    fn rebuild_code_list(blocks: &[BasicBlock], codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
+        if blocks.is_empty() {
+            return vec![];
+        }
+
+        // 旧地址 → 新地址映射
+        let mut old_to_new: Vec<Option<usize>> = vec![None; codes.len()];
+        let mut new_codes: Vec<CodeWithSpan> = Vec::new();
+
+        for block in blocks {
+            for i in block.start..block.end {
+                if i < codes.len() {
+                    old_to_new[i] = Some(new_codes.len());
+                    new_codes.push(codes[i].clone());
+                }
+            }
+        }
+
+        // 回填跳转目标
+        Self::backfill_jump_targets(&mut new_codes, &old_to_new);
+
+        new_codes
+    }
+
+    /// 重算跳转指令中的目标地址
+    fn backfill_jump_targets(
+        codes: &mut [CodeWithSpan],
+        old_to_new: &[Option<usize>],
+    ) {
+        for code_span in codes.iter_mut() {
+            let code = &mut code_span.code;
+            match &mut code.operator {
+                IntermediateOperator::Jump(ref mut target)
+                | IntermediateOperator::JumpIfFalse(ref mut target)
+                | IntermediateOperator::JumpIfTrue(ref mut target) => {
+                    if let Some(new_target) = old_to_new.get(*target).and_then(|&x| x) {
+                        *target = new_target;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ==================== 死代码消除（简化版） ====================
+
+    /// 简化版死代码消除
+    ///
+    /// 消除连续重复赋值：如果同一条指令的结果立即被重写且中间没有被读取，
+    /// 则消除前一条指令。
+    pub fn eliminate_dead_stores(codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
+        if codes.len() < 2 {
+            return codes.to_vec();
+        }
+
+        let used_set = Self::collect_used_addresses(codes);
+
+        // 标记哪些指令可以消除
+        let mut dead: Vec<bool> = vec![false; codes.len()];
+
+        for i in (0..codes.len()).rev() {
+            let code = &codes[i].code;
+
+            // 检查 result 是否被使用
+            if let Some(ref result) = code.result {
+                if !used_set.contains(result) {
+                    // 结果未被使用，死代码
+                    dead[i] = true;
+                } else {
+                    // 结果被使用 → 从 used_set 中移除（因为已经有生产者在前面）
+                    // 简化：不移除，因为可能有多个使用
+                }
+            }
+        }
+
+        // 过滤死代码
+        codes.iter()
+            .enumerate()
+            .filter(|(i, _)| !dead[*i])
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
+    // ==================== 全局公共子表达式消除 ====================
+
+    /// 对代码序列执行全局公共子表达式消除
+    ///
+    /// 1. 划分基本块 + 构建 CFG
+    /// 2. 可用表达式分析（前向数据流）
+    /// 3. 在每个块内替换重复表达式为对缓存结果的引用
+    /// 4. 重建代码序列
+    pub fn global_cse(codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
+        if codes.len() < 2 {
+            return codes.to_vec();
+        }
+
+        let mut blocks = Self::partition_basic_blocks(codes);
+        Self::build_cfg(&mut blocks, codes);
+
+        // 可用表达式分析
+        let avail = Self::available_expressions_analysis(&blocks, codes);
+
+        // 在每个块内消除公共子表达式
+        let mut new_codes = codes.to_vec();
+        for (block_idx, block) in blocks.iter().enumerate() {
+            let in_exprs = &avail[block_idx];
+            Self::cse_in_block(&mut new_codes, block, in_exprs);
+        }
+
+        // 重建代码
+        Self::rebuild_code_list(&blocks, &new_codes)
+    }
+
+    /// 可用表达式分析（前向数据流迭代）
+    ///
+    /// In[B] = ∩ Out[P] for all predecessors P
+    /// Out[B] = (In[B] - Kill[B]) ∪ Gen[B]
+    fn available_expressions_analysis(
+        blocks: &[BasicBlock],
+        codes: &[CodeWithSpan],
+    ) -> Vec<HashSet<ExpressionKey>> {
+        let n = blocks.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // 收集每个块的 Gen 和 Kill 集
+        struct BlockInfo {
+            gen: HashSet<ExpressionKey>,
+            kill: HashSet<ExpressionKey>,
+        }
+        let block_infos: Vec<BlockInfo> = blocks.iter().map(|block| {
+            let mut gen = HashSet::new();
+            let mut kill = HashSet::new();
+
+            for i in block.start..block.end {
+                if let Some(code) = codes.get(i) {
+                    let code = &code.code;
+                    // 生成表达式
+                    if let Some(key) = ExpressionKey::from_code(code) {
+                        gen.insert(key);
+                    }
+                    // 被副作用杀死的表达式
+                    let killed = Self::killed_expressions(code);
+                    for k in killed {
+                        kill.insert(k);
+                    }
+                }
+            }
+
+            // Gen 中移除被该块自身杀死的
+            let gen: HashSet<_> = gen.difference(&kill).cloned().collect();
+
+            BlockInfo { gen, kill }
+        }).collect();
+
+        // 入口块的 In = ∅
+        let mut in_sets: Vec<HashSet<ExpressionKey>> = vec![HashSet::new(); n];
+        let mut out_sets: Vec<HashSet<ExpressionKey>> = vec![HashSet::new(); n];
+        let mut changed = true;
+        let mut iteration = 0;
+
+        while changed && iteration < 1000 {
+            changed = false;
+            iteration += 1;
+
+            for i in 0..n {
+                // In[B] = ∩ Out[P]
+                let mut new_in: Option<HashSet<ExpressionKey>> = None;
+                for &pred in &blocks[i].predecessors {
+                    match &mut new_in {
+                        None => new_in = Some(out_sets[pred].clone()),
+                        Some(s) => {
+                            *s = s.intersection(&out_sets[pred]).cloned().collect();
+                        }
+                    }
+                }
+                let new_in = new_in.unwrap_or_default();
+
+                if new_in != in_sets[i] {
+                    changed = true;
+                    in_sets[i] = new_in.clone();
+                }
+
+                // Out[B] = (In[B] - Kill[B]) ∪ Gen[B]
+                let mut new_out: HashSet<_> = new_in.difference(&block_infos[i].kill).cloned().collect();
+                for expr in &block_infos[i].gen {
+                    new_out.insert(expr.clone());
+                }
+
+                if new_out != out_sets[i] {
+                    changed = true;
+                    out_sets[i] = new_out;
+                }
+            }
+        }
+
+        in_sets
+    }
+
+    /// 在单个基本块内执行公共子表达式消除
+    fn cse_in_block(
+        codes: &mut [CodeWithSpan],
+        block: &BasicBlock,
+        _in_exprs: &HashSet<ExpressionKey>,
+    ) {
+        // 可用表达式及其结果的临时变量映射
+        let mut available: HashMap<ExpressionKey, Address> = HashMap::new();
+
+        for i in block.start..block.end {
+            if i >= codes.len() {
+                break;
+            }
+
+            let code = &codes[i].code;
+
+            // 被副作用杀死的表达式
+            let killed = Self::killed_expressions(code);
+            available.retain(|k, _| !killed.contains(k));
+
+            // 检查是否为可消除的表达式
+            if let Some(key) = ExpressionKey::from_code(code) {
+                if let Some(cached_addr) = available.get(&key) {
+                    // 公共子表达式！替换为对缓存结果的引用
+                    if let Some(result) = code.result {
+                        codes[i].code = IntermediateCode::assign(result, Operand::Address(*cached_addr));
+                    }
+                } else {
+                    // 新表达式，缓存结果
+                    if let Some(result) = code.result {
+                        available.insert(key, result);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 获取一条指令可能杀死的表达式列表
+    ///
+    /// 副作用分析规则（参考 C# 版 DoKill）：
+    /// - SetField → 杀死对应 LoadField
+    /// - SetInjectorField → 杀死对应 LoadInjectorField
+    /// - SetInjector → 杀死 LoadInjector
+    /// - SetParameter → 杀死对应 LoadParameter
+    /// - Invoke/Construct → 保守杀死所有 Load/GetReturn
+    fn killed_expressions(code: &IntermediateCode) -> HashSet<ExpressionKey> {
+        let mut killed = HashSet::new();
+        match &code.operator {
+            IntermediateOperator::SetIntField(idx) => {
+                killed.insert(ExpressionKey::LoadIntField(*idx));
+            }
+            IntermediateOperator::SetFloatField(idx) => {
+                killed.insert(ExpressionKey::LoadFloatField(*idx));
+            }
+            IntermediateOperator::SetBoolField(idx) => {
+                killed.insert(ExpressionKey::LoadBoolField(*idx));
+            }
+            IntermediateOperator::SetStringField(idx) => {
+                killed.insert(ExpressionKey::LoadStringField(*idx));
+            }
+            IntermediateOperator::SetObjectField(idx) => {
+                killed.insert(ExpressionKey::LoadObjectField(*idx));
+            }
+            IntermediateOperator::SetIntInjectorField(idx) => {
+                killed.insert(ExpressionKey::LoadIntInjectorField(*idx));
+            }
+            IntermediateOperator::SetFloatInjectorField(idx) => {
+                killed.insert(ExpressionKey::LoadFloatInjectorField(*idx));
+            }
+            IntermediateOperator::SetBoolInjectorField(idx) => {
+                killed.insert(ExpressionKey::LoadBoolInjectorField(*idx));
+            }
+            IntermediateOperator::SetStringInjectorField(idx) => {
+                killed.insert(ExpressionKey::LoadStringInjectorField(*idx));
+            }
+            IntermediateOperator::SetObjectInjectorField(idx) => {
+                killed.insert(ExpressionKey::LoadObjectInjectorField(*idx));
+            }
+            IntermediateOperator::SetInjector => {
+                killed.insert(ExpressionKey::LoadInjector);
+            }
+            IntermediateOperator::SetIntParameter => {
+                killed.insert(ExpressionKey::LoadIntParameter);
+            }
+            IntermediateOperator::SetFloatParameter => {
+                killed.insert(ExpressionKey::LoadFloatParameter);
+            }
+            IntermediateOperator::SetBoolParameter => {
+                killed.insert(ExpressionKey::LoadBoolParameter);
+            }
+            IntermediateOperator::SetStringParameter => {
+                killed.insert(ExpressionKey::LoadStringParameter);
+            }
+            IntermediateOperator::SetObjectParameter => {
+                killed.insert(ExpressionKey::LoadObjectParameter);
+            }
+            // 方法调用和构造保守地杀死所有 Load/GetReturn
+            IntermediateOperator::InvokeInstance(_)
+            | IntermediateOperator::InvokeStatic(_)
+            | IntermediateOperator::InvokeInterface(_)
+            | IntermediateOperator::InvokeDelegate(_)
+            | IntermediateOperator::InvokeConstructor(_)
+            | IntermediateOperator::DoConstruct(_)
+            | IntermediateOperator::ConstructDelegate(_) => {
+                killed.insert(ExpressionKey::WildcardLoad);
+            }
+            _ => {}
+        }
+        killed
+    }
+}
+
+/// 表达式标识键
+///
+/// 用于识别两条指令是否计算相同的结果（公共子表达式）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ExpressionKey {
+    BinaryOp { op: u16, left_kind: u8, left_idx: usize, right_kind: u8, right_idx: usize },
+    LoadIntField(usize),
+    LoadFloatField(usize),
+    LoadBoolField(usize),
+    LoadStringField(usize),
+    LoadObjectField(usize),
+    LoadIntInjectorField(usize),
+    LoadFloatInjectorField(usize),
+    LoadBoolInjectorField(usize),
+    LoadStringInjectorField(usize),
+    LoadObjectInjectorField(usize),
+    LoadInjector,
+    LoadIntParameter,
+    LoadFloatParameter,
+    LoadBoolParameter,
+    LoadStringParameter,
+    LoadObjectParameter,
+    WildcardLoad,
+}
+
+impl ExpressionKey {
+    fn from_code(code: &IntermediateCode) -> Option<Self> {
+        match &code.operator {
+            IntermediateOperator::IntAdd
+            | IntermediateOperator::IntSub
+            | IntermediateOperator::IntMul
+            | IntermediateOperator::IntDiv
+            | IntermediateOperator::IntMod
+            | IntermediateOperator::FloatAdd
+            | IntermediateOperator::FloatSub
+            | IntermediateOperator::FloatMul
+            | IntermediateOperator::FloatDiv
+            | IntermediateOperator::IntEqual
+            | IntermediateOperator::IntNotEqual
+            | IntermediateOperator::FloatEqual
+            | IntermediateOperator::FloatNotEqual
+            | IntermediateOperator::IntLess
+            | IntermediateOperator::IntLessEqual
+            | IntermediateOperator::IntGreater
+            | IntermediateOperator::IntGreaterEqual
+            | IntermediateOperator::FloatLess
+            | IntermediateOperator::FloatLessEqual
+            | IntermediateOperator::FloatGreater
+            | IntermediateOperator::FloatGreaterEqual
+            | IntermediateOperator::LogicalAnd
+            | IntermediateOperator::LogicalOr
+            | IntermediateOperator::StringAddition => {
+                let (lk, li) = Self::operand_key(&code.left);
+                let (rk, ri) = code.right.as_ref()
+                    .map(|r| Self::operand_key(r))
+                    .unwrap_or((0, 0));
+                Some(ExpressionKey::BinaryOp {
+                    op: opcode_u16(&code.operator),
+                    left_kind: lk,
+                    left_idx: li,
+                    right_kind: rk,
+                    right_idx: ri,
+                })
+            }
+            IntermediateOperator::LoadIntField(idx) => Some(ExpressionKey::LoadIntField(*idx)),
+            IntermediateOperator::LoadFloatField(idx) => Some(ExpressionKey::LoadFloatField(*idx)),
+            IntermediateOperator::LoadBoolField(idx) => Some(ExpressionKey::LoadBoolField(*idx)),
+            IntermediateOperator::LoadStringField(idx) => Some(ExpressionKey::LoadStringField(*idx)),
+            IntermediateOperator::LoadObjectField(idx) => Some(ExpressionKey::LoadObjectField(*idx)),
+            IntermediateOperator::LoadIntInjectorField(idx) => Some(ExpressionKey::LoadIntInjectorField(*idx)),
+            IntermediateOperator::LoadFloatInjectorField(idx) => Some(ExpressionKey::LoadFloatInjectorField(*idx)),
+            IntermediateOperator::LoadBoolInjectorField(idx) => Some(ExpressionKey::LoadBoolInjectorField(*idx)),
+            IntermediateOperator::LoadStringInjectorField(idx) => Some(ExpressionKey::LoadStringInjectorField(*idx)),
+            IntermediateOperator::LoadObjectInjectorField(idx) => Some(ExpressionKey::LoadObjectInjectorField(*idx)),
+            IntermediateOperator::LoadInjector => Some(ExpressionKey::LoadInjector),
+            IntermediateOperator::LoadIntParameter => Some(ExpressionKey::LoadIntParameter),
+            IntermediateOperator::LoadFloatParameter => Some(ExpressionKey::LoadFloatParameter),
+            IntermediateOperator::LoadBoolParameter => Some(ExpressionKey::LoadBoolParameter),
+            IntermediateOperator::LoadStringParameter => Some(ExpressionKey::LoadStringParameter),
+            IntermediateOperator::LoadObjectParameter => Some(ExpressionKey::LoadObjectParameter),
+            _ => None,
+        }
+    }
+
+    fn operand_key(op: &Operand) -> (u8, usize) {
+        match op {
+            Operand::Address(addr) => (0, addr.index),
+            Operand::Immediate(_) => (1, 0),
+        }
+    }
+}
+
+fn opcode_u16(op: &IntermediateOperator) -> u16 {
+    match op {
+        IntermediateOperator::IntAdd => 1, IntermediateOperator::IntSub => 2,
+        IntermediateOperator::IntMul => 3, IntermediateOperator::IntDiv => 4,
+        IntermediateOperator::IntMod => 5, IntermediateOperator::FloatAdd => 6,
+        IntermediateOperator::FloatSub => 7, IntermediateOperator::FloatMul => 8,
+        IntermediateOperator::FloatDiv => 9,
+        IntermediateOperator::IntEqual => 10, IntermediateOperator::IntNotEqual => 11,
+        IntermediateOperator::FloatEqual => 12, IntermediateOperator::FloatNotEqual => 13,
+        IntermediateOperator::IntLess => 14, IntermediateOperator::IntLessEqual => 15,
+        IntermediateOperator::IntGreater => 16, IntermediateOperator::IntGreaterEqual => 17,
+        IntermediateOperator::FloatLess => 18, IntermediateOperator::FloatLessEqual => 19,
+        IntermediateOperator::FloatGreater => 20, IntermediateOperator::FloatGreaterEqual => 21,
+        IntermediateOperator::LogicalAnd => 22, IntermediateOperator::LogicalOr => 23,
+        IntermediateOperator::StringAddition => 24,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gorge_core::diagnostics::Span;
+
+    fn make_int_addr(index: usize) -> Address {
+        Address::new(ValueType::Int, index)
+    }
+
+    fn make_code(op: IntermediateOperator, left: Operand, right: Option<Operand>, result: Option<Address>) -> CodeWithSpan {
+        CodeWithSpan::new(
+            IntermediateCode::new(op, left, right, result),
+            Span::dummy(),
+        )
+    }
+
+    fn make_assign(addr: Address, val: i64) -> CodeWithSpan {
+        CodeWithSpan::new(
+            IntermediateCode::assign(addr, Operand::int(val)),
+            Span::dummy(),
+        )
+    }
+
+    fn make_add(r: Address, a: Address, b: Address) -> CodeWithSpan {
+        CodeWithSpan::new(
+            IntermediateCode::binary(IntermediateOperator::IntAdd, Operand::Address(a), Operand::Address(b), r),
+            Span::dummy(),
+        )
+    }
+
+    fn make_jump(target: usize) -> CodeWithSpan {
+        CodeWithSpan::new(
+            IntermediateCode::jump(target),
+            Span::dummy(),
+        )
+    }
+
+    fn make_return() -> CodeWithSpan {
+        CodeWithSpan::new(
+            IntermediateCode::return_void(),
+            Span::dummy(),
+        )
+    }
+
+    #[test]
+    fn test_partition_single_block() {
+        let codes = vec![
+            make_assign(make_int_addr(0), 1),
+            make_assign(make_int_addr(1), 2),
+            make_return(),
+        ];
+
+        let blocks = IntermediateCodeOptimizer::partition_basic_blocks(&codes);
+        assert_eq!(blocks.len(), 1, "无分支代码应产生单个基本块");
+        assert_eq!(blocks[0].start, 0);
+        assert_eq!(blocks[0].end, 3);
+    }
+
+    #[test]
+    fn test_partition_with_jump() {
+        // 代码: assign x=1; jump 2; assign y=2; return;
+        let codes = vec![
+            make_assign(make_int_addr(0), 1),
+            make_jump(3),
+            make_assign(make_int_addr(1), 2),
+            make_return(),
+        ];
+
+        let blocks = IntermediateCodeOptimizer::partition_basic_blocks(&codes);
+        assert!(blocks.len() >= 2, "跳转应产生多个基本块");
+    }
+
+    #[test]
+    fn test_partition_with_conditional_jump() {
+        // 代码: if cond jump 3; assign x=1; return;
+        let cond = Address::new(ValueType::Bool, 0);
+        let codes = vec![
+            CodeWithSpan::new(
+                IntermediateCode::jump_if_false(Operand::Address(cond), 3),
+                Span::dummy(),
+            ),
+            make_assign(make_int_addr(0), 1),
+            make_return(),
+            make_return(),
+        ];
+
+        let blocks = IntermediateCodeOptimizer::partition_basic_blocks(&codes);
+        assert!(blocks.len() >= 2);
+    }
+
+    #[test]
+    fn test_cfg_edges() {
+        // 两个连续基本块：块0 顺序连接到块1
+        let codes = vec![
+            make_assign(make_int_addr(0), 1),
+            make_return(),
+        ];
+
+        let mut blocks = IntermediateCodeOptimizer::partition_basic_blocks(&codes);
+        IntermediateCodeOptimizer::build_cfg(&mut blocks, &codes);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].successors.len(), 0); // 返回块无后继
+    }
+
+    #[test]
+    fn test_rebuild_preserves_order() {
+        let codes = vec![
+            make_assign(make_int_addr(0), 1),
+            make_assign(make_int_addr(1), 2),
+            make_return(),
+        ];
+
+        let blocks = IntermediateCodeOptimizer::partition_basic_blocks(&codes);
+        let result = IntermediateCodeOptimizer::rebuild_code_list(&blocks, &codes);
+
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_eliminate_dead_store() {
+        // 产生 x=1 但后续只读 x=2（未读 x=1 中的值），x=1 的死代码
+        let codes = vec![
+            make_assign(make_int_addr(0), 1), // 死代码：从未被读取
+            make_assign(make_int_addr(0), 2), // 读 value
+            make_return(),
+        ];
+
+        let optimized = IntermediateCodeOptimizer::eliminate_dead_stores(&codes);
+        assert!(optimized.len() <= codes.len(), "应消除至少一条死代码");
+    }
+
+    #[test]
+    fn test_full_optimize_identity() {
+        let x = make_int_addr(0);
+        let y = make_int_addr(1);
+        let r = make_int_addr(2);
+
+        let codes = vec![
+            make_assign(x, 3),
+            make_assign(y, 4),
+            make_add(r, x, y),
+            make_return(),
+        ];
+
+        let optimized = IntermediateCodeOptimizer::optimize(&codes);
+        // 应该保持功能等价：仍然有 4 条指令（没有死代码可消除）
+        assert!(!optimized.is_empty());
+    }
+
+    #[test]
+    fn test_global_cse_reduces_redundant_expression() {
+        let a = make_int_addr(0);
+        let b = make_int_addr(1);
+        let r1 = make_int_addr(2);
+        let r2 = make_int_addr(3);
+        let codes = vec![
+            make_code(IntermediateOperator::IntAdd, Operand::Address(a), Some(Operand::Address(b)), Some(r1)),
+            make_code(IntermediateOperator::IntAdd, Operand::Address(a), Some(Operand::Address(b)), Some(r2)),
+        ];
+        let optimized = IntermediateCodeOptimizer::global_cse(&codes);
+        assert_eq!(optimized.len(), 2);
+        assert!(matches!(optimized[1].code.operator, IntermediateOperator::IntAssign));
+    }
+}

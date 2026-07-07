@@ -1,0 +1,171 @@
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use crate::declaration::ClassDeclaration;
+use crate::ir::CompiledMethod;
+use crate::object::GorgeObject;
+use crate::value_pool::FixedFieldValuePool;
+
+/// Gorge 类的 trait
+///
+/// 负责方法分发、构造方法调用、Injector 默认值管理。
+pub trait GorgeClass: Debug + Send + Sync {
+    /// 获取类声明元数据
+    fn declaration(&self) -> &ClassDeclaration;
+    /// 获取父类
+    fn super_class(&self) -> Option<&Arc<dyn GorgeClass>>;
+
+    /// 调用实例方法
+    fn invoke_method(&self, obj: &mut dyn GorgeObject, method_id: usize);
+    /// 调用静态方法
+    fn invoke_static_method(&self, method_id: usize);
+    /// 调用构造方法，返回新对象
+    fn invoke_constructor(&self, ctor_id: usize) -> Box<dyn GorgeObject>;
+    /// 在已有对象上执行构造
+    fn do_construct(&self, target: &mut dyn GorgeObject, ctor_id: usize);
+
+    /// Injector 整数字段默认值
+    fn get_injector_int_default(&self, _index: usize) -> i64 { 0 }
+    fn get_injector_float_default(&self, _index: usize) -> f64 { 0.0 }
+    fn get_injector_bool_default(&self, _index: usize) -> bool { false }
+    fn get_injector_string_default(&self, _index: usize) -> String { String::new() }
+    fn get_injector_object_default(&self, _index: usize) -> usize { 0 }
+}
+
+/// 编译生成的运行时类
+///
+/// 对应 C# 的 CompiledGorgeClass，持有方法/构造方法的编译实现（IR 字节码）。
+#[derive(Debug, Clone)]
+pub struct RuntimeClass {
+    pub declaration: ClassDeclaration,
+    pub super_class: Option<Arc<RuntimeClass>>,
+    /// 实例方法实现映射：method_id → CompiledMethod
+    pub method_impls: HashMap<usize, CompiledMethod>,
+    /// 静态方法实现映射
+    pub static_method_impls: HashMap<usize, CompiledMethod>,
+    /// 构造方法实现映射
+    pub constructor_impls: HashMap<usize, CompiledMethod>,
+    /// Injector 字段默认值池
+    pub injector_defaults: FixedFieldValuePool,
+}
+
+impl RuntimeClass {
+    pub fn new(declaration: ClassDeclaration, super_class: Option<Arc<RuntimeClass>>) -> Self {
+        let defaults = FixedFieldValuePool::new(&declaration.injector_field_default_value_type_count);
+        Self {
+            declaration,
+            super_class,
+            method_impls: HashMap::new(),
+            static_method_impls: HashMap::new(),
+            constructor_impls: HashMap::new(),
+            injector_defaults: defaults,
+        }
+    }
+
+    /// 注册方法实现
+    pub fn register_method(&mut self, method_id: usize, code: CompiledMethod) {
+        self.method_impls.insert(method_id, code);
+    }
+}
+
+impl GorgeClass for RuntimeClass {
+    fn declaration(&self) -> &ClassDeclaration {
+        &self.declaration
+    }
+
+    fn super_class(&self) -> Option<&Arc<dyn GorgeClass>> {
+        // RuntimeClass 不是 dyn GorgeClass，需要转换。简化返回 None。
+        None
+    }
+
+    fn invoke_method(&self, _obj: &mut dyn GorgeObject, _method_id: usize) {
+        // 查找方法实现并执行
+    }
+
+    fn invoke_static_method(&self, _method_id: usize) {
+        // 查找静态方法实现并执行
+    }
+
+    fn invoke_constructor(&self, _ctor_id: usize) -> Box<dyn GorgeObject> {
+        // 创建对象 + 执行构造方法
+        Box::new(crate::object::RuntimeObject::new(Arc::new(self.clone())))
+    }
+
+    fn do_construct(&self, _target: &mut dyn GorgeObject, _ctor_id: usize) {
+        // 在已有对象上执行构造初始化
+    }
+
+    fn get_injector_int_default(&self, index: usize) -> i64 {
+        self.injector_defaults.get_int(index)
+    }
+
+    fn get_injector_float_default(&self, index: usize) -> f64 {
+        self.injector_defaults.get_float(index)
+    }
+
+    fn get_injector_bool_default(&self, index: usize) -> bool {
+        self.injector_defaults.get_bool(index)
+    }
+
+    fn get_injector_string_default(&self, index: usize) -> String {
+        self.injector_defaults.get_string(index).to_string()
+    }
+
+    fn get_injector_object_default(&self, index: usize) -> usize {
+        self.injector_defaults.get_object(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{GorgeType, TypeCount};
+    use std::collections::HashMap;
+
+    fn make_dummy_class() -> RuntimeClass {
+        RuntimeClass::new(
+            ClassDeclaration {
+                class_type: GorgeType::class("Test", None),
+                is_native: false,
+                annotations: vec![],
+                fields: vec![],
+                methods: vec![],
+                static_methods: vec![],
+                constructors: vec![],
+                injector_fields: vec![],
+                super_class: None,
+                super_interfaces: vec![],
+                field_type_count: TypeCount::zero(),
+                method_count: 0,
+                static_method_count: 0,
+                constructor_count: 0,
+                injector_field_type_count: TypeCount::zero(),
+                injector_field_default_value_type_count: TypeCount::zero(),
+                method_start_id: 0,
+                constructor_start_id: 0,
+                interface_method_impl_id: HashMap::new(),
+                method_override_id: HashMap::new(),
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn test_runtime_class_construction() {
+        let cls = make_dummy_class();
+        assert_eq!(cls.declaration().class_type.full_name(), "Test");
+    }
+
+    #[test]
+    fn test_register_method() {
+        let mut cls = make_dummy_class();
+        let method = CompiledMethod {
+            name: "test".into(),
+            codes: vec![],
+            local_count: 0,
+        };
+        cls.register_method(0, method);
+        assert!(cls.method_impls.contains_key(&0));
+    }
+}

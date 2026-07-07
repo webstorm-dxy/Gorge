@@ -1,0 +1,1966 @@
+#![allow(dead_code)]
+
+use gorge_core::diagnostics::{Diagnostics, Span};
+
+use crate::ast::*;
+use crate::lexer::{Token, TokenSpan};
+
+// === Pratt 解析器优先级常量 ===
+
+/// 无优先级（哨兵值）
+const PREC_NONE: u8 = 0;
+/// 赋值运算符 `=`, `+=`, `-=`, `*=`, `/=`, `%=`
+const PREC_ASSIGNMENT: u8 = 1;
+/// 条件表达式 `?:`
+const PREC_CONDITIONAL: u8 = 2;
+/// 逻辑或 `||`
+const PREC_LOGICAL_OR: u8 = 3;
+/// 逻辑与 `&&`
+const PREC_LOGICAL_AND: u8 = 4;
+/// 相等比较 `==`, `!=`
+const PREC_EQUALITY: u8 = 5;
+/// 大小比较 `<`, `<=`, `>`, `>=`
+const PREC_COMPARISON: u8 = 6;
+/// 加减 `+`, `-`
+const PREC_ADDITION: u8 = 7;
+/// 乘除取模 `*`, `/`, `%`
+const PREC_MULTIPLICATION: u8 = 8;
+/// 一元前缀 `-`, `!`, 强制转换
+const PREC_UNARY: u8 = 9;
+/// 后缀操作 `.` `()` `[]`
+const PREC_POSTFIX: u8 = 10;
+/// 主表达式（字面量、标识符、`new` 等）
+const PREC_PRIMARY: u8 = 11;
+
+/// 递归下降语法分析器
+///
+/// 使用 Pratt 解析算法处理表达式，手写递归下降处理语句和顶层声明。
+/// 参考 C# 版本的 Gorge.g4 / GorgeExpression.g4 / GorgeStatement.g4 语法规则。
+pub struct Parser {
+    /// Token 序列
+    tokens: Vec<TokenSpan>,
+    /// 当前读取位置
+    pos: usize,
+    /// 诊断信息收集器
+    diagnostics: Diagnostics,
+}
+
+impl Parser {
+    /// 创建新的解析器实例
+    pub fn new(tokens: Vec<TokenSpan>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            diagnostics: Diagnostics::new(),
+        }
+    }
+
+    // ==================== 辅助方法 ====================
+
+    /// 查看当前 token，不移动位置
+    fn peek(&self) -> Option<&TokenSpan> {
+        self.tokens.get(self.pos)
+    }
+
+    /// 查看向前第 n 个 token（n=0 等同于 peek）
+    fn peek_ahead(&self, n: usize) -> Option<&TokenSpan> {
+        self.tokens.get(self.pos + n)
+    }
+
+    /// 消费当前 token 并返回，位置前进 1
+    fn advance(&mut self) -> Option<TokenSpan> {
+        let token = self.tokens.get(self.pos).cloned();
+        if token.is_some() {
+            self.pos += 1;
+        }
+        token
+    }
+
+    /// 当前 token 是否匹配指定类型
+    fn check(&self, token: &Token) -> bool {
+        matches!(self.peek().map(|t| &t.token), Some(t) if std::mem::discriminant(t) == std::mem::discriminant(token))
+    }
+
+    /// 检查当前 token 是否为关键字（用于语句解析分派）
+    fn check_keyword(&self, keyword: &Token) -> bool {
+        self.check(keyword)
+    }
+
+    /// 检查当前 token 是否为标识符
+    fn check_identifier(&self) -> bool {
+        matches!(self.peek().map(|t| &t.token), Some(Token::Identifier(_)))
+    }
+
+    /// 获取当前标识符名称（如果是标识符的话）
+    fn peek_identifier_name(&self) -> Option<&str> {
+        match self.peek() {
+            Some(TokenSpan { token: Token::Identifier(name), .. }) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// 是否已到达 token 流末尾
+    fn is_at_end(&self) -> bool {
+        self.pos >= self.tokens.len()
+    }
+
+    /// 尝试匹配指定 token 类型，匹配成功则消费并返回 true
+    fn match_token(&mut self, token: &Token) -> bool {
+        if self.check(token) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 尝试匹配标识符并返回其名称
+    fn match_identifier(&mut self) -> Option<String> {
+        match self.peek() {
+            Some(TokenSpan { token: Token::Identifier(name), .. }) => {
+                let name = name.clone();
+                self.advance();
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+
+    /// 期望当前 token 为指定类型，匹配成功则消费返回，失败则产生错误
+    fn expect(&mut self, expected: &str) -> Result<TokenSpan, ()> {
+        if self.is_at_end() {
+            let span = self.last_span();
+            self.diagnostics.emit_error(span, format!("期望 {}，但已到达文件末尾", expected));
+            return Err(());
+        }
+        let token = self.advance().unwrap();
+        Ok(token)
+    }
+
+    /// 期望当前 token 为指定的 Token 类型
+    fn expect_token(&mut self, expected: &Token) -> Result<TokenSpan, ()> {
+        if self.check(expected) {
+            Ok(self.advance().unwrap())
+        } else {
+            let span = self.current_span();
+            self.diagnostics
+                .emit_error(span, format!("期望 {:?}，但遇到了其他 token", expected));
+            Err(())
+        }
+    }
+
+    /// 期望并消费一个分号，否则报错
+    fn expect_semicolon(&mut self) -> Result<(), ()> {
+        if self.match_token(&Token::Semicolon) {
+            Ok(())
+        } else {
+            let span = self.current_span();
+            self.diagnostics.emit_error(span, "期望分号 `;`");
+            Err(())
+        }
+    }
+
+    /// 获取当前位置的 span（用于错误报告）
+    fn current_span(&self) -> Span {
+        self.peek()
+            .map(|t| t.span)
+            .unwrap_or_else(Span::dummy)
+    }
+
+    /// 获取上一个已消费 token 的 span
+    fn last_span(&self) -> Span {
+        if self.pos > 0 {
+            self.tokens[self.pos - 1].span
+        } else {
+            Span::dummy()
+        }
+    }
+
+    /// 获取已收集的诊断信息
+    pub fn into_diagnostics(self) -> Diagnostics {
+        self.diagnostics
+    }
+
+    // ==================== 顶层解析 ====================
+
+    /// 解析整个源文件
+    ///
+    /// 按 Gorge.g4 语法规则，顶层为可任意交错出现的声明序列：
+    /// namespace、using、class、interface、enum。
+    pub fn parse_source_file(&mut self) -> Result<SourceFile, Diagnostics> {
+        let mut namespace: Option<QualifiedName> = None;
+        let mut usings: Vec<UsingDirective> = Vec::new();
+        let mut members: Vec<TopLevelMember> = Vec::new();
+
+        while !self.is_at_end() {
+            // namespace 声明（可多次出现，后声明的覆盖前面的）
+            if self.match_token(&Token::KwNamespace) {
+                if let Ok(ns) = self.parse_qualified_name() {
+                    namespace = Some(ns);
+                }
+                let _ = self.expect_semicolon();
+                continue;
+            }
+
+            // using 声明（可多次出现）
+            if self.match_token(&Token::KwUsing) {
+                if let Ok(name) = self.parse_qualified_name() {
+                    usings.push(UsingDirective { name, span: Span::dummy() });
+                }
+                let _ = self.expect_semicolon();
+                continue;
+            }
+
+            match self.parse_top_level_member() {
+                Ok(member) => members.push(member),
+                Err(()) => {
+                    self.synchronize();
+                }
+            }
+        }
+
+        if self.diagnostics.has_errors() {
+            return Err(self.diagnostics.clone());
+        }
+
+        Ok(SourceFile {
+            namespace,
+            usings,
+            members,
+            span: Span::dummy(),
+        })
+    }
+
+    /// 跳过出错 token，尝试同步到下一个安全恢复点
+    fn synchronize(&mut self) {
+        self.advance();
+        while !self.is_at_end() {
+            // 在语句边界处恢复：}、; 或下一个关键字
+            match self.peek() {
+                Some(t) => match &t.token {
+                    Token::RBrace | Token::Semicolon => {
+                        self.advance();
+                        return;
+                    }
+                    Token::KwClass
+                    | Token::KwInterface
+                    | Token::KwEnum
+                    | Token::KwNamespace
+                    | Token::KwUsing => {
+                        return;
+                    }
+                    _ => {
+                        self.advance();
+                    }
+                },
+                None => return,
+            }
+        }
+    }
+
+    /// 解析可选的 namespace 声明
+    fn parse_namespace(&mut self) -> Option<QualifiedName> {
+        if self.match_token(&Token::KwNamespace) {
+            self.parse_qualified_name().ok()
+        } else {
+            None
+        }
+    }
+
+    /// 解析 using 指令列表
+    fn parse_usings(&mut self) -> Vec<UsingDirective> {
+        let mut usings = Vec::new();
+        while self.match_token(&Token::KwUsing) {
+            if let Ok(name) = self.parse_qualified_name() {
+                usings.push(UsingDirective {
+                    name,
+                    span: Span::dummy(),
+                });
+            }
+            let _ = self.expect_semicolon();
+        }
+        usings
+    }
+
+    /// 解析一个顶层成员声明
+    fn parse_top_level_member(&mut self) -> Result<TopLevelMember, ()> {
+        let annotations = self.parse_annotations();
+        let modifiers = self.parse_modifiers();
+
+        match self.peek() {
+            Some(TokenSpan { token: Token::KwClass, .. }) => {
+                self.advance();
+                self.parse_class_declaration(annotations, modifiers)
+                    .map(TopLevelMember::Class)
+            }
+            Some(TokenSpan { token: Token::KwInterface, .. }) => {
+                self.advance();
+                self.parse_interface_declaration(annotations, modifiers)
+                    .map(TopLevelMember::Interface)
+            }
+            Some(TokenSpan { token: Token::KwEnum, .. }) => {
+                self.advance();
+                self.parse_enum_declaration(annotations, modifiers)
+                    .map(TopLevelMember::Enum)
+            }
+            _ => {
+                let span = self.current_span();
+                self.diagnostics
+                    .emit_error(span, "顶层只能声明 class、interface 或 enum");
+                Err(())
+            }
+        }
+    }
+
+    /// 解析类型引用
+    ///
+    /// 支持简单类型名（`int`、`MyClass`）和泛型类型（`List<MyClass>`）
+    /// 以及数组类型（`int[]`）。
+    fn parse_type_ref(&mut self) -> Result<TypeRef, ()> {
+        let span = self.current_span();
+
+        // 内置类型关键字
+        if self.match_token(&Token::TypeInt) {
+            return Ok(TypeRef::simple("int", span));
+        }
+        if self.match_token(&Token::TypeFloat) {
+            return Ok(TypeRef::simple("float", span));
+        }
+        if self.match_token(&Token::TypeBool) {
+            return Ok(TypeRef::simple("bool", span));
+        }
+        if self.match_token(&Token::TypeString) {
+            return Ok(TypeRef::simple("string", span));
+        }
+        if self.match_token(&Token::TypeVoid) {
+            return Ok(TypeRef::simple("void", span));
+        }
+        if self.match_token(&Token::TypeObject) {
+            return Ok(TypeRef::simple("object", span));
+        }
+
+        // delegate<ReturnType, ParamType, ...>
+        if self.match_token(&Token::KwDelegate) {
+            self.expect_token(&Token::Less)?;
+            let return_type = self.parse_type_ref()?;
+            let mut param_types = Vec::new();
+            while self.match_token(&Token::Colon) || self.match_token(&Token::Comma) {
+                param_types.push(self.parse_type_ref()?);
+            }
+            self.expect_token(&Token::Greater)?;
+            return Ok(TypeRef::Delegate {
+                return_type: Box::new(return_type),
+                param_types,
+                span,
+            });
+        }
+
+        // 用户自定义类型名
+        let name = self.match_identifier().ok_or_else(|| {
+            self.diagnostics
+                .emit_error(self.current_span(), "期望类型名称");
+            ()
+        })?;
+
+        // 泛型参数
+        if self.match_token(&Token::Less) {
+            let mut type_args = Vec::new();
+            loop {
+                type_args.push(self.parse_type_ref()?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect_token(&Token::Greater).map_err(|_| ())?;
+            return Ok(TypeRef::Generic {
+                name,
+                type_args,
+                span,
+            });
+        }
+
+        // 数组类型
+        if self.match_token(&Token::LBracket) {
+            self.expect_token(&Token::RBracket).map_err(|_| ())?;
+            return Ok(TypeRef::Array {
+                element_type: Box::new(TypeRef::simple(name, span)),
+                span,
+            });
+        }
+
+        Ok(TypeRef::simple(name, span))
+    }
+
+    /// 解析限定名（如 `System.Collections.Generic`）
+    fn parse_qualified_name(&mut self) -> Result<QualifiedName, ()> {
+        let span = self.current_span();
+        let mut parts = Vec::new();
+
+        let first = self.match_identifier().ok_or_else(|| {
+            self.diagnostics
+                .emit_error(self.current_span(), "期望限定名");
+            ()
+        })?;
+        parts.push(first);
+
+        while self.match_token(&Token::Dot) {
+            let part = self.match_identifier().ok_or_else(|| {
+                self.diagnostics
+                    .emit_error(self.current_span(), "期望标识符");
+                ()
+            })?;
+            parts.push(part);
+        }
+
+        Ok(QualifiedName { parts, span })
+    }
+
+    // ==================== 类声明 ====================
+
+    /// 解析类声明中的成员
+    fn parse_class_member(&mut self) -> Result<ClassMember, ()> {
+        let annotations = self.parse_annotations();
+        let modifiers = self.parse_modifiers();
+        let member_type = self.parse_type_ref()?;
+        let name = self.match_identifier().ok_or_else(|| {
+            self.diagnostics
+                .emit_error(self.current_span(), "期望成员名称");
+            ()
+        })?;
+
+        match self.peek() {
+            // 方法声明：`Type name(`
+            Some(TokenSpan { token: Token::LParen, .. }) => {
+                self.parse_method_declaration(annotations, modifiers, member_type, name)
+                    .map(ClassMember::Method)
+            }
+            // 字段声明：`Type name =` 或 `Type name;`
+            _ => {
+                self.parse_field_declaration(annotations, modifiers, member_type, name)
+                    .map(ClassMember::Field)
+            }
+        }
+    }
+
+    /// 解析字段声明
+    fn parse_field_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+        modifiers: Vec<Modifier>,
+        field_type: TypeRef,
+        name: String,
+    ) -> Result<FieldDeclaration, ()> {
+        let span = self.current_span();
+        let initializer = if self.match_token(&Token::Assign) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+        self.expect_semicolon()?;
+
+        Ok(FieldDeclaration {
+            annotations,
+            modifiers,
+            field_type,
+            name,
+            initializer,
+            span,
+        })
+    }
+
+    /// 解析方法声明
+    fn parse_method_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+        modifiers: Vec<Modifier>,
+        return_type: TypeRef,
+        name: String,
+    ) -> Result<MethodDeclaration, ()> {
+        let span = self.current_span();
+        self.advance(); // 消费 '('
+        let parameters = self.parse_parameters()?;
+        self.expect_token(&Token::RParen)?;
+
+        let body = if self.check(&Token::LBrace) {
+            let statements = self.parse_block()?;
+            Some(statements)
+        } else {
+            self.expect_semicolon()?; // 接口方法或抽象方法无方法体
+            None
+        };
+
+        Ok(MethodDeclaration {
+            annotations,
+            modifiers,
+            return_type,
+            name,
+            parameters,
+            body,
+            span,
+        })
+    }
+
+    /// 解析参数列表
+    fn parse_parameters(&mut self) -> Result<Vec<Parameter>, ()> {
+        let mut params = Vec::new();
+
+        if self.check(&Token::RParen) {
+            return Ok(params);
+        }
+
+        loop {
+            let param_type = self.parse_type_ref()?;
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics
+                    .emit_error(self.current_span(), "期望参数名称");
+                ()
+            })?;
+            let span = self.current_span();
+
+            params.push(Parameter { name, param_type, span });
+
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+
+        Ok(params)
+    }
+
+    /// 解析带类型的参数列表 `Type name, Type name`
+    fn parse_typed_parameters(&mut self) -> Result<Vec<Parameter>, ()> {
+        let mut params = Vec::new();
+        if self.check(&Token::RParen) {
+            return Ok(params);
+        }
+        loop {
+            let param_type = self.parse_type_ref()?;
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望参数名");
+                ()
+            })?;
+            let span = self.current_span();
+            params.push(Parameter { name, param_type, span });
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(params)
+    }
+
+    /// 解析类型关键字，若后跟 `:(params) -> body` 则解析为 Lambda，否则返回标识符
+    fn parse_type_keyword_or_lambda(&mut self, type_name: &str, span: Span) -> Result<Expression, ()> {
+        if self.check(&Token::Colon) {
+            if let Some(TokenSpan { token: Token::LParen, .. }) = self.peek_ahead(1) {
+                self.advance(); // 消费 ':'
+                self.advance(); // 消费 '('
+                let params = self.parse_typed_parameters()?;
+                self.expect_token(&Token::RParen)?;
+                self.expect_token(&Token::LambdaArrow)?;
+                let body = if self.check(&Token::LBrace) {
+                    LambdaBody::Block(self.parse_block()?)
+                } else {
+                    LambdaBody::Expression(Box::new(self.parse_expression()?))
+                };
+                return Ok(Expression::Lambda {
+                    parameters: params,
+                    body,
+                    span,
+                });
+            }
+        }
+        Ok(Expression::Identifier(type_name.to_string(), span))
+    }
+
+    // ==================== 类/接口/枚举声明 ====================
+
+    /// 解析类声明（关键字已消费）
+    fn parse_class_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+        modifiers: Vec<Modifier>,
+    ) -> Result<ClassDeclaration, ()> {
+        let span = self.current_span();
+        let name = self.match_identifier().ok_or_else(|| {
+            self.diagnostics.emit_error(self.current_span(), "期望类名");
+            ()
+        })?;
+
+        // 继承关系
+        let super_class = if self.match_token(&Token::Colon) {
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+
+        let super_interfaces = if self.match_token(&Token::DoubleColon) {
+            let mut interfaces = Vec::new();
+            loop {
+                interfaces.push(self.parse_type_ref()?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+            interfaces
+        } else {
+            Vec::new()
+        };
+
+        // injector 声明
+        let injector = if self.match_token(&Token::KwInjector) {
+            self.expect_token(&Token::LBrace)?;
+            let fields = self.parse_injector_fields()?;
+            self.expect_token(&Token::RBrace)?;
+            Some(InjectorDeclaration { fields, span })
+        } else {
+            None
+        };
+
+        // 类体
+        self.expect_token(&Token::LBrace)?;
+        let mut members = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            members.push(self.parse_class_member()?);
+        }
+        self.expect_token(&Token::RBrace)?;
+
+        Ok(ClassDeclaration {
+            annotations,
+            modifiers,
+            name,
+            super_class,
+            super_interfaces,
+            injector,
+            members,
+            span,
+        })
+    }
+
+    /// 解析接口声明（关键字已消费）
+    fn parse_interface_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+        modifiers: Vec<Modifier>,
+    ) -> Result<InterfaceDeclaration, ()> {
+        let span = self.current_span();
+        let name = self.match_identifier().ok_or_else(|| {
+            self.diagnostics.emit_error(self.current_span(), "期望接口名");
+            ()
+        })?;
+
+        // 父接口
+        let super_interfaces = if self.match_token(&Token::KwExtends) {
+            let mut interfaces = Vec::new();
+            loop {
+                interfaces.push(self.parse_type_ref()?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+            interfaces
+        } else {
+            Vec::new()
+        };
+
+        // 接口体
+        self.expect_token(&Token::LBrace)?;
+        let mut methods = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            let method_annotations = self.parse_annotations();
+            let return_type = self.parse_type_ref()?;
+            let method_name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望方法名");
+                ()
+            })?;
+
+            self.expect_token(&Token::LParen)?;
+            let parameters = self.parse_parameters()?;
+            self.expect_token(&Token::RParen)?;
+            self.expect_semicolon()?;
+
+            methods.push(MethodSignature {
+                annotations: method_annotations,
+                return_type,
+                name: method_name,
+                parameters,
+                span,
+            });
+        }
+        self.expect_token(&Token::RBrace)?;
+
+        Ok(InterfaceDeclaration {
+            annotations,
+            modifiers,
+            name,
+            super_interfaces,
+            methods,
+            span,
+        })
+    }
+
+    /// 解析枚举声明（关键字已消费）
+    fn parse_enum_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+        modifiers: Vec<Modifier>,
+    ) -> Result<EnumDeclaration, ()> {
+        let span = self.current_span();
+        let name = self.match_identifier().ok_or_else(|| {
+            self.diagnostics.emit_error(self.current_span(), "期望枚举名");
+            ()
+        })?;
+
+        self.expect_token(&Token::LBrace)?;
+        let mut values = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            let val_annotations = self.parse_annotations();
+            let val_name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望枚举值名称");
+                ()
+            })?;
+
+            let val = if self.match_token(&Token::Assign) {
+                // 枚举值可以指定数值
+                match self.parse_expression()? {
+                    Expression::Literal(Literal::Int(v), _) => Some(v),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            values.push(EnumValue {
+                annotations: val_annotations,
+                name: val_name,
+                value: val,
+                span,
+            });
+
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect_token(&Token::RBrace)?;
+
+        Ok(EnumDeclaration {
+            annotations,
+            modifiers,
+            name,
+            values,
+            span,
+        })
+    }
+
+    /// 解析注解列表
+    ///
+    /// Gorge 注解语法：`metadata? '@' Identifier ('(' key '=' expr (',' key '=' expr)* ')')?`
+    /// metadata 块为 `[ type name = expr (',' type name = expr)* ]`
+    fn parse_annotations(&mut self) -> Vec<Annotation> {
+        let mut annotations = Vec::new();
+        loop {
+            // 跳过可选的 metadata 块 [...]
+            if self.check(&Token::LBracket) {
+                self.skip_metadata_block();
+            }
+
+            // 解析 @Name 注解
+            if self.match_token(&Token::At) {
+                let span = self.current_span();
+                let name = match self.match_identifier() {
+                    Some(n) => n,
+                    None => {
+                        self.diagnostics.emit_error(self.current_span(), "期望注解名");
+                        break;
+                    }
+                };
+
+                let mut arguments = Vec::new();
+                // 可选的泛型参数
+                let generic_type = if self.match_token(&Token::Less) {
+                    let gt = self.parse_type_ref().ok();
+                    self.expect_token(&Token::Greater).ok();
+                    gt
+                } else {
+                    None
+                };
+
+                // 注解参数 (key = value, ...)
+                if self.match_token(&Token::LParen) {
+                    if !self.check(&Token::RParen) {
+                        loop {
+                            // key = value 中的 key 是标识符，value 是表达式
+                            let _key = self.match_identifier();
+                            if self.match_token(&Token::Assign) {
+                                if let Ok(value) = self.parse_expression() {
+                                    arguments.push(value);
+                                }
+                            }
+                            if !self.match_token(&Token::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_token(&Token::RParen).ok();
+                }
+
+                annotations.push(Annotation { name, generic_type, arguments, span });
+            } else if self.check(&Token::LBracket) {
+                // 只有 metadata 没有 @注解，跳过继续
+                self.skip_metadata_block();
+                continue;
+            } else {
+                break;
+            }
+        }
+        annotations
+    }
+
+    /// 跳过 metadata 块 [ type name = expr, ... ]
+    fn skip_metadata_block(&mut self) {
+        if !self.match_token(&Token::LBracket) {
+            return;
+        }
+        // 简单跳过：消费到 ] 为止的所有 token
+        let mut depth = 1;
+        while !self.is_at_end() && depth > 0 {
+            match self.peek().map(|t| &t.token) {
+                Some(Token::LBracket) => { depth += 1; self.advance(); }
+                Some(Token::RBracket) => { depth -= 1; self.advance(); }
+                _ => { self.advance(); }
+            }
+        }
+    }
+
+    /// 解析修饰符列表
+    fn parse_modifiers(&mut self) -> Vec<Modifier> {
+        let mut modifiers = Vec::new();
+        loop {
+            let m = match self.peek().map(|t| &t.token) {
+                Some(Token::KwNative) => Some(Modifier::Native),
+                Some(Token::KwStatic) => Some(Modifier::Static),
+                _ => None,
+            };
+            if let Some(modifier) = m {
+                self.advance();
+                modifiers.push(modifier);
+            } else {
+                break;
+            }
+        }
+        modifiers
+    }
+
+    /// 解析注入器字段定义
+    fn parse_injector_fields(&mut self) -> Result<Vec<InjectorField>, ()> {
+        let mut fields = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            let field_type = self.parse_type_ref()?;
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                ()
+            })?;
+            let span = self.current_span();
+            self.expect_semicolon()?;
+            fields.push(InjectorField { name, field_type, span });
+        }
+        Ok(fields)
+    }
+
+    // ==================== 语句解析 ====================
+
+    /// 解析一条语句
+    fn parse_statement(&mut self) -> Result<Statement, ()> {
+        match self.peek() {
+            Some(TokenSpan { token: Token::LBrace, .. }) => {
+                let statements = self.parse_block()?;
+                let span = self.last_span();
+                Ok(Statement::Block { statements, span })
+            }
+            Some(TokenSpan { token: Token::KwIf, .. }) => self.parse_if_statement(),
+            Some(TokenSpan { token: Token::KwDo, .. }) => self.parse_do_while_statement(),
+            Some(TokenSpan { token: Token::KwWhile, .. }) => self.parse_while_statement(),
+            Some(TokenSpan { token: Token::KwFor, .. }) => self.parse_for_statement(),
+            Some(TokenSpan { token: Token::KwSwitch, .. }) => self.parse_switch_statement(),
+            Some(TokenSpan { token: Token::KwReturn, .. }) => self.parse_return_statement(),
+            Some(TokenSpan { token: Token::KwBreak, .. }) => {
+                let span = self.advance().unwrap().span;
+                self.expect_semicolon()?;
+                Ok(Statement::Break { targets: Vec::new(), span })
+            }
+            Some(TokenSpan { token: Token::KwContinue, .. }) => {
+                let span = self.advance().unwrap().span;
+                self.expect_semicolon()?;
+                Ok(Statement::Continue { targets: Vec::new(), span })
+            }
+            // var 声明或表达式语句
+            _ => self.parse_declaration_or_expression_statement(),
+        }
+    }
+
+    /// 解析代码块 `{ statements }`
+    fn parse_block(&mut self) -> Result<Vec<Statement>, ()> {
+        self.expect_token(&Token::LBrace)?;
+        let mut statements = Vec::new();
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            statements.push(self.parse_statement()?);
+        }
+        self.expect_token(&Token::RBrace)?;
+        Ok(statements)
+    }
+
+    /// 解析 if 语句（关键字已检查）
+    fn parse_if_statement(&mut self) -> Result<Statement, ()> {
+        let span = self.advance().unwrap().span;
+        self.expect_token(&Token::LParen)?;
+        let condition = self.parse_expression()?;
+        self.expect_token(&Token::RParen)?;
+        let then_branch = Box::new(self.parse_statement()?);
+        let else_branch = if self.match_token(&Token::KwElse) {
+            Some(Box::new(self.parse_statement()?))
+        } else {
+            None
+        };
+
+        Ok(Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        })
+    }
+
+    /// 解析 while 语句（关键字已检查）
+    fn parse_while_statement(&mut self) -> Result<Statement, ()> {
+        let span = self.advance().unwrap().span;
+        self.expect_token(&Token::LParen)?;
+        let condition = self.parse_expression()?;
+        self.expect_token(&Token::RParen)?;
+        let body = Box::new(self.parse_statement()?);
+
+        Ok(Statement::While { condition, body, span })
+    }
+
+    /// 解析 for 语句（关键字已检查）
+    fn parse_for_statement(&mut self) -> Result<Statement, ()> {
+        let span = self.advance().unwrap().span;
+        self.expect_token(&Token::LParen)?;
+
+        // 初始器：直接解析（类型声明或表达式），不消费 ; 作为语句终结符
+        let initializer = if self.check(&Token::Semicolon) {
+            None
+        } else if self.is_type_start() {
+            let var_type = self.parse_type_ref()?;
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望变量名");
+                ()
+            })?;
+            let init_expr = if self.match_token(&Token::Assign) {
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+            Some(Box::new(Statement::VariableDeclaration {
+                var_type,
+                name,
+                initializer: init_expr,
+                span,
+            }))
+        } else {
+            let expr = self.parse_expression()?;
+            Some(Box::new(Statement::Expression(expr, span)))
+        };
+        self.expect_token(&Token::Semicolon)?;
+
+        let condition = if self.check(&Token::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        self.expect_token(&Token::Semicolon)?;
+
+        let update = if self.check(&Token::RParen) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        self.expect_token(&Token::RParen)?;
+
+        let body = Box::new(self.parse_statement()?);
+
+        Ok(Statement::For {
+            initializer,
+            condition,
+            update,
+            body,
+            span,
+        })
+    }
+
+    /// 解析 do-while 语句：`do { body } while (condition);`
+    fn parse_do_while_statement(&mut self) -> Result<Statement, ()> {
+        let span = self.advance().unwrap().span;
+        let body = Box::new(self.parse_statement()?);
+        self.expect_token(&Token::KwWhile)?;
+        self.expect_token(&Token::LParen)?;
+        let condition = self.parse_expression()?;
+        self.expect_token(&Token::RParen)?;
+        self.expect_semicolon()?;
+        Ok(Statement::DoWhile { body, condition, span })
+    }
+
+    /// 解析 switch 语句（关键字已检查）
+    fn parse_switch_statement(&mut self) -> Result<Statement, ()> {
+        let span = self.advance().unwrap().span;
+        self.expect_token(&Token::LParen)?;
+        let expression = self.parse_expression()?;
+        self.expect_token(&Token::RParen)?;
+
+        self.expect_token(&Token::LBrace)?;
+        let mut cases = Vec::new();
+        let mut default_body = None;
+
+        while !self.check(&Token::RBrace) && !self.is_at_end() {
+            if self.match_token(&Token::KwCase) {
+                let case_span = self.current_span();
+                // case 可以有多个值：`case 1, 2:`
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.parse_expression()?);
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect_token(&Token::Colon)?;
+
+                let mut body = Vec::new();
+                while !self.check(&Token::KwCase)
+                    && !self.check(&Token::KwDefault)
+                    && !self.check(&Token::RBrace)
+                    && !self.is_at_end()
+                {
+                    body.push(self.parse_statement()?);
+                }
+                cases.push(CaseBlock { values, body, span: case_span });
+            } else if self.match_token(&Token::KwDefault) {
+                self.expect_token(&Token::Colon)?;
+                let mut body = Vec::new();
+                while !self.check(&Token::KwCase)
+                    && !self.check(&Token::KwDefault)
+                    && !self.check(&Token::RBrace)
+                    && !self.is_at_end()
+                {
+                    body.push(self.parse_statement()?);
+                }
+                default_body = Some(Box::new(Statement::Block {
+                    statements: body,
+                    span,
+                }));
+            } else {
+                self.advance();
+            }
+        }
+        self.expect_token(&Token::RBrace)?;
+
+        Ok(Statement::Switch {
+            expression,
+            cases,
+            default_body,
+            span,
+        })
+    }
+
+    /// 解析 return 语句（关键字已检查）
+    fn parse_return_statement(&mut self) -> Result<Statement, ()> {
+        let span = self.advance().unwrap().span;
+        let value = if self.check(&Token::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        self.expect_semicolon()?;
+        Ok(Statement::Return { value, span })
+    }
+
+    /// 解析变量声明或表达式语句
+    ///
+    /// 策略：如果当前 token 看起来像类型声明（var 或已知类型关键字后跟标识符），
+    /// 尝试解析为变量声明；否则解析为表达式。
+    fn parse_declaration_or_expression_statement(&mut self) -> Result<Statement, ()> {
+        // 检查是否为 var 声明 `var name = expr;`
+        if self.match_token(&Token::KwAuto) {
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望变量名");
+                ()
+            })?;
+            let span = self.current_span();
+
+            // 暂时用 TypeRef::simple("var") 代替真实类型
+            let var_type = TypeRef::simple("var", span);
+
+            let initializer = if self.match_token(&Token::Assign) {
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+            self.expect_semicolon()?;
+
+            return Ok(Statement::VariableDeclaration {
+                var_type,
+                name,
+                initializer,
+                span,
+            });
+        }
+
+        // 检查是否为类型声明 `TypeName name = expr;` 或 `TypeName name;`
+        if self.is_type_start() {
+            // 尝试解析类型名 + 标识符 + 可能有的 = expr
+            let saved_pos = self.pos;
+            let _saved_diags_count = self.diagnostics.error_count();
+
+            if let Ok(var_type) = self.parse_type_ref() {
+                if let Some(name) = self.match_identifier() {
+                    let span = self.current_span();
+                    let initializer = if self.match_token(&Token::Assign) {
+                        match self.parse_expression() {
+                            Ok(expr) => Some(expr),
+                            Err(_) => {
+                                // 恢复位置
+                                self.pos = saved_pos;
+                                // 但诊断已经被添加，跳转到表达式解析
+                                return self.parse_expression_statement();
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    self.expect_semicolon()?;
+
+                    return Ok(Statement::VariableDeclaration {
+                        var_type,
+                        name,
+                        initializer,
+                        span,
+                    });
+                }
+            }
+
+            // 恢复位置，按表达式处理
+            self.pos = saved_pos;
+        }
+
+        self.parse_expression_statement()
+    }
+
+    /// 判断当前位置是否可能是类型声明的开头
+    fn is_type_start(&self) -> bool {
+        matches!(
+            self.peek().map(|t| &t.token),
+            Some(Token::TypeInt)
+                | Some(Token::TypeFloat)
+                | Some(Token::TypeBool)
+                | Some(Token::TypeString)
+                | Some(Token::TypeVoid)
+                | Some(Token::TypeObject)
+                | Some(Token::KwDelegate)
+                | Some(Token::Identifier(_))
+        )
+    }
+
+    /// 表达式语句 `expr;`
+    fn parse_expression_statement(&mut self) -> Result<Statement, ()> {
+        let expr = self.parse_expression()?;
+        let span = expr.span();
+        self.expect_semicolon()?;
+        Ok(Statement::Expression(expr, span))
+    }
+
+    // ==================== 表达式解析 (Pratt) ====================
+
+    /// 解析表达式（从最低优先级开始）
+    pub fn parse_expression(&mut self) -> Result<Expression, ()> {
+        self.parse_expression_with_precedence(PREC_ASSIGNMENT)
+    }
+
+    /// Pratt 解析器核心循环
+    ///
+    /// 先解析前缀表达式（操作数），然后循环解析中缀/后缀操作符。
+    /// 只要下一个操作符的优先级不低于 min_precedence，就继续绑定。
+    fn parse_expression_with_precedence(&mut self, min_precedence: u8) -> Result<Expression, ()> {
+        let mut left = self.parse_prefix()?;
+
+        while !self.is_at_end() {
+            let precedence = self.current_infix_precedence();
+            if precedence < min_precedence {
+                break;
+            }
+            left = self.parse_infix(left, precedence)?;
+        }
+
+        Ok(left)
+    }
+
+    /// 解析前缀表达式
+    fn parse_prefix(&mut self) -> Result<Expression, ()> {
+        let token_span = match self.advance() {
+            Some(t) => t,
+            None => {
+                self.diagnostics
+                    .emit_error(Span::dummy(), "期望表达式，但已到达文件末尾");
+                return Err(());
+            }
+        };
+        let span = token_span.span;
+
+        match token_span.token {
+            // 字面量
+            Token::IntLiteral(v) => Ok(Expression::Literal(Literal::Int(v), span)),
+            Token::FloatLiteral(v) => Ok(Expression::Literal(Literal::Float(v), span)),
+            Token::StringLiteral(v) => Ok(Expression::Literal(Literal::String(v), span)),
+            Token::KwTrue => Ok(Expression::Literal(Literal::Bool(true), span)),
+            Token::KwFalse => Ok(Expression::Literal(Literal::Bool(false), span)),
+            Token::KwNull => Ok(Expression::Null(span)),
+
+            // 标识符（可能是变量引用、类型名或函数调用的一部分）
+            Token::Identifier(name) => {
+                // 检查是否为 lambda 参数：`x => expr`
+                if self.match_token(&Token::Arrow) {
+                    let body = if self.check(&Token::LBrace) {
+                        LambdaBody::Block(self.parse_block()?)
+                    } else {
+                        LambdaBody::Expression(Box::new(self.parse_expression()?))
+                    };
+                    return Ok(Expression::Lambda {
+                        parameters: vec![Parameter {
+                            name,
+                            param_type: TypeRef::simple("var", span),
+                            span,
+                        }],
+                        body,
+                        span,
+                    });
+                }
+                // 检查是否为带类型 Lambda：`TypeRef:(params) -> body`
+                if self.check(&Token::Colon) {
+                    if let Some(TokenSpan { token: Token::LParen, .. }) = self.peek_ahead(1) {
+                        self.advance(); // 消费 ':'
+                        self.advance(); // 消费 '('
+                        let params = self.parse_typed_parameters()?;
+                        self.expect_token(&Token::RParen)?;
+                        self.expect_token(&Token::LambdaArrow)?;
+                        let body = if self.check(&Token::LBrace) {
+                            LambdaBody::Block(self.parse_block()?)
+                        } else {
+                            LambdaBody::Expression(Box::new(self.parse_expression()?))
+                        };
+                        return Ok(Expression::Lambda {
+                            parameters: params,
+                            body,
+                            span,
+                        });
+                    }
+                }
+                Ok(Expression::Identifier(name, span))
+            }
+
+            // 类型关键字作为表达式前缀（用于 Lambda 语法 `int:(params) -> body`）
+            Token::TypeInt => self.parse_type_keyword_or_lambda("int", span),
+            Token::TypeFloat => self.parse_type_keyword_or_lambda("float", span),
+            Token::TypeBool => self.parse_type_keyword_or_lambda("bool", span),
+            Token::TypeString => self.parse_type_keyword_or_lambda("string", span),
+            Token::TypeVoid => self.parse_type_keyword_or_lambda("void", span),
+            Token::TypeObject => self.parse_type_keyword_or_lambda("object", span),
+
+            // 一元前缀操作符
+            Token::Minus => {
+                let operand = self.parse_expression_with_precedence(PREC_UNARY)?;
+                Ok(Expression::Unary {
+                    operator: UnaryOp::Negate,
+                    operand: Box::new(operand),
+                    span,
+                })
+            }
+            Token::Bang => {
+                let operand = self.parse_expression_with_precedence(PREC_UNARY)?;
+                Ok(Expression::Unary {
+                    operator: UnaryOp::Not,
+                    operand: Box::new(operand),
+                    span,
+                })
+            }
+            Token::PlusPlus => {
+                let operand = self.parse_expression_with_precedence(PREC_UNARY)?;
+                Ok(Expression::Unary {
+                    operator: UnaryOp::PreIncrement,
+                    operand: Box::new(operand),
+                    span,
+                })
+            }
+            Token::MinusMinus => {
+                let operand = self.parse_expression_with_precedence(PREC_UNARY)?;
+                Ok(Expression::Unary {
+                    operator: UnaryOp::PreDecrement,
+                    operand: Box::new(operand),
+                    span,
+                })
+            }
+
+            // 括号分组
+            Token::LParen => {
+                let inner = self.parse_expression()?;
+                self.expect_token(&Token::RParen)?;
+                Ok(inner)
+            }
+
+            // new 表达式
+            Token::KwNew => self.parse_new_expression(span),
+
+            // this / base 引用
+            Token::KwThis => Ok(Expression::This(span)),
+            Token::KwSuper => Ok(Expression::Super(span)),
+
+            // 注入器对象 `{ key: value, ... }`
+            Token::LBrace => self.parse_injector_object(span),
+
+            // 注入器数组 `[elem1, elem2, ...]`
+            Token::LBracket => self.parse_injector_or_array(span),
+
+            _ => {
+                self.diagnostics.emit_error(
+                    span,
+                    format!("意外的 token，期望表达式"),
+                );
+                Err(())
+            }
+        }
+    }
+
+    /// 解析 new 表达式：`new ClassName()` 或 `new ClassName { injector }`
+    fn parse_new_expression(&mut self, span: Span) -> Result<Expression, ()> {
+        let class_type = self.parse_type_ref()?;
+
+        // 构造参数
+        let arguments = if self.match_token(&Token::LParen) {
+            let args = self.parse_argument_list()?;
+            self.expect_token(&Token::RParen)?;
+            args
+        } else {
+            Vec::new()
+        };
+
+        Ok(Expression::New {
+            class_type,
+            arguments,
+            span,
+        })
+    }
+
+    /// 解析注入器对象字面量 `{ key: value, ... }`
+    ///
+    /// 在表达式上下文中，`{` 后的内容通过 key: value 模式识别为注入器对象。
+    fn parse_injector_object(&mut self, span: Span) -> Result<Expression, ()> {
+        let mut fields = Vec::new();
+
+        if self.check(&Token::RBrace) {
+            self.advance();
+            return Ok(Expression::InjectorObject { fields, span });
+        }
+
+        loop {
+            // 字段名：标识符
+            let key = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                ()
+            })?;
+
+            // 冒号分隔
+            self.expect_token(&Token::Colon)?;
+
+            // 字段值
+            let value = self.parse_expression()?;
+            fields.push((key, value));
+
+            if self.match_token(&Token::Comma) {
+                if self.check(&Token::RBrace) {
+                    // 尾随逗号允许
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.expect_token(&Token::RBrace)?;
+        Ok(Expression::InjectorObject { fields, span })
+    }
+
+    /// 解析注入器数组或普通数组 `[elem1, elem2, ...]`
+    fn parse_injector_or_array(&mut self, span: Span) -> Result<Expression, ()> {
+        let elements = if self.check(&Token::RBracket) {
+            Vec::new()
+        } else {
+            self.parse_argument_list()?
+        };
+        self.expect_token(&Token::RBracket)?;
+        Ok(Expression::InjectorArray { elements, span })
+    }
+
+    /// 解析参数/元素列表（逗号分隔的表达式）
+    fn parse_argument_list(&mut self) -> Result<Vec<Expression>, ()> {
+        let mut args = Vec::new();
+        if self.check(&Token::RParen) || self.check(&Token::RBracket) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expression()?);
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+            // 允许尾随逗号
+            if self.check(&Token::RParen) || self.check(&Token::RBracket) {
+                break;
+            }
+        }
+        Ok(args)
+    }
+
+    /// 获取当前 token 作为中缀操作符的优先级
+    fn current_infix_precedence(&self) -> u8 {
+        match self.peek().map(|t| &t.token) {
+            Some(Token::Assign)
+            | Some(Token::PlusAssign)
+            | Some(Token::MinusAssign)
+            | Some(Token::StarAssign)
+            | Some(Token::SlashAssign)
+            | Some(Token::PercentAssign) => PREC_ASSIGNMENT,
+
+            Some(Token::Question) => PREC_CONDITIONAL,
+
+            Some(Token::OrOr) => PREC_LOGICAL_OR,
+            Some(Token::AndAnd) => PREC_LOGICAL_AND,
+
+            Some(Token::EqualEqual) | Some(Token::NotEqual) => PREC_EQUALITY,
+
+            Some(Token::Less)
+            | Some(Token::LessEqual)
+            | Some(Token::Greater)
+            | Some(Token::GreaterEqual) => PREC_COMPARISON,
+
+            Some(Token::Plus) | Some(Token::Minus) => PREC_ADDITION,
+
+            Some(Token::Star) | Some(Token::Slash) | Some(Token::Percent) => PREC_MULTIPLICATION,
+
+            // 后缀操作符（最高中缀优先级）
+            Some(Token::Dot)
+            | Some(Token::LParen)
+            | Some(Token::LBracket)
+            | Some(Token::PlusPlus)
+            | Some(Token::MinusMinus) => PREC_POSTFIX,
+
+            _ => PREC_NONE,
+        }
+    }
+
+    /// 解析中缀/后缀表达式
+    fn parse_infix(&mut self, left: Expression, precedence: u8) -> Result<Expression, ()> {
+        let token_span = self.advance().unwrap();
+        let span = token_span.span;
+        let span_start = left.span();
+
+        match token_span.token {
+            // 二元操作符
+            Token::Plus
+            | Token::Minus
+            | Token::Star
+            | Token::Slash
+            | Token::Percent
+            | Token::Less
+            | Token::LessEqual
+            | Token::Greater
+            | Token::GreaterEqual
+            | Token::EqualEqual
+            | Token::NotEqual
+            | Token::AndAnd
+            | Token::OrOr => {
+                // 左结合：用 precedence + 1 解析右操作数
+                let right = self.parse_expression_with_precedence(precedence + 1)?;
+                let op = token_to_binary_op(&token_span.token);
+                let combined_span = Span::new(
+                    span_start.start,
+                    right.span().end,
+                    span_start.line,
+                    span_start.column,
+                    span_start.source_id,
+                );
+                Ok(Expression::Binary {
+                    left: Box::new(left),
+                    operator: op,
+                    right: Box::new(right),
+                    span: combined_span,
+                })
+            }
+
+            // 赋值操作符（右结合）
+            Token::Assign
+            | Token::PlusAssign
+            | Token::MinusAssign
+            | Token::StarAssign
+            | Token::SlashAssign
+            | Token::PercentAssign => {
+                // 右结合：用相同优先级解析右操作数
+                let right = self.parse_expression_with_precedence(precedence)?;
+                let target = match left {
+                    Expression::Identifier(name, s) => AssignmentTarget::Variable(name, s),
+                    Expression::MemberAccess { object, member, span: _ms } => {
+                        if let Some(field) = member.strip_prefix('^') {
+                            AssignmentTarget::InjectorField { object, field: field.to_string(), span: _ms }
+                        } else {
+                            AssignmentTarget::Field { object, field: member, span: _ms }
+                        }
+                    }
+                    Expression::ArrayAccess { array, index, span: aspan } => {
+                        AssignmentTarget::ArrayElement { array, index, span: aspan }
+                    }
+                    _ => {
+                        self.diagnostics.emit_error(
+                            left.span(),
+                            "赋值目标必须是变量、字段或数组元素",
+                        );
+                        return Err(());
+                    }
+                };
+                let op = token_to_assignment_op(&token_span.token);
+                Ok(Expression::Assignment {
+                    target,
+                    operator: op,
+                    value: Box::new(right),
+                    span,
+                })
+            }
+
+            // 条件表达式 `?:`
+            Token::Question => {
+                let then_branch = self.parse_expression_with_precedence(PREC_ASSIGNMENT)?;
+                self.expect_token(&Token::Colon)?;
+                let else_branch = self.parse_expression_with_precedence(precedence)?;
+                Ok(Expression::Conditional {
+                    condition: Box::new(left),
+                    then_branch: Box::new(then_branch),
+                    else_branch: Some(Box::new(else_branch)),
+                    span,
+                })
+            }
+
+            // 成员访问 `object.member`
+            Token::Dot => {
+                // 注入器字段访问 obj.^field
+                if self.match_token(&Token::Caret) {
+                    let member = self.match_identifier().ok_or_else(|| {
+                        self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                        ()
+                    })?;
+                    return Ok(Expression::MemberAccess {
+                        object: Box::new(left),
+                        member: format!("^{}", member),
+                        span,
+                    });
+                }
+                let member = self.match_identifier().ok_or_else(|| {
+                    self.diagnostics.emit_error(self.current_span(), "期望成员名");
+                    ()
+                })?;
+                Ok(Expression::MemberAccess {
+                    object: Box::new(left),
+                    member,
+                    span,
+                })
+            }
+
+            // 方法调用 `receiver(args)`
+            Token::LParen => {
+                let args = self.parse_argument_list()?;
+                self.expect_token(&Token::RParen)?;
+
+                // 根据 left 的类型构造对应的调用表达式
+                match left {
+                    Expression::Identifier(name, _) => {
+                        // `func(args)` — 可能是静态调用或本地函数调用
+                        Ok(Expression::StaticMethodCall {
+                            class_name: String::new(),
+                            method: name,
+                            arguments: args,
+                            span,
+                        })
+                    }
+                    Expression::MemberAccess { object, member, span: _ms } => {
+                        Ok(Expression::MethodCall {
+                            receiver: object,
+                            method: member,
+                            arguments: args,
+                            span,
+                        })
+                    }
+                    other => {
+                        // `expr()` — 委托调用，暂用 MethodCall 表示
+                        Ok(Expression::MethodCall {
+                            receiver: Box::new(other),
+                            method: String::new(),
+                            arguments: args,
+                            span,
+                        })
+                    }
+                }
+            }
+
+            // 数组访问 `array[index]`
+            Token::LBracket => {
+                let index = self.parse_expression()?;
+                self.expect_token(&Token::RBracket)?;
+                Ok(Expression::ArrayAccess {
+                    array: Box::new(left),
+                    index: Box::new(index),
+                    span,
+                })
+            }
+
+            // 后缀自增/自减
+            Token::PlusPlus => Ok(Expression::Unary {
+                operator: UnaryOp::PostIncrement,
+                operand: Box::new(left),
+                span,
+            }),
+            Token::MinusMinus => Ok(Expression::Unary {
+                operator: UnaryOp::PostDecrement,
+                operand: Box::new(left),
+                span,
+            }),
+
+            // Lambda: typeRef : (params) -> body
+            Token::Colon => {
+                if self.check(&Token::LParen) {
+                    self.advance(); // (
+                    let params = self.parse_typed_parameters()?;
+                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::LambdaArrow)?; // ->
+                    let body = if self.check(&Token::LBrace) {
+                        LambdaBody::Block(self.parse_block()?)
+                    } else {
+                        LambdaBody::Expression(Box::new(self.parse_expression()?))
+                    };
+                    return Ok(Expression::Lambda {
+                        parameters: params,
+                        body,
+                        span,
+                    });
+                }
+                self.diagnostics.emit_error(span, "Colon 后期望 Lambda 参数列表或注入器字面量");
+                Err(())
+            }
+
+            _ => {
+                self.diagnostics
+                    .emit_error(span, "意外的中缀操作符");
+                Err(())
+            }
+        }
+    }
+}
+
+/// Token 转换为二元操作符
+fn token_to_binary_op(token: &Token) -> BinaryOp {
+    match token {
+        Token::Plus => BinaryOp::Add,
+        Token::Minus => BinaryOp::Subtract,
+        Token::Star => BinaryOp::Multiply,
+        Token::Slash => BinaryOp::Divide,
+        Token::Percent => BinaryOp::Modulo,
+        Token::Less => BinaryOp::Less,
+        Token::LessEqual => BinaryOp::LessEqual,
+        Token::Greater => BinaryOp::Greater,
+        Token::GreaterEqual => BinaryOp::GreaterEqual,
+        Token::EqualEqual => BinaryOp::Equal,
+        Token::NotEqual => BinaryOp::NotEqual,
+        Token::AndAnd => BinaryOp::LogicAnd,
+        Token::OrOr => BinaryOp::LogicOr,
+        _ => BinaryOp::Add, // 不应该到达这里
+    }
+}
+
+/// Token 转换为赋值操作符
+fn token_to_assignment_op(token: &Token) -> AssignmentOp {
+    match token {
+        Token::Assign => AssignmentOp::Assign,
+        Token::PlusAssign => AssignmentOp::PlusAssign,
+        Token::MinusAssign => AssignmentOp::MinusAssign,
+        Token::StarAssign => AssignmentOp::StarAssign,
+        Token::SlashAssign => AssignmentOp::SlashAssign,
+        Token::PercentAssign => AssignmentOp::Assign,
+        _ => AssignmentOp::Assign,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::tokenize;
+
+    /// 辅助函数：对源码进行词法 + 语法分析，返回解析结果
+    fn parse_source(source: &str) -> Result<SourceFile, Diagnostics> {
+        let (tokens, lexer_diags) = tokenize(source, 0);
+        if !lexer_diags.is_empty() {
+            eprintln!("词法错误: {:?}", lexer_diags);
+        }
+        let mut parser = Parser::new(tokens);
+        parser.parse_source_file()
+    }
+
+    /// 辅助函数：解析表达式
+    fn parse_expr(source: &str) -> Result<Expression, Diagnostics> {
+        let (tokens, _) = tokenize(source, 0);
+        let mut parser = Parser::new(tokens);
+        match parser.parse_expression() {
+            Ok(expr) => {
+                if parser.diagnostics.has_errors() {
+                    Err(parser.into_diagnostics())
+                } else {
+                    Ok(expr)
+                }
+            }
+            Err(_) => Err(parser.into_diagnostics()),
+        }
+    }
+
+    #[test]
+    fn test_parse_integer_literal() {
+        let result = parse_expr("42").unwrap();
+        assert!(matches!(result, Expression::Literal(Literal::Int(42), _)));
+    }
+
+    #[test]
+    fn test_parse_float_literal() {
+        let result = parse_expr("3.14").unwrap();
+        assert!(matches!(result, Expression::Literal(Literal::Float(v), _) if (v - 3.14).abs() < 0.001));
+    }
+
+    #[test]
+    fn test_parse_string_literal() {
+        let result = parse_expr(r#""hello""#).unwrap();
+        assert!(matches!(result, Expression::Literal(Literal::String(s), _) if s == "hello"));
+    }
+
+    #[test]
+    fn test_parse_identifier() {
+        let result = parse_expr("myVar").unwrap();
+        assert!(matches!(result, Expression::Identifier(name, _) if name == "myVar"));
+    }
+
+    #[test]
+    fn test_parse_binary_add() {
+        let result = parse_expr("1 + 2").unwrap();
+        assert!(matches!(result, Expression::Binary { operator: BinaryOp::Add, .. }));
+    }
+
+    #[test]
+    fn test_parse_binary_mul() {
+        let result = parse_expr("3 * 4").unwrap();
+        assert!(matches!(result, Expression::Binary { operator: BinaryOp::Multiply, .. }));
+    }
+
+    #[test]
+    fn test_parse_comparison() {
+        let result = parse_expr("x < y").unwrap();
+        assert!(matches!(result, Expression::Binary { operator: BinaryOp::Less, .. }));
+    }
+
+    #[test]
+    fn test_parse_equality() {
+        let result = parse_expr("a == b").unwrap();
+        assert!(matches!(result, Expression::Binary { operator: BinaryOp::Equal, .. }));
+    }
+
+    #[test]
+    fn test_parse_logical_and() {
+        let result = parse_expr("true && false").unwrap();
+        assert!(matches!(result, Expression::Binary { operator: BinaryOp::LogicAnd, .. }));
+    }
+
+    #[test]
+    fn test_parse_logical_or() {
+        let result = parse_expr("a || b").unwrap();
+        assert!(matches!(result, Expression::Binary { operator: BinaryOp::LogicOr, .. }));
+    }
+
+    #[test]
+    fn test_parse_precedence_mul_before_add() {
+        // 应该解析为 (1 + (2 * 3))
+        let result = parse_expr("1 + 2 * 3").unwrap();
+        match result {
+            Expression::Binary { left, operator: BinaryOp::Add, right, .. } => {
+                assert!(matches!(*left, Expression::Literal(Literal::Int(1), _)));
+                assert!(matches!(*right, Expression::Binary { operator: BinaryOp::Multiply, .. }));
+            }
+            _ => panic!("期望加法为顶层操作"),
+        }
+    }
+
+    #[test]
+    fn test_parse_parentheses() {
+        let result = parse_expr("(1 + 2) * 3").unwrap();
+        match result {
+            Expression::Binary { left, operator: BinaryOp::Multiply, .. } => {
+                assert!(matches!(*left, Expression::Binary { operator: BinaryOp::Add, .. }));
+            }
+            _ => panic!("期望乘法为顶层操作"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unary_negate() {
+        let result = parse_expr("-5").unwrap();
+        assert!(matches!(result, Expression::Unary { operator: UnaryOp::Negate, .. }));
+    }
+
+    #[test]
+    fn test_parse_unary_not() {
+        let result = parse_expr("!flag").unwrap();
+        assert!(matches!(result, Expression::Unary { operator: UnaryOp::Not, .. }));
+    }
+
+    #[test]
+    fn test_parse_assignment() {
+        let result = parse_expr("x = 10").unwrap();
+        assert!(matches!(result, Expression::Assignment { operator: AssignmentOp::Assign, .. }));
+    }
+
+    #[test]
+    fn test_parse_member_access() {
+        let result = parse_expr("obj.field").unwrap();
+        assert!(matches!(result, Expression::MemberAccess { member, .. } if member == "field"));
+    }
+
+    #[test]
+    fn test_parse_method_call() {
+        let result = parse_expr("obj.method()").unwrap();
+        assert!(matches!(result, Expression::MethodCall { method, .. } if method == "method"));
+    }
+
+    #[test]
+    fn test_parse_conditional() {
+        let result = parse_expr("a ? b : c").unwrap();
+        assert!(matches!(result, Expression::Conditional { .. }));
+    }
+
+    #[test]
+    fn test_parse_null() {
+        let result = parse_expr("null").unwrap();
+        assert!(matches!(result, Expression::Null(_)));
+    }
+
+    #[test]
+    fn test_parse_bool_literal() {
+        let t = parse_expr("true").unwrap();
+        assert!(matches!(t, Expression::Literal(Literal::Bool(true), _)));
+        let f = parse_expr("false").unwrap();
+        assert!(matches!(f, Expression::Literal(Literal::Bool(false), _)));
+    }
+
+    #[test]
+    fn test_parse_class_with_method() {
+        let source = "class Test { int getValue() { return 42; } }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test");
+                assert_eq!(c.members.len(), 1);
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_declaration() {
+        let source = "class MyClass { }";
+        let ast = parse_source(source).unwrap();
+        assert_eq!(ast.members.len(), 1);
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => assert_eq!(c.name, "MyClass"),
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_with_field() {
+        let source = "class Point { int x; float y; }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Point");
+                assert_eq!(c.members.len(), 2);
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_interface() {
+        let source = "interface IDrawable { void draw(); }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Interface(i) => {
+                assert_eq!(i.name, "IDrawable");
+                assert_eq!(i.methods.len(), 1);
+            }
+            _ => panic!("期望接口声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_enum() {
+        let source = "enum Color { Red, Green, Blue }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Enum(e) => {
+                assert_eq!(e.name, "Color");
+                assert_eq!(e.values.len(), 3);
+            }
+            _ => panic!("期望枚举声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_with_inheritance() {
+        let source = "class Dog : Animal :: IPet , IBark { }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Dog");
+                assert!(c.super_class.is_some());
+                assert_eq!(c.super_interfaces.len(), 2);
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_namespace() {
+        let source = "namespace MyGame; class Player { }";
+        let ast = parse_source(source).unwrap();
+        assert!(ast.namespace.is_some());
+    }
+
+    #[test]
+    fn test_parse_namespace_interleaved() {
+        let source = "namespace A; class X { } namespace B; class Y { }";
+        let ast = parse_source(source).unwrap();
+        // 最后一个 namespace 生效
+        assert!(ast.namespace.is_some());
+        assert_eq!(ast.members.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_using() {
+        let source = "using System; class Foo { }";
+        let ast = parse_source(source).unwrap();
+        assert_eq!(ast.usings.len(), 1);
+    }
+}

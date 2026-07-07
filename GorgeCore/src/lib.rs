@@ -1,3 +1,16 @@
-pub fn hello() {
-    println!("Hello from GorgeCore!");
-}
+pub mod diagnostics;
+pub mod ir;
+pub mod vm;
+pub mod bytecode;
+pub mod types;
+pub mod declaration;
+pub mod value_pool;
+pub mod object;
+pub mod class;
+pub mod injector;
+pub mod param_pool;
+pub mod interface;
+pub mod runtime;
+pub mod delegate;
+pub mod array;
+pub mod list;

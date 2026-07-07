@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "GorgeCompiler"
+name = "gorgec"
 path = "src/main.rs"
+
+[[bin]]
+name = "gorge"
+path = "src/vm_main.rs"
 
 [dependencies]
 gorge_core = { path = "../GorgeCore" }
+logos = "0.15"
