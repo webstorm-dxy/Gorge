@@ -314,33 +314,25 @@ impl Parser {
 
     /// 解析类型引用
     ///
-    /// 支持简单类型名（`int`、`MyClass`）和泛型类型（`List<MyClass>`）
-    /// 以及数组类型（`int[]`）。
+    /// 支持简单类型名（`int`、`MyClass`）、泛型类型（`List<MyClass>`）、
+    /// 数组类型（`int[]`）、注入器类型（`Type^`）及其组合（`Type^[]^`）。
     fn parse_type_ref(&mut self) -> Result<TypeRef, ()> {
         let span = self.current_span();
 
-        // 内置类型关键字
-        if self.match_token(&Token::TypeInt) {
-            return Ok(TypeRef::simple("int", span));
-        }
-        if self.match_token(&Token::TypeFloat) {
-            return Ok(TypeRef::simple("float", span));
-        }
-        if self.match_token(&Token::TypeBool) {
-            return Ok(TypeRef::simple("bool", span));
-        }
-        if self.match_token(&Token::TypeString) {
-            return Ok(TypeRef::simple("string", span));
-        }
-        if self.match_token(&Token::TypeVoid) {
-            return Ok(TypeRef::simple("void", span));
-        }
-        if self.match_token(&Token::TypeObject) {
-            return Ok(TypeRef::simple("object", span));
-        }
-
-        // delegate<ReturnType, ParamType, ...>
-        if self.match_token(&Token::KwDelegate) {
+        let mut result = if self.match_token(&Token::TypeInt) {
+            TypeRef::simple("int", span)
+        } else if self.match_token(&Token::TypeFloat) {
+            TypeRef::simple("float", span)
+        } else if self.match_token(&Token::TypeBool) {
+            TypeRef::simple("bool", span)
+        } else if self.match_token(&Token::TypeString) {
+            TypeRef::simple("string", span)
+        } else if self.match_token(&Token::TypeVoid) {
+            TypeRef::simple("void", span)
+        } else if self.match_token(&Token::TypeObject) {
+            TypeRef::simple("object", span)
+        } else if self.match_token(&Token::KwDelegate) {
+            // delegate<ReturnType, ParamType, ...>
             self.expect_token(&Token::Less)?;
             let return_type = self.parse_type_ref()?;
             let mut param_types = Vec::new();
@@ -348,47 +340,55 @@ impl Parser {
                 param_types.push(self.parse_type_ref()?);
             }
             self.expect_token(&Token::Greater)?;
-            return Ok(TypeRef::Delegate {
+            TypeRef::Delegate {
                 return_type: Box::new(return_type),
                 param_types,
                 span,
-            });
-        }
-
-        // 用户自定义类型名
-        let name = self.match_identifier().ok_or_else(|| {
-            self.diagnostics
-                .emit_error(self.current_span(), "期望类型名称");
-            ()
-        })?;
-
-        // 泛型参数
-        if self.match_token(&Token::Less) {
-            let mut type_args = Vec::new();
-            loop {
-                type_args.push(self.parse_type_ref()?);
-                if !self.match_token(&Token::Comma) {
-                    break;
-                }
             }
-            self.expect_token(&Token::Greater).map_err(|_| ())?;
-            return Ok(TypeRef::Generic {
-                name,
-                type_args,
-                span,
-            });
+        } else {
+            // 用户自定义类型名
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics
+                    .emit_error(self.current_span(), "期望类型名称");
+                ()
+            })?;
+
+            // 泛型参数
+            if self.match_token(&Token::Less) {
+                let mut type_args = Vec::new();
+                loop {
+                    type_args.push(self.parse_type_ref()?);
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect_token(&Token::Greater).map_err(|_| ())?;
+                TypeRef::Generic { name, type_args, span }
+            } else {
+                TypeRef::simple(name, span)
+            }
+        };
+
+        // 后缀链: [] 和 ^ 的任意组合（[] 只在紧接 RBracket 时才是类型后缀）
+        loop {
+            if self.check(&Token::LBracket) && matches!(self.peek_ahead(1).map(|t| &t.token), Some(Token::RBracket)) {
+                self.advance(); // [
+                self.advance(); // ]
+                result = TypeRef::Array {
+                    element_type: Box::new(result),
+                    span,
+                };
+            } else if self.match_token(&Token::Caret) {
+                result = TypeRef::Injector {
+                    base_type: Box::new(result),
+                    span,
+                };
+            } else {
+                break;
+            }
         }
 
-        // 数组类型
-        if self.match_token(&Token::LBracket) {
-            self.expect_token(&Token::RBracket).map_err(|_| ())?;
-            return Ok(TypeRef::Array {
-                element_type: Box::new(TypeRef::simple(name, span)),
-                span,
-            });
-        }
-
-        Ok(TypeRef::simple(name, span))
+        Ok(result)
     }
 
     /// 解析限定名（如 `System.Collections.Generic`）
@@ -418,28 +418,50 @@ impl Parser {
     // ==================== 类声明 ====================
 
     /// 解析类声明中的成员
+    ///
+    /// 通过 lookahead 区分三种成员声明：字段、方法和构造函数。
+    /// 构造函数由类名标识符后跟 `(` 开头，而字段和方法都由类型引用开头。
     fn parse_class_member(&mut self) -> Result<ClassMember, ()> {
         let annotations = self.parse_annotations();
         let modifiers = self.parse_modifiers();
-        let member_type = self.parse_type_ref()?;
-        let name = self.match_identifier().ok_or_else(|| {
-            self.diagnostics
-                .emit_error(self.current_span(), "期望成员名称");
-            ()
-        })?;
 
-        match self.peek() {
-            // 方法声明：`Type name(`
-            Some(TokenSpan { token: Token::LParen, .. }) => {
-                self.parse_method_declaration(annotations, modifiers, member_type, name)
-                    .map(ClassMember::Method)
-            }
-            // 字段声明：`Type name =` 或 `Type name;`
-            _ => {
-                self.parse_field_declaration(annotations, modifiers, member_type, name)
-                    .map(ClassMember::Field)
+        // 保存位置用于回退到构造函数路径
+        let saved_pos = self.pos;
+
+        // 尝试解析为 TypeRef + Identifier（方法或字段）
+        if let Ok(member_type) = self.parse_type_ref() {
+            if let Some(name) = self.match_identifier() {
+                match self.peek() {
+                    Some(TokenSpan { token: Token::LParen, .. }) => {
+                        return self
+                            .parse_method_declaration(annotations, modifiers, member_type, name)
+                            .map(ClassMember::Method);
+                    }
+                    _ => {
+                        return self
+                            .parse_field_declaration(annotations, modifiers, member_type, name)
+                            .map(ClassMember::Field);
+                    }
+                }
             }
         }
+
+        // 回退到 modifiers 之后：尝试构造函数路径
+        // 构造函数语法：annotation* [injector] Identifier ( params ) [: super(args)] { body }
+        self.pos = saved_pos;
+
+        if let Some(name) = self.match_identifier() {
+            if self.check(&Token::LParen) {
+                return self
+                    .parse_constructor_declaration(annotations, modifiers, name)
+                    .map(ClassMember::Constructor);
+            }
+        }
+
+        let span = self.current_span();
+        self.diagnostics
+            .emit_error(span, "期望字段、方法或构造函数声明");
+        Err(())
     }
 
     /// 解析字段声明
@@ -495,6 +517,50 @@ impl Parser {
             return_type,
             name,
             parameters,
+            body,
+            span,
+        })
+    }
+
+    /// 解析构造函数声明（关键字 `(` 还未消费，需由调用方确认）
+    ///
+    /// Gorge 构造函数语法：`[injector] ClassName(params) [: super(args)] { body }`
+    fn parse_constructor_declaration(
+        &mut self,
+        annotations: Vec<Annotation>,
+        modifiers: Vec<Modifier>,
+        _name: String,
+    ) -> Result<ConstructorDeclaration, ()> {
+        let span = self.current_span();
+        self.advance(); // 消费 '('
+        let parameters = self.parse_parameters()?;
+        self.expect_token(&Token::RParen)?;
+
+        // 可选的 super(...) 调用
+        let base_arguments = if self.match_token(&Token::Colon) {
+            self.expect_token(&Token::KwSuper)?;
+            self.expect_token(&Token::LParen)?;
+            let args = self.parse_argument_list()?;
+            self.expect_token(&Token::RParen)?;
+            args
+        } else {
+            Vec::new()
+        };
+
+        // 构造方法体
+        let body = if self.check(&Token::LBrace) {
+            let statements = self.parse_block()?;
+            Some(statements)
+        } else {
+            self.expect_semicolon()?;
+            None
+        };
+
+        Ok(ConstructorDeclaration {
+            annotations,
+            modifiers,
+            parameters,
+            base_arguments,
             body,
             span,
         })
@@ -838,6 +904,7 @@ impl Parser {
             let m = match self.peek().map(|t| &t.token) {
                 Some(Token::KwNative) => Some(Modifier::Native),
                 Some(Token::KwStatic) => Some(Modifier::Static),
+                Some(Token::KwInjector) => Some(Modifier::Injector),
                 _ => None,
             };
             if let Some(modifier) = m {
@@ -1190,6 +1257,19 @@ impl Parser {
         let mut left = self.parse_prefix()?;
 
         while !self.is_at_end() {
+            // `:` 只在后跟 `{`（注入器）或 `(`（Lambda）时作为中缀操作符
+            // 否则留给条件表达式 `?:` 的 else 分支消费
+            if self.check(&Token::Colon) {
+                if let Some(tok) = self.peek_ahead(1) {
+                    if matches!(&tok.token, Token::LBrace | Token::LParen) {
+                        left = self.parse_infix(left, PREC_POSTFIX)?;
+                        continue;
+                    }
+                }
+                // `:` 后不是 { 或 ( → 退出，让上层 ? 处理
+                break;
+            }
+
             let precedence = self.current_infix_precedence();
             if precedence < min_precedence {
                 break;
@@ -1220,6 +1300,15 @@ impl Parser {
             Token::KwTrue => Ok(Expression::Literal(Literal::Bool(true), span)),
             Token::KwFalse => Ok(Expression::Literal(Literal::Bool(false), span)),
             Token::KwNull => Ok(Expression::Null(span)),
+
+            // 注入器字段引用 `^fieldName`
+            Token::Caret => {
+                let name = self.match_identifier().ok_or_else(|| {
+                    self.diagnostics.emit_error(self.current_span(), "注入器字段引用 `^` 后期望标识符");
+                    ()
+                })?;
+                Ok(Expression::InjectorFieldRef(name, span))
+            }
 
             // 标识符（可能是变量引用、类型名或函数调用的一部分）
             Token::Identifier(name) => {
@@ -1335,12 +1424,63 @@ impl Parser {
         }
     }
 
-    /// 解析 new 表达式：`new ClassName()` 或 `new ClassName { injector }`
+    /// 解析 new 表达式：`new Type(args)` / `new Type[size]` / `new ^field(args)` / `new var(args)`
     fn parse_new_expression(&mut self, span: Span) -> Result<Expression, ()> {
-        let class_type = self.parse_type_ref()?;
+        let saved = self.pos;
 
-        // 构造参数
-        let arguments = if self.match_token(&Token::LParen) {
+        // 如果当前 token 是类型开头（关键字/标识符/delegate），尝试类型路径
+        let is_type_start = matches!(
+            self.peek().map(|t| &t.token),
+            Some(Token::TypeInt)
+                | Some(Token::TypeFloat)
+                | Some(Token::TypeBool)
+                | Some(Token::TypeString)
+                | Some(Token::TypeVoid)
+                | Some(Token::TypeObject)
+                | Some(Token::KwDelegate)
+                | Some(Token::Identifier(_))
+        );
+
+        if is_type_start {
+            if let Ok(class_type) = self.parse_type_ref() {
+                // new Type(args)
+                if self.check(&Token::LParen) {
+                    let arguments = if self.match_token(&Token::LParen) {
+                        let args = self.parse_argument_list()?;
+                        self.expect_token(&Token::RParen)?;
+                        args
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(Expression::New { class_type, arguments, span });
+                }
+                // new Type[size] — 数组构造
+                if self.check(&Token::LBracket) {
+                    self.advance(); // [
+                    let size = self.parse_expression()?;
+                    self.expect_token(&Token::RBracket)?;
+                    // 用 StaticMethodCall 暂代数组构造
+                    let type_name = match &class_type {
+                        TypeRef::Simple { name, .. } => name.clone(),
+                        _ => "array".into(),
+                    };
+                    return Ok(Expression::StaticMethodCall {
+                        class_name: type_name,
+                        method: "new_array".into(),
+                        arguments: vec![size],
+                        span,
+                    });
+                }
+            }
+            // 类型路径失败，错误已记录
+            return Err(());
+        }
+
+        // 表达式路径: new ^field(args) 或 new var(args)
+        self.pos = saved;
+        let target_expr = self.parse_expression()?;
+        let arguments = if self.check(&Token::LParen) {
+            self.advance(); // (
             let args = self.parse_argument_list()?;
             self.expect_token(&Token::RParen)?;
             args
@@ -1348,11 +1488,26 @@ impl Parser {
             Vec::new()
         };
 
-        Ok(Expression::New {
-            class_type,
-            arguments,
-            span,
-        })
+        match &target_expr {
+            Expression::InjectorFieldRef(name, _) => Ok(Expression::StaticMethodCall {
+                class_name: format!("^{}", name),
+                method: String::new(),
+                arguments,
+                span,
+            }),
+            Expression::Identifier(name, _) => Ok(Expression::StaticMethodCall {
+                class_name: name.clone(),
+                method: String::new(),
+                arguments,
+                span,
+            }),
+            _ => Ok(Expression::StaticMethodCall {
+                class_name: String::new(),
+                method: String::new(),
+                arguments,
+                span,
+            }),
+        }
     }
 
     /// 解析注入器对象字面量 `{ key: value, ... }`
@@ -1405,6 +1560,72 @@ impl Parser {
         Ok(Expression::InjectorArray { elements, span })
     }
 
+    /// 解析注入器字面量内容 `{ ... }`（前面的 `{` 已被消费）
+    ///
+    /// 在 `expr : { ... }` 语法中使用。根据内容格式自动区分配置对象注入器
+    /// （`{ key: value, ... }`）和数组注入器（`{ elem, elem, ... }`）。
+    fn parse_injector_literal_content(&mut self, span: Span) -> Result<Expression, ()> {
+        // 空注入器对象 `{:}`
+        if self.match_token(&Token::Colon) {
+            self.expect_token(&Token::RBrace)?;
+            return Ok(Expression::InjectorObject { fields: Vec::new(), span });
+        }
+        // 空注入器数组 `{,}`
+        if self.match_token(&Token::Comma) {
+            self.expect_token(&Token::RBrace)?;
+            return Ok(Expression::InjectorArray { elements: Vec::new(), span });
+        }
+        // 直接闭合 `{}` — 视为空对象注入器
+        if self.check(&Token::RBrace) {
+            self.advance();
+            return Ok(Expression::InjectorObject { fields: Vec::new(), span });
+        }
+
+        // 有内容：lookahead 判读是 key:value 对还是纯表达式列表
+        let saved = self.pos;
+        let is_object = self.match_identifier().is_some() && self.check(&Token::Colon);
+        self.pos = saved; // 回退
+
+        if is_object {
+            // 对象注入器：`{ key: value, key: value, ... }`
+            let mut fields = Vec::new();
+            loop {
+                let key = self.match_identifier().ok_or_else(|| {
+                    self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                    ()
+                })?;
+                self.expect_token(&Token::Colon)?;
+                let value = self.parse_expression()?;
+                fields.push((key, value));
+
+                if self.match_token(&Token::Comma) {
+                    if self.check(&Token::RBrace) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.expect_token(&Token::RBrace)?;
+            Ok(Expression::InjectorObject { fields, span })
+        } else {
+            // 数组注入器：`{ expr, expr, ... }`
+            let mut elements = Vec::new();
+            loop {
+                elements.push(self.parse_expression()?);
+                if self.match_token(&Token::Comma) {
+                    if self.check(&Token::RBrace) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.expect_token(&Token::RBrace)?;
+            Ok(Expression::InjectorArray { elements, span })
+        }
+    }
+
     /// 解析参数/元素列表（逗号分隔的表达式）
     fn parse_argument_list(&mut self) -> Result<Vec<Expression>, ()> {
         let mut args = Vec::new();
@@ -1454,6 +1675,7 @@ impl Parser {
             Some(Token::Dot)
             | Some(Token::LParen)
             | Some(Token::LBracket)
+            | Some(Token::Caret)
             | Some(Token::PlusPlus)
             | Some(Token::MinusMinus) => PREC_POSTFIX,
 
@@ -1635,7 +1857,14 @@ impl Parser {
                 span,
             }),
 
-            // Lambda: typeRef : (params) -> body
+            // 注入器类型后缀 expr^、注入器字段访问 obj.^field
+            Token::Caret => Ok(Expression::MemberAccess {
+                object: Box::new(left),
+                member: "^".into(),
+                span,
+            }),
+
+            // Lambda: typeRef : (params) -> body 或注入器字面量: expr : { ... }
             Token::Colon => {
                 if self.check(&Token::LParen) {
                     self.advance(); // (
@@ -1652,6 +1881,11 @@ impl Parser {
                         body,
                         span,
                     });
+                }
+                // 注入器字面量: expr : { key: value } 或 expr : { elem, elem }
+                if self.check(&Token::LBrace) {
+                    self.advance(); // 消费 '{'
+                    return self.parse_injector_literal_content(span);
                 }
                 self.diagnostics.emit_error(span, "Colon 后期望 Lambda 参数列表或注入器字面量");
                 Err(())
@@ -1962,5 +2196,318 @@ mod tests {
         let source = "using System; class Foo { }";
         let ast = parse_source(source).unwrap();
         assert_eq!(ast.usings.len(), 1);
+    }
+
+    // ==================== 构造函数解析测试 ====================
+
+    #[test]
+    fn test_parse_class_with_constructor() {
+        let source = "class Test4 { Test4(int x) { this.x = x; } }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test4");
+                assert_eq!(c.members.len(), 1);
+                assert!(matches!(&c.members[0], ClassMember::Constructor(_)));
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_with_constructor_and_super() {
+        let source = "class TestB : TestA { TestB(int x) : super(x + 1) { value = x; } }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "TestB");
+                assert_eq!(c.members.len(), 1);
+                match &c.members[0] {
+                    ClassMember::Constructor(ctor) => {
+                        assert_eq!(ctor.parameters.len(), 1);
+                        assert_eq!(ctor.base_arguments.len(), 1);
+                        assert!(ctor.body.is_some());
+                    }
+                    _ => panic!("期望构造函数"),
+                }
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_with_injector_constructor() {
+        let source = "class Test11A { injector Test11A(int i) { value = value + i; } }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                match &c.members[0] {
+                    ClassMember::Constructor(ctor) => {
+                        assert!(ctor.modifiers.iter().any(|m| matches!(m, Modifier::Injector)));
+                        assert_eq!(ctor.parameters.len(), 1);
+                    }
+                    _ => panic!("期望构造函数"),
+                }
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_with_field_method_and_constructor() {
+        let source = r#"
+class Test4 {
+    int counter;
+    int increasment;
+    Test4(int inc) {
+        this.increasment = inc;
+    }
+    void SelfIncreasement() {
+        counter = counter + 1;
+    }
+}
+"#;
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test4");
+                assert_eq!(c.members.len(), 4);
+                let field_count = c.members.iter().filter(|m| matches!(m, ClassMember::Field(_))).count();
+                let ctor_count = c.members.iter().filter(|m| matches!(m, ClassMember::Constructor(_))).count();
+                let method_count = c.members.iter().filter(|m| matches!(m, ClassMember::Method(_))).count();
+                assert_eq!(field_count, 2, "应有 2 个字段");
+                assert_eq!(ctor_count, 1, "应有 1 个构造函数");
+                assert_eq!(method_count, 1, "应有 1 个方法");
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    #[test]
+    fn test_parse_class_with_native_constructor() {
+        let source = "native class Test8N { int gorgeField; Test8N(int a, int b); static int GetConst(); }";
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test8N");
+                assert_eq!(c.members.len(), 3);
+                let ctor_count = c.members.iter().filter(|m| matches!(m, ClassMember::Constructor(_))).count();
+                assert_eq!(ctor_count, 1, "应有 1 个构造函数");
+                match &c.members[1] {
+                    ClassMember::Constructor(ctor) => {
+                        assert!(ctor.body.is_none(), "native 构造函数应无方法体");
+                        assert_eq!(ctor.parameters.len(), 2);
+                    }
+                    _ => panic!("第 2 个成员应是构造函数"),
+                }
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    // ==================== 真实 .g 文件解析验证 ====================
+
+    /// 解析 Test4.g 的核心结构并验证构造函数 AST
+    #[test]
+    fn test_parse_test4g_constructor_and_this() {
+        let source = r#"
+class Test4
+{
+    int counter;
+    int increasment;
+    int selfIncreasement = -1;
+
+    Test4(int increasment)
+    {
+        this.increasment = increasment;
+    }
+
+    void SelfIncreasement()
+    {
+        counter = counter + selfIncreasement;
+    }
+
+    static int DoTest()
+    {
+        Test4 t = new Test4(2);
+        t.counter = 0;
+        for(int j = 0; j < 100000000; j = j + 1)
+        {
+            t.counter = t.counter + t.increasment;
+            t.SelfIncreasement();
+        }
+        return t.counter;
+    }
+}
+"#;
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test4");
+                assert_eq!(c.members.len(), 6);
+
+                // 验证三个字段
+                let fields: Vec<_> = c.members.iter()
+                    .filter_map(|m| if let ClassMember::Field(f) = m { Some(f) } else { None })
+                    .collect();
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].name, "counter");
+                assert_eq!(fields[1].name, "increasment");
+                assert_eq!(fields[2].name, "selfIncreasement");
+                assert!(fields[2].initializer.is_some(), "selfIncreasement 应有初始值 -1");
+
+                // 验证构造函数
+                let ctors: Vec<_> = c.members.iter()
+                    .filter_map(|m| if let ClassMember::Constructor(ctor) = m { Some(ctor) } else { None })
+                    .collect();
+                assert_eq!(ctors.len(), 1, "应有 1 个构造函数");
+                let ctor = ctors[0];
+                assert_eq!(ctor.parameters.len(), 1);
+                assert_eq!(ctor.parameters[0].name, "increasment");
+                assert!(matches!(&ctor.parameters[0].param_type, TypeRef::Simple { name, .. } if name == "int"));
+                assert!(ctor.base_arguments.is_empty(), "无 super() 调用");
+                assert!(ctor.body.is_some(), "应有构造函数体");
+                let body = ctor.body.as_ref().unwrap();
+                assert_eq!(body.len(), 1);
+
+                // 验证构造函数体中的赋值语句：this.increasment = increasment;
+                match &body[0] {
+                    Statement::Expression(expr, _) => {
+                        match expr {
+                            Expression::Assignment { target, operator, .. } => {
+                                assert!(matches!(operator, AssignmentOp::Assign));
+                                match target {
+                                    AssignmentTarget::Field { object, field, .. } => {
+                                        assert!(matches!(**object, Expression::This(_)), "赋值目标是 this.field");
+                                        assert_eq!(field, "increasment");
+                                    }
+                                    _ => panic!("赋值目标应为字段"),
+                                }
+                            }
+                            _ => panic!("构造函数首语句应为赋值"),
+                        }
+                    }
+                    _ => panic!("构造函数体应有表达式语句"),
+                }
+
+                // 验证 void SelfIncreasement 方法
+                let methods: Vec<_> = c.members.iter()
+                    .filter_map(|m| if let ClassMember::Method(meth) = m { Some(meth) } else { None })
+                    .collect();
+                assert_eq!(methods.len(), 2);
+                assert_eq!(methods[0].name, "SelfIncreasement");
+                assert_eq!(methods[1].name, "DoTest");
+                assert!(methods[1].modifiers.iter().any(|m| matches!(m, Modifier::Static)), "DoTest 应为 static");
+            }
+            _ => panic!("期望类声明"),
+        }
+    }
+
+    /// 解析 Test5.g 的多类 + 继承 + super() 结构
+    #[test]
+    fn test_parse_test5g_multi_class_with_super() {
+        let source = r#"
+class Test5A
+{
+    int valueA;
+    Test5A(int value)
+    {
+        valueA = value;
+    }
+    int GetValue() { return valueA; }
+    int GetValueA() { return valueA; }
+}
+class Test5B : Test5A
+{
+    int valueB;
+    Test5B(int value) : super(value + 1)
+    {
+        valueB = value;
+    }
+    int GetValue() { return valueB; }
+    int GetValueB() { return valueB; }
+}
+"#;
+        let ast = parse_source(source).unwrap();
+        assert_eq!(ast.members.len(), 2, "应有两个类");
+
+        // 验证 Test5A
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test5A");
+                assert!(c.super_class.is_none());
+                assert_eq!(c.members.len(), 4);
+                // 构造函数
+                let ctors: Vec<_> = c.members.iter()
+                    .filter_map(|m| if let ClassMember::Constructor(ctor) = m { Some(ctor) } else { None })
+                    .collect();
+                assert_eq!(ctors.len(), 1);
+                assert!(ctors[0].base_arguments.is_empty());
+            }
+            _ => panic!("Test5A 应为类"),
+        }
+
+        // 验证 Test5B
+        match &ast.members[1] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test5B");
+                assert!(c.super_class.is_some(), "应有父类 Test5A");
+                match c.super_class.as_ref().unwrap() {
+                    TypeRef::Simple { name, .. } => assert_eq!(name, "Test5A"),
+                    _ => panic!("父类应为 Simple 类型"),
+                }
+                assert_eq!(c.members.len(), 4);
+                // 验证 super(args) 调用
+                let ctors: Vec<_> = c.members.iter()
+                    .filter_map(|m| if let ClassMember::Constructor(ctor) = m { Some(ctor) } else { None })
+                    .collect();
+                assert_eq!(ctors.len(), 1);
+                assert_eq!(ctors[0].base_arguments.len(), 1, "应有一个 super 参数");
+                // super(value + 1) — 参数是二元加法表达式
+                match &ctors[0].base_arguments[0] {
+                    Expression::Binary { operator: BinaryOp::Add, .. } => {},
+                    _ => panic!("super 参数应为 value + 1 加法表达式"),
+                }
+            }
+            _ => panic!("Test5B 应为类"),
+        }
+    }
+
+    /// 解析 Test9.g 的注入器构造函数
+    #[test]
+    fn test_parse_test9g_injector_constructor_with_super() {
+        let source = r#"
+class Test9Inner
+{
+    int innerFieldA;
+    Test9Inner()
+    {
+    }
+}
+class Test9A : Test9N
+{
+    int gorgeIntField;
+    Test9A() : super()
+    {
+    }
+}
+"#;
+        let ast = parse_source(source).unwrap();
+        assert_eq!(ast.members.len(), 2);
+
+        // 验证 Test9A 的 super() 无参数调用
+        match &ast.members[1] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Test9A");
+                let ctors: Vec<_> = c.members.iter()
+                    .filter_map(|m| if let ClassMember::Constructor(ctor) = m { Some(ctor) } else { None })
+                    .collect();
+                assert_eq!(ctors.len(), 1);
+                assert_eq!(ctors[0].body.as_ref().unwrap().len(), 0, "空构造函数体");
+                // super() 无参数
+                assert!(ctors[0].base_arguments.is_empty(), "super() 无参数");
+            }
+            _ => panic!("Test9A 应为类"),
+        }
     }
 }

@@ -32,6 +32,10 @@ pub struct CodeGenerator<'a> {
     next_local: HashMap<ValueType, usize>,
     /// 委托变量名 → delegate_impl 索引
     delegate_vars: HashMap<String, usize>,
+    /// 类字段名 → (偏移, 值类型) 映射
+    field_info: HashMap<String, (usize, ValueType)>,
+    /// 参数索引计数器（每次方法调用前重置）
+    param_index: usize,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -57,6 +61,8 @@ impl<'a> CodeGenerator<'a> {
             param_vars: HashMap::new(),
             next_local,
             delegate_vars: HashMap::new(),
+            field_info: HashMap::new(),
+            param_index: 0,
         }
     }
 
@@ -104,6 +110,50 @@ impl<'a> CodeGenerator<'a> {
     /// 发出一条 IR 指令
     fn emit(&mut self, code: IntermediateCode, span: Span) {
         self.codes.push(CodeWithSpan::new(code, span));
+    }
+
+    /// 设置类上下文，填充字段名→(偏移,类型) 映射（包含继承字段）
+    pub fn set_class_context(&mut self, class_name: &str) {
+        self.field_info.clear();
+        let scope_id = self.symbol_table.global_scope;
+        if let Some(mut class_id) = self.symbol_table.lookup_class(scope_id, class_name) {
+            loop {
+                let class_info = self.symbol_table.classes.get(class_id.0);
+                for &field_id in &class_info.fields {
+                    let fi = self.symbol_table.fields.get(field_id.0);
+                    let vt = Self::type_to_value_type(&fi.field_type);
+                    let offset = fi.offset.unwrap_or(0);
+                    self.field_info.entry(fi.name.clone()).or_insert((offset, vt));
+                }
+                // 继续处理父类
+                class_id = match class_info.super_class {
+                    Some(super_id) => super_id,
+                    None => break,
+                };
+            }
+        }
+    }
+
+    /// 生成读取字段的 IR 操作码
+    fn load_field_op(value_type: ValueType, field_index: usize) -> IntermediateOperator {
+        match value_type {
+            ValueType::Int => IntermediateOperator::LoadIntField(field_index),
+            ValueType::Float => IntermediateOperator::LoadFloatField(field_index),
+            ValueType::Bool => IntermediateOperator::LoadBoolField(field_index),
+            ValueType::String => IntermediateOperator::LoadStringField(field_index),
+            ValueType::Object => IntermediateOperator::LoadObjectField(field_index),
+        }
+    }
+
+    /// 生成写入字段的 IR 操作码
+    fn set_field_op(value_type: ValueType, field_index: usize) -> IntermediateOperator {
+        match value_type {
+            ValueType::Int => IntermediateOperator::SetIntField(field_index),
+            ValueType::Float => IntermediateOperator::SetFloatField(field_index),
+            ValueType::Bool => IntermediateOperator::SetBoolField(field_index),
+            ValueType::String => IntermediateOperator::SetStringField(field_index),
+            ValueType::Object => IntermediateOperator::SetObjectField(field_index),
+        }
     }
 
     // ==================== 类型推导 ====================
@@ -173,6 +223,16 @@ impl<'a> CodeGenerator<'a> {
                 match self.lookup_var(name) {
                     Some(addr) => Operand::Address(addr),
                     None => {
+                        // 回退：在类字段中查找
+                        if let Some(&(offset, vt)) = self.field_info.get(name) {
+                            let temp = self.alloc_temp(vt);
+                            let load_op = Self::load_field_op(vt, offset);
+                            self.emit(
+                                IntermediateCode::new(load_op, Operand::int(0), None, Some(temp)),
+                                *span,
+                            );
+                            return Operand::Address(temp);
+                        }
                         self.diagnostics.emit_error(
                             *span,
                             format!("未定义的变量 `{}`", name),
@@ -197,6 +257,15 @@ impl<'a> CodeGenerator<'a> {
                 self.generate_method_call(receiver, method, arguments, *span)
             }
             Expression::StaticMethodCall { class_name: _, method, arguments, span } => {
+                // 数组构造占位符 `new_array`
+                if method == "new_array" {
+                    for arg in arguments {
+                        let _ = self.generate_expression(arg);
+                    }
+                    let temp = self.alloc_temp(ValueType::Object);
+                    self.emit(IntermediateCode::nop(), *span);
+                    return Operand::Address(temp);
+                }
                 self.generate_delegate_call(method, arguments, *span)
             }
             Expression::New { class_type, arguments, span } => {
@@ -233,6 +302,11 @@ impl<'a> CodeGenerator<'a> {
                 for elem in elements {
                     let _val = self.generate_expression(elem);
                 }
+                let temp = self.alloc_temp(ValueType::Object);
+                self.emit(IntermediateCode::nop(), *span);
+                Operand::Address(temp)
+            }
+            Expression::InjectorFieldRef(_name, span) => {
                 let temp = self.alloc_temp(ValueType::Object);
                 self.emit(IntermediateCode::nop(), *span);
                 Operand::Address(temp)
@@ -453,6 +527,12 @@ impl<'a> CodeGenerator<'a> {
                 let addr = match self.lookup_var(name) {
                     Some(a) => a,
                     None => {
+                        // 回退：检查是否为实例字段
+                        if let Some(&(offset, field_vt)) = self.field_info.get(name) {
+                            let set_op = Self::set_field_op(field_vt, offset);
+                            self.emit(IntermediateCode::new(set_op, result_op.clone(), None, None), span);
+                            return result_op;
+                        }
                         // 隐式声明变量
                         self.declare_local(name, vt)
                     }
@@ -460,10 +540,17 @@ impl<'a> CodeGenerator<'a> {
                 self.emit(IntermediateCode::assign(addr, result_op), span);
                 Operand::Address(addr)
             }
-            AssignmentTarget::Field { object, field: _, span: _ } => {
-                // 生成对象引用，然后生成字段写入指令
+            AssignmentTarget::Field { object, field, span: _ } => {
+                // this.field = expr → 生成 SetField
+                if matches!(**object, Expression::This(_)) {
+                    if let Some(&(offset, vt)) = self.field_info.get(field) {
+                        let set_op = Self::set_field_op(vt, offset);
+                        self.emit(IntermediateCode::new(set_op, result_op.clone(), None, None), span);
+                        return result_op;
+                    }
+                }
+                // 其他对象字段赋值，暂为占位
                 let _obj_op = self.generate_expression(object);
-                // 字段写入需要知道字段索引，这里暂时简化为直接赋值
                 let temp = self.alloc_temp(ValueType::Object);
                 self.emit(IntermediateCode::assign(temp, result_op), span);
                 Operand::Address(temp)
@@ -486,11 +573,22 @@ impl<'a> CodeGenerator<'a> {
     fn generate_member_access(
         &mut self,
         object: &Expression,
-        _member: &str,
+        member: &str,
     ) -> Operand {
+        // this.field → 生成 LoadField
+        if matches!(object, Expression::This(_)) {
+            if let Some(&(offset, vt)) = self.field_info.get(member) {
+                let temp = self.alloc_temp(vt);
+                let load_op = Self::load_field_op(vt, offset);
+                self.emit(
+                    IntermediateCode::new(load_op, Operand::int(0), None, Some(temp)),
+                    object.span(),
+                );
+                return Operand::Address(temp);
+            }
+        }
+        // 其他对象字段读取，暂为占位
         let _obj_op = self.generate_expression(object);
-        // 字段读取简化实现：需要知道字段索引（从符号表获取）
-        // 暂时返回临时变量
         let temp = self.alloc_temp(ValueType::Int);
         self.emit(
             IntermediateCode::assign(temp, Operand::int(0)),
@@ -503,20 +601,145 @@ impl<'a> CodeGenerator<'a> {
     fn generate_method_call(
         &mut self,
         receiver: &Expression,
-        _method: &str,
+        method: &str,
         arguments: &[Expression],
         span: Span,
     ) -> Operand {
-        // 计算接收者（委托对象）
-        let recv_op = self.generate_expression(receiver);
+        // 检查是否为静态方法调用 ClassName.method(args)
+        if let Expression::Identifier(class_name, _) = receiver {
+            let scope = self.symbol_table.global_scope;
+            if let Some(class_id) = self.symbol_table.lookup_class(scope, class_name) {
+                let class_info = self.symbol_table.classes.get(class_id.0);
+                // 在类方法中查找匹配的静态方法
+                for (i, &method_id) in class_info.methods.iter().enumerate() {
+                    let mi = self.symbol_table.methods.get(method_id.0);
+                    if mi.name == method && mi.is_static {
+                        // 设置调用参数（分配参数索引）
+                        self.param_index = 0;
+                        for arg in arguments {
+                            let arg_op = self.generate_expression(arg);
+                            let arg_vt = Self::operand_value_type(&arg_op);
+                            let param_addr = Address::new(ValueType::Int, self.param_index);
+                            self.param_index += 1;
+                            match arg_vt {
+                                ValueType::Int => {
+                                    self.emit(IntermediateCode::new(
+                                        IntermediateOperator::SetIntParameter, arg_op, None, Some(param_addr)), span);
+                                }
+                                ValueType::Float => {
+                                    self.emit(IntermediateCode::new(
+                                        IntermediateOperator::SetFloatParameter, arg_op, None, Some(param_addr)), span);
+                                }
+                                ValueType::Bool => {
+                                    self.emit(IntermediateCode::new(
+                                        IntermediateOperator::SetBoolParameter, arg_op, None, Some(param_addr)), span);
+                                }
+                                ValueType::String => {
+                                    self.emit(IntermediateCode::new(
+                                        IntermediateOperator::SetStringParameter, arg_op, None, Some(param_addr)), span);
+                                }
+                                ValueType::Object => {
+                                    self.emit(IntermediateCode::new(
+                                        IntermediateOperator::SetObjectParameter, arg_op, None, Some(param_addr)), span);
+                                }
+                            }
+                        }
+                        // 生成 InvokeStatic（left 操作数存参数计数）
+                        let idx = i;
+                        let result = self.alloc_temp(Self::type_to_value_type(&mi.return_type));
+                        self.emit(
+                            IntermediateCode::new(
+                                IntermediateOperator::InvokeStatic(idx),
+                                Operand::int(arguments.len() as i64),
+                                None,
+                                Some(result),
+                            ),
+                            span,
+                        );
+                        return Operand::Address(result);
+                    }
+                }
+            }
+        }
 
-        // 查找委托索引
+        // 原有的委托/实例调用逻辑
+        let recv_op = self.generate_expression(receiver);
         let delegate_idx = match receiver {
             Expression::Identifier(name, _) => self.delegate_vars.get(name).copied(),
             _ => None,
         };
 
-        // 设置调用参数到参数池
+        // 非委托调用：尝试查找实例方法
+        if delegate_idx.is_none() {
+            if let Expression::Identifier(class_name, _) = receiver {
+                let scope = self.symbol_table.global_scope;
+                if let Some(class_id) = self.symbol_table.lookup_class(scope, class_name) {
+                    let class_info = self.symbol_table.classes.get(class_id.0);
+                    for (i, &method_id) in class_info.methods.iter().enumerate() {
+                        let mi = self.symbol_table.methods.get(method_id.0);
+                        if mi.name == method && !mi.is_static {
+                            self.param_index = 0;
+                            for arg in arguments {
+                                let arg_op = self.generate_expression(arg);
+                                let arg_vt = Self::operand_value_type(&arg_op);
+                                let param_addr = Address::new(ValueType::Int, self.param_index);
+                                self.param_index += 1;
+                                let set_param = match arg_vt {
+                                    ValueType::Int => IntermediateOperator::SetIntParameter,
+                                    ValueType::Float => IntermediateOperator::SetFloatParameter,
+                                    ValueType::Bool => IntermediateOperator::SetBoolParameter,
+                                    ValueType::String => IntermediateOperator::SetStringParameter,
+                                    ValueType::Object => IntermediateOperator::SetObjectParameter,
+                                };
+                                self.emit(IntermediateCode::new(set_param, arg_op, None, Some(param_addr)), span);
+                            }
+                            let result = self.alloc_temp(Self::type_to_value_type(&mi.return_type));
+                            self.emit(
+                                IntermediateCode::new(
+                                    IntermediateOperator::InvokeInstance(i),
+                                    Operand::int(arguments.len() as i64),
+                                    None,
+                                    Some(result),
+                                ),
+                                span,
+                            );
+                            return Operand::Address(result);
+                        }
+                    }
+                }
+            }
+            // 无法静态解析（如变量调用），发出 InvokeInstance(0) 让 VM 运行时分派
+            self.param_index = 0;
+            for arg in arguments {
+                let arg_op = self.generate_expression(arg);
+                let arg_vt = Self::operand_value_type(&arg_op);
+                let param_addr = Address::new(ValueType::Int, self.param_index);
+                self.param_index += 1;
+                let set_param = match arg_vt {
+                    ValueType::Int => IntermediateOperator::SetIntParameter,
+                    ValueType::Float => IntermediateOperator::SetFloatParameter,
+                    ValueType::Bool => IntermediateOperator::SetBoolParameter,
+                    ValueType::String => IntermediateOperator::SetStringParameter,
+                    ValueType::Object => IntermediateOperator::SetObjectParameter,
+                };
+                self.emit(IntermediateCode::new(set_param, arg_op, None, Some(param_addr)), span);
+            }
+            // 生成 receiver 的代码并将地址作为 InvokeInstance 的 left（目标对象引用）
+            let recv_addr_op = self.generate_expression(receiver);
+            let result = self.alloc_temp(ValueType::Int);
+            self.emit(
+                IntermediateCode::new(
+                    IntermediateOperator::InvokeInstance(0),
+                    recv_addr_op,
+                    None,
+                    Some(result),
+                ),
+                span,
+            );
+            return Operand::Address(result);
+        }
+
+        // 委托调用
         for (_i, arg) in arguments.iter().enumerate() {
             let arg_op = self.generate_expression(arg);
             let arg_vt = Self::operand_value_type(&arg_op);
@@ -533,11 +756,10 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        // 生成 InvokeDelegate 调用
         let result = self.alloc_temp(ValueType::Int);
         let op = match delegate_idx {
             Some(idx) => IntermediateOperator::InvokeDelegate(idx),
-            None => IntermediateOperator::InvokeDelegate(0),
+            None => IntermediateOperator::Nop,
         };
         self.emit(
             IntermediateCode::new(op, recv_op, None, Some(result)),
@@ -563,15 +785,33 @@ impl<'a> CodeGenerator<'a> {
 
         let delegate_idx = self.delegate_vars.get(var_name).copied();
 
+        self.param_index = 0;
         for (_i, arg) in arguments.iter().enumerate() {
             let arg_op = self.generate_expression(arg);
             let arg_vt = Self::operand_value_type(&arg_op);
+            let param_addr = Address::new(ValueType::Int, self.param_index);
+            self.param_index += 1;
             match arg_vt {
                 ValueType::Int => {
                     self.emit(IntermediateCode::new(
-                        IntermediateOperator::SetIntParameter, arg_op, None, None), span);
+                        IntermediateOperator::SetIntParameter, arg_op, None, Some(param_addr)), span);
                 }
-                _ => {}
+                ValueType::Float => {
+                    self.emit(IntermediateCode::new(
+                        IntermediateOperator::SetFloatParameter, arg_op, None, Some(param_addr)), span);
+                }
+                ValueType::Bool => {
+                    self.emit(IntermediateCode::new(
+                        IntermediateOperator::SetBoolParameter, arg_op, None, Some(param_addr)), span);
+                }
+                ValueType::String => {
+                    self.emit(IntermediateCode::new(
+                        IntermediateOperator::SetStringParameter, arg_op, None, Some(param_addr)), span);
+                }
+                ValueType::Object => {
+                    self.emit(IntermediateCode::new(
+                        IntermediateOperator::SetObjectParameter, arg_op, None, Some(param_addr)), span);
+                }
             }
         }
 
@@ -591,17 +831,34 @@ impl<'a> CodeGenerator<'a> {
     fn generate_new(
         &mut self,
         _class_type: &TypeRef,
-        _arguments: &[Expression],
+        arguments: &[Expression],
         span: Span,
     ) -> Operand {
-        for arg in _arguments {
-            let _ = self.generate_expression(arg);
+        // 设置构造参数
+        self.param_index = 0;
+        for arg in arguments {
+            let arg_op = self.generate_expression(arg);
+            let arg_vt = Self::operand_value_type(&arg_op);
+            let param_addr = Address::new(ValueType::Int, self.param_index);
+            self.param_index += 1;
+            let set_param = match arg_vt {
+                ValueType::Int => IntermediateOperator::SetIntParameter,
+                ValueType::Float => IntermediateOperator::SetFloatParameter,
+                ValueType::Bool => IntermediateOperator::SetBoolParameter,
+                ValueType::String => IntermediateOperator::SetStringParameter,
+                ValueType::Object => IntermediateOperator::SetObjectParameter,
+            };
+            self.emit(
+                IntermediateCode::new(set_param, arg_op, None, Some(param_addr)),
+                span,
+            );
         }
+        // 调用构造方法
         let temp = self.alloc_temp(ValueType::Object);
         self.emit(
             IntermediateCode::new(
-                IntermediateOperator::DoConstruct(0),
-                Operand::Address(Address::new(ValueType::Object, 0)),
+                IntermediateOperator::InvokeConstructor(0),
+                Operand::int(arguments.len() as i64),
                 None,
                 Some(temp),
             ),

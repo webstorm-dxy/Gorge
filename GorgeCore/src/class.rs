@@ -67,6 +67,49 @@ impl RuntimeClass {
     pub fn register_method(&mut self, method_id: usize, code: CompiledMethod) {
         self.method_impls.insert(method_id, code);
     }
+
+    /// 按局部索引查找实例方法（含继承链上溯和重写映射）
+    ///
+    /// 对应 C# CompiledGorgeClass.InvokeMethod 的查找逻辑。
+    /// method_id 是全局方法 ID（相对于本类声明的 method_start_id）。
+    pub fn find_method(&self, method_id: usize) -> Option<CompiledMethod> {
+        // 1. 检查 method_id 是否在本类声明范围内
+        let start = self.declaration.method_start_id;
+        let end = start + self.declaration.method_count;
+        if method_id >= start && method_id < end {
+            let local_idx = method_id - start;
+            return self.method_impls.get(&local_idx).cloned();
+        }
+        // 2. 检查本类是否重写了该父类方法
+        if let Some(&real_id) = self.declaration.method_override_id.get(&method_id) {
+            let local_idx = real_id - start;
+            return self.method_impls.get(&local_idx).cloned();
+        }
+        // 3. 向上委托给父类
+        if let Some(super_cls) = &self.super_class {
+            return super_cls.find_method(method_id);
+        }
+        None
+    }
+
+    /// 注册构造方法实现
+    pub fn register_constructor(&mut self, ctor_id: usize, code: CompiledMethod) {
+        self.constructor_impls.insert(ctor_id, code);
+    }
+
+    /// 按局部索引查找构造方法（含继承链上溯）
+    pub fn find_constructor(&self, ctor_id: usize) -> Option<CompiledMethod> {
+        let start = self.declaration.constructor_start_id;
+        let end = start + self.declaration.constructor_count;
+        if ctor_id >= start && ctor_id < end {
+            let local_idx = ctor_id - start;
+            return self.constructor_impls.get(&local_idx).cloned();
+        }
+        if let Some(super_cls) = &self.super_class {
+            return super_cls.find_constructor(ctor_id);
+        }
+        None
+    }
 }
 
 impl GorgeClass for RuntimeClass {
@@ -167,5 +210,43 @@ mod tests {
         };
         cls.register_method(0, method);
         assert!(cls.method_impls.contains_key(&0));
+    }
+
+    #[test]
+    fn test_find_method_local() {
+        let mut cls = make_dummy_class();
+        cls.declaration.method_count = 2;
+        let m = CompiledMethod { name: "foo".into(), codes: vec![], local_count: 1 };
+        cls.register_method(0, m.clone());
+        let found = cls.find_method(0);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "foo");
+    }
+
+    #[test]
+    fn test_find_method_super_class() {
+        let mut parent = make_dummy_class();
+        parent.declaration.method_count = 1;
+        let pm = CompiledMethod { name: "parentMethod".into(), codes: vec![], local_count: 1 };
+        parent.register_method(0, pm);
+        // 子类的 method_start_id = 1（跳过父类的 0）
+        let mut child = RuntimeClass::new(
+            ClassDeclaration {
+                class_type: GorgeType::class("Child", None),
+                method_start_id: 1,
+                method_count: 1,
+                ..parent.declaration.clone()
+            },
+            Some(Arc::new(parent)),
+        );
+        let cm = CompiledMethod { name: "childMethod".into(), codes: vec![], local_count: 1 };
+        child.register_method(0, cm);
+        // 子类方法（局部 0 → 全局 1）
+        assert!(child.find_method(1).is_some());
+        // 父类方法（全局 0），子类未重写 → 上溯
+        assert!(child.find_method(0).is_some());
+        assert_eq!(child.find_method(0).unwrap().name, "parentMethod");
+        // 不存在的全局 ID
+        assert!(child.find_method(99).is_none());
     }
 }

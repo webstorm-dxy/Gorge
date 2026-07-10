@@ -371,6 +371,8 @@ pub enum Modifier {
     Static,
     /// 抽象标记，表示该方法或类不提供具体实现，需子类实现
     Abstract,
+    /// 注入器构造标记，表示该构造方法为注入器构造方法
+    Injector,
 }
 
 // === 类型引用 ===
@@ -396,6 +398,11 @@ pub enum TypeRef {
         param_types: Vec<TypeRef>,
         span: Span,
     },
+    /// 注入器类型引用 `Type^`，表示该类型的注入器
+    Injector {
+        base_type: Box<TypeRef>,
+        span: Span,
+    },
 }
 
 impl TypeRef {
@@ -418,6 +425,7 @@ impl TypeRef {
             TypeRef::Generic { span, .. } => *span,
             TypeRef::Array { span, .. } => *span,
             TypeRef::Delegate { span, .. } => *span,
+            TypeRef::Injector { span, .. } => *span,
         }
     }
 }
@@ -534,6 +542,8 @@ pub enum Expression {
     Super(Span),
     /// `null` 字面量
     Null(Span),
+    /// 注入器字段引用 `^fieldName`，用于字段初始化表达式中引用注入器字段
+    InjectorFieldRef(String, Span),
 }
 
 impl Expression {
@@ -562,6 +572,7 @@ impl Expression {
             Expression::This(span) => *span,
             Expression::Super(span) => *span,
             Expression::Null(span) => *span,
+            Expression::InjectorFieldRef(_, span) => *span,
         }
     }
 }

@@ -1021,6 +1021,9 @@ impl SymbolTable {
                     type_args: resolved_args,
                 })
             }
+            ast::TypeRef::Injector { base_type, .. } => {
+                self.resolve_type(scope_id, base_type)
+            }
         }
     }
 }

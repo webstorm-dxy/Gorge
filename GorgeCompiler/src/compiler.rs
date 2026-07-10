@@ -17,6 +17,46 @@ pub struct InjectorFieldDef {
     pub has_default: bool,
 }
 
+/// 字段偏移计数器（按值类型分组）
+///
+/// 运行时 `FixedFieldValuePool` 按 int/float/bool/string/object 五个独立数组
+/// 分离存储字段值，因此字段的 offset 应为该字段在其所属值类型分组内的下标。
+/// 每种类型的计数器从 0 开始独立递增。
+#[derive(Debug)]
+struct FieldOffsetCounters {
+    int_offset: usize,
+    float_offset: usize,
+    bool_offset: usize,
+    string_offset: usize,
+    object_offset: usize,
+}
+
+impl FieldOffsetCounters {
+    fn new() -> Self {
+        Self {
+            int_offset: 0,
+            float_offset: 0,
+            bool_offset: 0,
+            string_offset: 0,
+            object_offset: 0,
+        }
+    }
+
+    /// 获取当前值类型对应的偏移并递增该类型计数器
+    fn next(&mut self, vt: ValueType) -> usize {
+        let counter = match vt {
+            ValueType::Int => &mut self.int_offset,
+            ValueType::Float => &mut self.float_offset,
+            ValueType::Bool => &mut self.bool_offset,
+            ValueType::String => &mut self.string_offset,
+            ValueType::Object => &mut self.object_offset,
+        };
+        let current = *counter;
+        *counter += 1;
+        current
+    }
+}
+
 /// 编译任务
 ///
 /// Pass 3 产出的编译任务列表，每个任务代表一个需要在 Pass 4（代码生成）
@@ -554,12 +594,14 @@ impl Compiler {
         };
         let class_scope = self.symbol_table.classes.get(class_id.0).scope_id;
 
-        let mut field_offset = 0usize;
+        // 字段偏移按值类型分组计数，每种类型从 0 开始独立递增
+        // 与运行时 FixedFieldValuePool 按类型分离存储一致
+        let mut counters = FieldOffsetCounters::new();
 
         for member in &decl.members {
             match member {
                 ClassMember::Field(field_decl) => {
-                    self.pass3_declare_field(class_id, class_scope, field_decl, &mut field_offset);
+                    self.pass3_declare_field(class_id, class_scope, field_decl, &mut counters);
                 }
                 ClassMember::Method(method_decl) => {
                     self.pass3_declare_method(class_id, class_scope, method_decl);
@@ -598,7 +640,7 @@ impl Compiler {
         class_id: ClassId,
         class_scope: ScopeId,
         decl: &FieldDeclaration,
-        field_offset: &mut usize,
+        counters: &mut FieldOffsetCounters,
     ) {
         let field_type = self.resolve_ast_type(class_scope, &decl.field_type);
         let is_static = decl.modifiers.iter().any(|m| matches!(m, Modifier::Static));
@@ -611,10 +653,12 @@ impl Compiler {
             decl.span,
         );
 
-        // 为非静态字段分配偏移
+        // 为非静态字段按值类型分组分配偏移
+        // offset = 该字段在其所属值类型分组内的下标（每种类型从 0 开始独立计数）
         if !is_static {
-            self.symbol_table.allocate_field_offset(field_id, *field_offset);
-            *field_offset += 1;
+            let vt = type_info_to_value_type(&field_type);
+            let offset = counters.next(vt);
+            self.symbol_table.allocate_field_offset(field_id, offset);
         }
 
         // 如果有初始化表达式，创建编译任务
@@ -792,12 +836,21 @@ impl Compiler {
         _method_id: MethodId,
         method_info: &MethodInfo,
     ) {
+        let class_name = method_info.class_id
+            .map(|cid| self.symbol_table.classes.get(cid.0).name.clone())
+            .unwrap_or_default();
+
         // 在 AST 中搜索该方法的声明
         for source in sources {
             for member in &source.members {
                 if let TopLevelMember::Class(class_decl) = member {
+                    if !class_name.is_empty() && class_decl.name != class_name {
+                        continue;
+                    }
                     if let Some(stmts) = self.find_method_body(class_decl, &method_info.name) {
                         let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
+
+                        cg.set_class_context(&class_decl.name);
 
                         // 注册参数
                         let params: Vec<(String, ValueType)> = method_info.parameters.iter()
@@ -835,11 +888,18 @@ impl Compiler {
         _constructor_id: ConstructorId,
         ctor_info: &ConstructorInfo,
     ) {
+        let class_name = &self.symbol_table.classes.get(ctor_info.class_id.0).name.clone();
+
         for source in sources {
             for member in &source.members {
                 if let TopLevelMember::Class(class_decl) = member {
+                    if class_decl.name != *class_name {
+                        continue;
+                    }
                     if let Some(stmts) = self.find_constructor_body(class_decl) {
                         let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
+
+                        cg.set_class_context(&class_decl.name);
 
                         let params: Vec<(String, ValueType)> = ctor_info.parameters.iter()
                             .map(|pid| {
@@ -935,6 +995,7 @@ fn type_ref_name(type_ref: &TypeRef) -> String {
             let params: Vec<String> = param_types.iter().map(type_ref_name).collect();
             format!("delegate<{}, {}>", type_ref_name(return_type), params.join(", "))
         }
+        TypeRef::Injector { base_type, .. } => format!("{}^", type_ref_name(base_type)),
     }
 }
 
@@ -1461,6 +1522,65 @@ mod tests {
         }
     }
 
+    /// 验证混合类型字段的 offset 按值类型分组分配
+    ///
+    /// 字段声明顺序 `int a; float b; int c; float d; bool e;`，
+    /// 正确偏移应为：
+    ///   a=0(int组), b=0(float组), c=1(int组), d=1(float组), e=0(bool组)
+    #[test]
+    fn test_pass3_field_offset_by_value_type() {
+        let source = SourceFile {
+            members: vec![TopLevelMember::Class(ClassDeclaration {
+                annotations: vec![],
+                modifiers: vec![],
+                name: "Mixed".into(),
+                super_class: None,
+                super_interfaces: vec![],
+                members: vec![
+                    field("a", "int"),
+                    field("b", "float"),
+                    field("c", "int"),
+                    field("d", "float"),
+                    field("e", "bool"),
+                ],
+                injector: None,
+                span: dummy_span(),
+            })],
+            ..empty_source()
+        };
+
+        let mut compiler = Compiler::new();
+        compiler.compile(&[source]).unwrap();
+
+        let class_id = compiler.symbol_table
+            .lookup_class(compiler.symbol_table.global_scope, "Mixed")
+            .unwrap();
+        let info = compiler.symbol_table.classes.get(class_id.0);
+
+        // 按字段名核对 offset
+        let offsets: Vec<(&str, usize)> = info.fields.iter()
+            .map(|&fid| {
+                let fi = compiler.symbol_table.fields.get(fid.0);
+                (fi.name.as_str(), fi.offset.unwrap())
+            })
+            .collect();
+
+        // 预期：a(int)=0, b(float)=0, c(int)=1, d(float)=1, e(bool)=0
+        let expected = vec![
+            ("a", 0), // int 组第 0 个
+            ("b", 0), // float 组第 0 个
+            ("c", 1), // int 组第 1 个
+            ("d", 1), // float 组第 1 个
+            ("e", 0), // bool 组第 0 个
+        ];
+
+        assert_eq!(offsets.len(), expected.len(), "字段数量应匹配");
+        for (&(name, offset), &(exp_name, exp_offset)) in offsets.iter().zip(expected.iter()) {
+            assert_eq!(name, exp_name, "字段名应匹配");
+            assert_eq!(offset, exp_offset, "字段 {} 的偏移应为 {}，实际为 {}", name, exp_offset, offset);
+        }
+    }
+
     fn field(name: &str, ty: &str) -> ClassMember {
         ClassMember::Field(FieldDeclaration {
             annotations: vec![],
@@ -1470,5 +1590,107 @@ mod tests {
             initializer: None,
             span: dummy_span(),
         })
+    }
+
+    /// 解析含构造函数的源码 → pass1-3 构造任务验证
+    /// 注：pass4 代码生成（this.field 支持）留到步骤 5
+    #[test]
+    fn test_constructor_parse_to_compile_task() {
+        let source_text = r#"
+class Point {
+    int x;
+    int y;
+    Point(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+}
+"#;
+        let (tokens, _) = crate::lexer::tokenize(source_text, 0);
+        let mut parser = crate::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+
+        let mut compiler = Compiler::new();
+        compiler.pass1_type_identifier(&[source_file.clone()]).unwrap();
+        compiler.pass2_type_extension(&[source_file.clone()]).unwrap();
+        compiler.pass3_type_declaration(&[source_file]).unwrap();
+
+        let class_id = compiler.symbol_table
+            .lookup_class(compiler.symbol_table.global_scope, "Point")
+            .unwrap();
+        let class_info = compiler.symbol_table.classes.get(class_id.0);
+        assert_eq!(class_info.constructors.len(), 1, "应有 1 个构造函数");
+
+        let ctor_tasks: Vec<_> = compiler.tasks.iter()
+            .filter(|t| matches!(t.kind, TaskKind::Constructor { .. }))
+            .collect();
+        assert_eq!(ctor_tasks.len(), 1, "应有 1 个构造编译任务");
+
+        let ctor_id = class_info.constructors[0];
+        let ctor_info = compiler.symbol_table.constructors.get(ctor_id.0);
+        assert_eq!(ctor_info.parameters.len(), 2, "构造函数应有 2 个参数");
+    }
+
+    /// 含 super(args) 的构造函数 → pass1-3 完整验证
+    #[test]
+    fn test_constructor_with_super_compile() {
+        let source_text = r#"
+class Animal {
+    int age;
+    Animal(int a) { age = a; }
+}
+class Dog : Animal {
+    int weight;
+    Dog(int w) : super(w) { weight = w; }
+}
+"#;
+        let (tokens, _) = crate::lexer::tokenize(source_text, 0);
+        let mut parser = crate::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+
+        assert_eq!(source_file.members.len(), 2, "应有两个类");
+
+        match &source_file.members[1] {
+            TopLevelMember::Class(dog) => {
+                assert_eq!(dog.name, "Dog");
+                assert_eq!(dog.super_class.as_ref().map(|t| type_ref_name(t)), Some("Animal".into()));
+
+                let ctors: Vec<_> = dog.members.iter()
+                    .filter_map(|m| if let ClassMember::Constructor(c) = m { Some(c) } else { None })
+                    .collect();
+                assert_eq!(ctors.len(), 1);
+                assert_eq!(ctors[0].base_arguments.len(), 1, "super(w) 应有 1 个参数");
+
+                match &ctors[0].base_arguments[0] {
+                    Expression::Identifier(name, _) => assert_eq!(name, "w"),
+                    _ => panic!("super 参数应为标识符 w"),
+                }
+            }
+            _ => panic!("Dog 应为类声明"),
+        }
+
+        let mut compiler = Compiler::new();
+        compiler.pass1_type_identifier(&[source_file.clone()]).unwrap();
+        compiler.pass2_type_extension(&[source_file.clone()]).unwrap();
+        compiler.pass3_type_declaration(&[source_file]).unwrap();
+
+        let dog_id = compiler.symbol_table
+            .lookup_class(compiler.symbol_table.global_scope, "Dog")
+            .unwrap();
+        let dog_info = compiler.symbol_table.classes.get(dog_id.0);
+        assert!(dog_info.super_class.is_some(), "Dog 应有父类");
+        let animal_id = dog_info.super_class.unwrap();
+        assert_eq!(compiler.symbol_table.classes.get(animal_id.0).name, "Animal");
+
+        let animal_id2 = compiler.symbol_table
+            .lookup_class(compiler.symbol_table.global_scope, "Animal")
+            .unwrap();
+        let animal_info = compiler.symbol_table.classes.get(animal_id2.0);
+        assert_eq!(animal_info.constructors.len(), 1);
+
+        let all_ctor_tasks: Vec<_> = compiler.tasks.iter()
+            .filter(|t| matches!(t.kind, TaskKind::Constructor { .. }))
+            .collect();
+        assert_eq!(all_ctor_tasks.len(), 2, "Animal + Dog 共 2 个构造任务");
     }
 }

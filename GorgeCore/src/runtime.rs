@@ -59,6 +59,14 @@ impl GorgeRuntime {
         if from == to {
             return true;
         }
+        // Int → Float
+        if from.basic_type == BasicType::Int && to.basic_type == BasicType::Float {
+            return true;
+        }
+        // Null → 任意 Object / Interface / Delegate
+        if from.is_null() && matches!(to.basic_type, BasicType::Object | BasicType::Interface | BasicType::Delegate) {
+            return true;
+        }
         // object 到 object 的基础规则（通过类层次检查）
         if from.basic_type == BasicType::Object && to.basic_type == BasicType::Object {
             return self.is_subclass_of(from, to);

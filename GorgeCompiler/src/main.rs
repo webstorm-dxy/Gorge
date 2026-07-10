@@ -123,6 +123,7 @@ fn main() {
             super_interfaces: vec![],
             field_counts: TypeCount::zero(),
             methods,
+            constructors: vec![],
             injector_fields: vec![],
             delegate_impls: vec![],
         });
@@ -170,6 +171,19 @@ fn collect_classes(
                     .cloned()
                     .collect();
 
+                // 匹配构造方法
+                let class_ctors: Vec<gorge_core::ir::CompiledMethod> = all_methods
+                    .iter()
+                    .filter(|m| m.name == "constructor")
+                    .filter(|_m| {
+                        info.constructors.iter().any(|cid| {
+                            let ci = st.constructors.get(cid.0);
+                            *class_id == ci.class_id
+                        })
+                    })
+                    .cloned()
+                    .collect();
+
                 let mut field_counts = TypeCount::zero();
                 for fid in &info.fields {
                     let fi = st.fields.get(fid.0);
@@ -193,6 +207,7 @@ fn collect_classes(
                     }).collect(),
                     field_counts,
                     methods: class_methods,
+                    constructors: class_ctors,
                     injector_fields: vec![],
                     delegate_impls: vec![],
                 });

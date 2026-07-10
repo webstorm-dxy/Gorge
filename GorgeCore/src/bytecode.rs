@@ -23,6 +23,7 @@ pub struct CompiledClass {
     pub super_interfaces: Vec<String>,
     pub field_counts: TypeCount,
     pub methods: Vec<CompiledMethod>,
+    pub constructors: Vec<CompiledMethod>,
     pub injector_fields: Vec<InjectorFieldDef>,
     pub delegate_impls: Vec<DelegateImpl>,
 }
@@ -143,6 +144,16 @@ fn opcode_to_u16(op: &IntermediateOperator) -> u16 {
         IntermediateOperator::LoadInjector => 220,
         IntermediateOperator::SetInjector => 221,
         IntermediateOperator::ConstructDelegate(_) => 222,
+        IntermediateOperator::LoadStaticIntField(_) => 223,
+        IntermediateOperator::LoadStaticFloatField(_) => 224,
+        IntermediateOperator::LoadStaticBoolField(_) => 225,
+        IntermediateOperator::LoadStaticStringField(_) => 226,
+        IntermediateOperator::LoadStaticObjectField(_) => 227,
+        IntermediateOperator::SetStaticIntField(_) => 228,
+        IntermediateOperator::SetStaticFloatField(_) => 229,
+        IntermediateOperator::SetStaticBoolField(_) => 230,
+        IntermediateOperator::SetStaticStringField(_) => 231,
+        IntermediateOperator::SetStaticObjectField(_) => 232,
         IntermediateOperator::Nop => 255,
         _ => 254, // fallback
     }
@@ -240,6 +251,16 @@ fn u16_to_opcode(code: u16, extra: u16) -> IntermediateOperator {
         220 => IntermediateOperator::LoadInjector,
         221 => IntermediateOperator::SetInjector,
         222 => IntermediateOperator::ConstructDelegate(extra as usize),
+        223 => IntermediateOperator::LoadStaticIntField(extra as usize),
+        224 => IntermediateOperator::LoadStaticFloatField(extra as usize),
+        225 => IntermediateOperator::LoadStaticBoolField(extra as usize),
+        226 => IntermediateOperator::LoadStaticStringField(extra as usize),
+        227 => IntermediateOperator::LoadStaticObjectField(extra as usize),
+        228 => IntermediateOperator::SetStaticIntField(extra as usize),
+        229 => IntermediateOperator::SetStaticFloatField(extra as usize),
+        230 => IntermediateOperator::SetStaticBoolField(extra as usize),
+        231 => IntermediateOperator::SetStaticStringField(extra as usize),
+        232 => IntermediateOperator::SetStaticObjectField(extra as usize),
         255 => IntermediateOperator::Nop,
         _ => IntermediateOperator::Nop,
     }
@@ -345,6 +366,11 @@ fn serialize_compiled_class(class: &CompiledClass, buf: &mut Vec<u8>) -> Bytecod
         serialize_method(method, buf)?;
     }
 
+    buf.extend_from_slice(&(class.constructors.len() as u16).to_le_bytes());
+    for ctor in &class.constructors {
+        serialize_method(ctor, buf)?;
+    }
+
     Ok(())
 }
 
@@ -416,6 +442,16 @@ fn get_extra_field(op: &IntermediateOperator) -> u16 {
         | IntermediateOperator::SetBoolInjectorField(v)
         | IntermediateOperator::SetStringInjectorField(v)
         | IntermediateOperator::SetObjectInjectorField(v)
+        | IntermediateOperator::LoadStaticIntField(v)
+        | IntermediateOperator::LoadStaticFloatField(v)
+        | IntermediateOperator::LoadStaticBoolField(v)
+        | IntermediateOperator::LoadStaticStringField(v)
+        | IntermediateOperator::LoadStaticObjectField(v)
+        | IntermediateOperator::SetStaticIntField(v)
+        | IntermediateOperator::SetStaticFloatField(v)
+        | IntermediateOperator::SetStaticBoolField(v)
+        | IntermediateOperator::SetStaticStringField(v)
+        | IntermediateOperator::SetStaticObjectField(v)
         | IntermediateOperator::ConstructDelegate(v)
         | IntermediateOperator::InvokeDelegate(v) => *v as u16,
         _ => 0,
@@ -522,6 +558,7 @@ pub fn deserialize_module(data: &[u8]) -> BytecodeResult<CompiledModule> {
             super_interfaces: vec![],
             field_counts: TypeCount::zero(),
             methods,
+            constructors: vec![],
             injector_fields: vec![],
             delegate_impls: vec![],
         };
@@ -666,6 +703,17 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize) -> BytecodeResult<(Co
         pos = new_pos;
     }
 
+    // 构造方法
+    if pos + 2 > data.len() { return Err("读取构造方法计数越界".into()); }
+    let ctor_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    let mut constructors = Vec::with_capacity(ctor_count);
+    for _ in 0..ctor_count {
+        let (ctor, new_pos) = deserialize_method(data, pos)?;
+        constructors.push(ctor);
+        pos = new_pos;
+    }
+
     let class_name = full_name.rsplit('.').next().unwrap_or(&full_name).to_string();
 
     Ok((CompiledClass {
@@ -678,6 +726,7 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize) -> BytecodeResult<(Co
             string_count: sc, object_count: oc,
         },
         methods,
+        constructors,
         injector_fields,
         delegate_impls,
     }, pos))
@@ -877,6 +926,7 @@ fn u8_to_value_type(v: u8) -> ValueType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::Span;
 
     #[test]
     fn test_roundtrip_single_method() {
@@ -969,6 +1019,7 @@ mod tests {
                 codes: vec![],
                 local_count: 0,
             }],
+            constructors: vec![],
             injector_fields: vec![],
             delegate_impls: vec![],
         };
@@ -978,5 +1029,292 @@ mod tests {
         assert_eq!(deserialized.classes.len(), 1);
         assert_eq!(deserialized.classes[0].methods.len(), 1);
         assert_eq!(deserialized.classes[0].super_interfaces.len(), 1);
+    }
+
+    /// 验证包含注入器字段的类可正确序列化/反序列化
+    #[test]
+    fn test_roundtrip_with_injector_fields() {
+        let class = CompiledClass {
+            class_type: GorgeType::class("WithInjector", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount { int_count: 1, ..TypeCount::zero() },
+            methods: vec![CompiledMethod {
+                name: "test".into(),
+                codes: vec![],
+                local_count: 0,
+            }],
+            constructors: vec![],
+            injector_fields: vec![
+                InjectorFieldDef { name: "hitTime".into(), value_type: ValueType::Float, has_default: true },
+                InjectorFieldDef { name: "position".into(), value_type: ValueType::Object, has_default: false },
+            ],
+            delegate_impls: vec![],
+        };
+        let module = CompiledModule { version: 2, classes: vec![class] };
+        let data = serialize_module(&module).unwrap();
+        let deserialized = deserialize_module(&data).unwrap();
+        assert_eq!(deserialized.classes.len(), 1);
+        assert_eq!(deserialized.classes[0].injector_fields.len(), 2);
+        assert_eq!(deserialized.classes[0].injector_fields[0].name, "hitTime");
+        assert!(deserialized.classes[0].injector_fields[0].has_default);
+        assert_eq!(deserialized.classes[0].injector_fields[1].name, "position");
+        assert!(!deserialized.classes[0].injector_fields[1].has_default);
+    }
+
+    /// 验证含委托实现的类可正确序列化/反序列化
+    #[test]
+    fn test_roundtrip_with_delegate_impls() {
+        let delegate_ir = vec![
+            CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::ReturnInt,
+                    Operand::int(42),
+                    None, None,
+                ),
+                Span::new(0, 10, 1, 1, 0),
+            ),
+        ];
+        let class = CompiledClass {
+            class_type: GorgeType::class("LambdaHost", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![
+                DelegateImpl {
+                    param_types: vec![ValueType::Int],
+                    return_type: ValueType::Int,
+                    body_ir: delegate_ir.clone(),
+                    captured_var_names: vec!["x".into()],
+                    outer_value_count: 1,
+                },
+            ],
+        };
+        let module = CompiledModule { version: 2, classes: vec![class] };
+        let data = serialize_module(&module).unwrap();
+        let deserialized = deserialize_module(&data).unwrap();
+        assert_eq!(deserialized.classes.len(), 1);
+        assert_eq!(deserialized.classes[0].delegate_impls.len(), 1);
+        assert_eq!(deserialized.classes[0].delegate_impls[0].param_types.len(), 1);
+        assert_eq!(deserialized.classes[0].delegate_impls[0].return_type, ValueType::Int);
+        assert_eq!(deserialized.classes[0].delegate_impls[0].captured_var_names, vec!["x"]);
+        assert_eq!(deserialized.classes[0].delegate_impls[0].body_ir.len(), 1);
+    }
+
+    /// 验证实际 .gorge 文件产物可正确反序列化
+    #[test]
+    fn test_deserialize_compiled_test1() {
+        let data = std::fs::read("../test_output/Test1.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 1, "Test1 应有 1 个类");
+        let cls = &module.classes[0];
+        assert_eq!(cls.class_type.full_name(), "Test1");
+        assert!(!cls.is_native);
+        assert_eq!(cls.methods.len(), 1);
+        assert_eq!(cls.methods[0].name, "DoTest");
+        assert!(!cls.methods[0].codes.is_empty(), "DoTest 应有 IR 指令");
+    }
+
+    #[test]
+    fn test_deserialize_compiled_test9() {
+        let data = std::fs::read("../test_output/Test9.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 5, "Test9 应有 5 个类: Test9, Test9NInner, Test9N, Test9Inner, Test9A");
+        let names: Vec<String> = module.classes.iter().map(|c| c.class_type.full_name()).collect();
+        assert!(names.iter().any(|n| n == "Test9"), "应包含 Test9");
+        assert!(names.iter().any(|n| n == "Test9A"), "应包含 Test9A");
+        assert!(names.iter().any(|n| n == "Test9N"), "应包含 Test9N");
+        assert!(names.iter().any(|n| n == "Test9Inner"), "应包含 Test9Inner");
+        assert!(names.iter().any(|n| n == "Test9NInner"), "应包含 Test9NInner");
+    }
+
+    #[test]
+    fn test_deserialize_compiled_test10() {
+        let data = std::fs::read("../test_output/Test10.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 1);
+        assert_eq!(module.classes[0].class_type.full_name(), "Test10");
+        assert_eq!(module.classes[0].methods.len(), 1);
+    }
+
+    #[test]
+    fn test_deserialize_compiled_test12() {
+        let data = std::fs::read("../test_output/Test12.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 1);
+        assert_eq!(module.classes[0].class_type.full_name(), "Test12");
+        assert!(module.classes[0].delegate_impls.len() >= 1, "应有至少 1 个委托");
+    }
+
+    #[test]
+    fn test_deserialize_compiled_test7() {
+        let data = std::fs::read("../test_output/Test7.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 1);
+        assert_eq!(module.classes[0].class_type.full_name(), "Test7");
+        assert_eq!(module.classes[0].methods.len(), 2, "Test7: DoTest + InstanceDoTest");
+        // InstanceDoTest 内的 3 个 lambda → 3 个委托
+        assert_eq!(module.classes[0].delegate_impls.len(), 3, "Test7 应有 3 个委托");
+    }
+
+    /// Test4: 单类 + 构造函数 + this.field + 实例方法 + 静态方法
+    #[test]
+    fn test_deserialize_compiled_test4() {
+        let data = std::fs::read("../test_output/Test4.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 1);
+        let cls = &module.classes[0];
+        assert_eq!(cls.class_type.full_name(), "Test4");
+        assert!(!cls.is_native);
+        assert_eq!(cls.field_counts.int_count, 3, "Test4: counter + increasment + selfIncreasement");
+        // Test4(): constructor + SelfIncreasement() + DoTest() → 3 方法
+        assert!(cls.methods.len() >= 2, "至少应生成 constructor + DoTest");
+    }
+
+    /// Test5: 多类 + 继承 + super()
+    #[test]
+    fn test_deserialize_compiled_test5() {
+        let data = std::fs::read("../test_output/Test5.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 4, "Test5: Test5 + Test5A + Test5B + Test5C");
+        let test5a = module.classes.iter().find(|c| c.class_type.full_name() == "Test5A").unwrap();
+        assert_eq!(test5a.field_counts.int_count, 1, "Test5A: valueA");
+        let test5b = module.classes.iter().find(|c| c.class_type.full_name() == "Test5B").unwrap();
+        assert_eq!(test5b.super_class_name, Some("Test5A".into()));
+        // Test5B 继承 Test5A 的 valueA，自身 valueB
+        assert!(test5b.field_counts.int_count >= 1);
+    }
+
+    /// Test6: 接口 + 多继承
+    #[test]
+    fn test_deserialize_compiled_test6() {
+        let data = std::fs::read("../test_output/Test6.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 4, "Test6: Test6 + Test6I(接口?) + Test6A + Test6B + Test6C");
+
+        let test6a = module.classes.iter().find(|c| c.class_type.full_name() == "Test6A").unwrap();
+        assert!(!test6a.super_interfaces.is_empty(), "Test6A 应实现 Test6I");
+        assert!(test6a.super_interfaces.iter().any(|i| i == "Test6I"));
+    }
+
+    /// Test11: 注入器构造 + 多类继承
+    #[test]
+    fn test_deserialize_compiled_test11() {
+        let data = std::fs::read("../test_output/Test11.gorge").unwrap();
+        let module = deserialize_module(&data).unwrap();
+        assert_eq!(module.classes.len(), 4, "Test11: Test11 + Test11A + Test11B + Test11C");
+        let test11a = module.classes.iter().find(|c| c.class_type.full_name() == "Test11A").unwrap();
+        assert_eq!(test11a.field_counts.int_count, 1, "Test11A: value");
+        let test11b = module.classes.iter().find(|c| c.class_type.full_name() == "Test11B").unwrap();
+        assert_eq!(test11b.super_class_name, Some("Test11A".into()));
+        let test11c = module.classes.iter().find(|c| c.class_type.full_name() == "Test11C").unwrap();
+        assert_eq!(test11c.super_class_name, Some("Test11A".into()));
+    }
+
+    // ==================== 全量产物结构验证 ====================
+
+    macro_rules! verify_class {
+        ($module:expr, $name:expr, $fields:expr, $super:expr) => {
+            let cls = $module.classes.iter()
+                .find(|c| c.class_type.full_name() == $name)
+                .unwrap_or_else(|| panic!("未找到类 `{}`", $name));
+            assert_eq!(cls.field_counts.int_count, $fields.0, "{}: int 字段数", $name);
+            assert_eq!(cls.field_counts.float_count, $fields.1, "{}: float 字段数", $name);
+            assert_eq!(cls.field_counts.string_count, $fields.2, "{}: string 字段数", $name);
+            assert_eq!(cls.field_counts.object_count, $fields.3, "{}: object 字段数", $name);
+            assert!(cls.methods.len() >= 1, "{}: 应有至少 1 个方法", $name);
+            assert_eq!(cls.super_class_name.as_deref(), $super, "{}: 父类", $name);
+        };
+    }
+
+    #[test]
+    fn test_all_compiled_artifacts() {
+        // Test1: 单类 + 静态方法
+        let m1 = deserialize_module(&std::fs::read("../test_output/Test1.gorge").unwrap()).unwrap();
+        assert_eq!(m1.classes.len(), 1);
+        verify_class!(m1, "Test1", (0,0,0,0), None);
+        assert_eq!(m1.classes[0].methods[0].name, "DoTest");
+        assert!(!m1.classes[0].methods[0].codes.is_empty());
+
+        // Test2: 单类 + 静态方法 + 静态调用
+        let m2 = deserialize_module(&std::fs::read("../test_output/Test2.gorge").unwrap()).unwrap();
+        assert_eq!(m2.classes.len(), 1);
+        verify_class!(m2, "Test2", (0,0,0,0), None);
+
+        // Test3: 单类 + 静态方法 + 递归静态调用
+        let m3 = deserialize_module(&std::fs::read("../test_output/Test3.gorge").unwrap()).unwrap();
+        assert_eq!(m3.classes.len(), 1);
+        verify_class!(m3, "Test3", (0,0,0,0), None);
+
+        // Test4: 单类 + 3 int 字段 + 构造函数（验证构造方法序列化）
+        let m4 = deserialize_module(&std::fs::read("../test_output/Test4.gorge").unwrap()).unwrap();
+        assert_eq!(m4.classes.len(), 1);
+        assert_eq!(m4.classes[0].field_counts.int_count, 3);
+        assert!(m4.classes[0].methods.len() >= 1, "Test4 应有普通方法");
+        assert!(m4.classes[0].constructors.len() >= 1, "Test4 应有构造方法");
+        for c in &m4.classes[0].constructors {
+            assert!(!c.codes.is_empty(), "构造方法 {} 应有 IR 指令", c.name);
+        }
+
+        // Test5: 4 类 + 继承链 Test5C → Test5B → Test5A
+        let m5 = deserialize_module(&std::fs::read("../test_output/Test5.gorge").unwrap()).unwrap();
+        assert_eq!(m5.classes.len(), 4);
+        verify_class!(m5, "Test5", (0,0,0,0), None);
+        verify_class!(m5, "Test5A", (1,0,0,0), None);
+        verify_class!(m5, "Test5B", (1,0,0,0), Some("Test5A"));
+        verify_class!(m5, "Test5C", (1,0,0,0), Some("Test5B"));
+
+        // Test6: 接口 Test6I + 多继承
+        let m6 = deserialize_module(&std::fs::read("../test_output/Test6.gorge").unwrap()).unwrap();
+        assert_eq!(m6.classes.len(), 4);
+        let test6a = m6.classes.iter().find(|c| c.class_type.full_name() == "Test6A").unwrap();
+        assert!(test6a.super_interfaces.iter().any(|i| i == "Test6I"), "Test6A 应实现 Test6I");
+
+        // Test7: Lambda + delegate: 3 个委托
+        let m7 = deserialize_module(&std::fs::read("../test_output/Test7.gorge").unwrap()).unwrap();
+        assert_eq!(m7.classes.len(), 1);
+        assert_eq!(m7.classes[0].field_counts.int_count, 1);
+        assert_eq!(m7.classes[0].delegate_impls.len(), 3, "Test7 应有 3 个委托");
+
+        // Test8: 3 类（Test8 + native Test8N + Test8A 继承）
+        let m8 = deserialize_module(&std::fs::read("../test_output/Test8.gorge").unwrap()).unwrap();
+        assert_eq!(m8.classes.len(), 3, "Test8: Test8 + Test8N + Test8A");
+        let test8n = m8.classes.iter().find(|c| c.class_type.full_name() == "Test8N").unwrap();
+        assert!(test8n.is_native, "Test8N 应为 native");
+        let test8a = m8.classes.iter().find(|c| c.class_type.full_name() == "Test8A").unwrap();
+        assert_eq!(test8a.super_class_name.as_deref(), Some("Test8N"), "Test8A 父类为 Test8N");
+
+        // Test9: 5 类 + Test9A → Test9N 继承
+        let m9 = deserialize_module(&std::fs::read("../test_output/Test9.gorge").unwrap()).unwrap();
+        assert_eq!(m9.classes.len(), 5);
+        let test9a = m9.classes.iter().find(|c| c.class_type.full_name() == "Test9A").unwrap();
+        assert_eq!(test9a.super_class_name, Some("Test9N".into()));
+
+        // Test10: 数组构造 + 注入器数组
+        let m10 = deserialize_module(&std::fs::read("../test_output/Test10.gorge").unwrap()).unwrap();
+        assert_eq!(m10.classes.len(), 1);
+        verify_class!(m10, "Test10", (0,0,0,0), None);
+
+        // Test11: 4 类 + injector 构造 + Test11B/11C → Test11A
+        // 注：构造函数在字节码中尚未序列化（collect_classes 仅导出 Method，不含 Constructor）
+        let m11 = deserialize_module(&std::fs::read("../test_output/Test11.gorge").unwrap()).unwrap();
+        assert_eq!(m11.classes.len(), 4);
+        let test11a = m11.classes.iter().find(|c| c.class_type.full_name() == "Test11A").unwrap();
+        assert_eq!(test11a.field_counts.int_count, 1);
+        let test11b = m11.classes.iter().find(|c| c.class_type.full_name() == "Test11B").unwrap();
+        assert_eq!(test11b.super_class_name.as_deref(), Some("Test11A"));
+        let test11c = m11.classes.iter().find(|c| c.class_type.full_name() == "Test11C").unwrap();
+        assert_eq!(test11c.super_class_name.as_deref(), Some("Test11A"));
+
+        // Test12: 嵌套 Lambda
+        let m12 = deserialize_module(&std::fs::read("../test_output/Test12.gorge").unwrap()).unwrap();
+        assert_eq!(m12.classes.len(), 1);
+        verify_class!(m12, "Test12", (0,0,0,0), None);
+        assert!(m12.classes[0].delegate_impls.len() >= 1, "Test12 应有委托");
     }
 }

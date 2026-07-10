@@ -32,7 +32,8 @@ pub trait GorgeObject: Debug {
 /// 否则从 compiled_fields 读取。
 #[derive(Debug)]
 pub struct RuntimeObject {
-    pub class: Arc<dyn GorgeClass>,
+    pub class_name: String,
+    pub class: Option<Arc<dyn GorgeClass>>,
     pub native_object: Option<Box<dyn GorgeObject>>,
     pub compiled_fields: FixedFieldValuePool,
     pub native_field_bounds: TypeCount,
@@ -41,10 +42,23 @@ pub struct RuntimeObject {
 impl RuntimeObject {
     pub fn new(class: Arc<dyn GorgeClass>) -> Self {
         let field_type_count = class.declaration().field_type_count.clone();
+        let class_name = class.declaration().class_type.full_name();
         Self {
-            class,
+            class_name,
+            class: Some(class),
             native_object: None,
             compiled_fields: FixedFieldValuePool::new(&field_type_count),
+            native_field_bounds: TypeCount::zero(),
+        }
+    }
+
+    /// 用类名和字段数量创建对象（不绑定 GorgeClass，供 VM 直接使用）
+    pub fn new_simple(class_name: String, field_counts: &TypeCount) -> Self {
+        Self {
+            class_name,
+            class: None,
+            native_object: None,
+            compiled_fields: FixedFieldValuePool::new(field_counts),
             native_field_bounds: TypeCount::zero(),
         }
     }
@@ -52,7 +66,7 @@ impl RuntimeObject {
 
 impl GorgeObject for RuntimeObject {
     fn gorge_class(&self) -> &Arc<dyn GorgeClass> {
-        &self.class
+        self.class.as_ref().expect("RuntimeObject: 未绑定 GorgeClass")
     }
 
     fn get_int_field(&self, index: usize) -> i64 {
@@ -136,8 +150,10 @@ impl GorgeObject for RuntimeObject {
     }
 
     fn invoke_method(&mut self, method_id: usize) {
-        let cls = Arc::clone(&self.class);
-        cls.invoke_method(self, method_id);
+        if let Some(cls) = &self.class {
+            let cls = Arc::clone(cls);
+            cls.invoke_method(self, method_id);
+        }
     }
 }
 

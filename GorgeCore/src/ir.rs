@@ -142,6 +142,20 @@ pub enum IntermediateOperator {
     SetStringInjectorField(usize),
     SetObjectInjectorField(usize),
 
+    // === 静态字段读取 ===
+    LoadStaticIntField(usize),
+    LoadStaticFloatField(usize),
+    LoadStaticBoolField(usize),
+    LoadStaticStringField(usize),
+    LoadStaticObjectField(usize),
+
+    // === 静态字段写入 ===
+    SetStaticIntField(usize),
+    SetStaticFloatField(usize),
+    SetStaticBoolField(usize),
+    SetStaticStringField(usize),
+    SetStaticObjectField(usize),
+
     // === this 加载 ===
     LoadThis,
 

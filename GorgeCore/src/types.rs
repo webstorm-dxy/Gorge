@@ -12,6 +12,8 @@ pub enum BasicType {
     Interface,
     Delegate,
     Void,
+    /// null 字面量类型，可自动转换为任意 Object/Interface/Delegate
+    Null,
 }
 
 impl fmt::Display for BasicType {
@@ -26,6 +28,7 @@ impl fmt::Display for BasicType {
             BasicType::Interface => write!(f, "interface"),
             BasicType::Delegate => write!(f, "delegate"),
             BasicType::Void => write!(f, "void"),
+            BasicType::Null => write!(f, "null"),
         }
     }
 }
@@ -69,6 +72,7 @@ impl GorgeType {
             BasicType::Enum => "".into(),
             BasicType::String => "string".into(),
             BasicType::Void => "void".into(),
+            BasicType::Null => "null".into(),
             BasicType::Interface | BasicType::Object | BasicType::Delegate => {
                 let name = self.class_name.as_deref().unwrap_or("?");
                 match &self.namespace_name {
@@ -81,6 +85,16 @@ impl GorgeType {
 
     pub fn is_void(&self) -> bool {
         self.basic_type == BasicType::Void
+    }
+
+    /// null 字面量类型
+    pub fn is_null(&self) -> bool {
+        self.basic_type == BasicType::Null
+    }
+
+    /// 构造 null 类型实例
+    pub fn null() -> Self {
+        Self::new(BasicType::Null)
     }
 }
 
@@ -134,6 +148,7 @@ impl TypeCount {
             BasicType::Float => self.float_count += 1,
             BasicType::Bool => self.bool_count += 1,
             BasicType::String => self.string_count += 1,
+            BasicType::Null => {} // null 不占用字段计数
             _ => self.object_count += 1,
         }
     }

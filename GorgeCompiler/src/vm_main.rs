@@ -60,7 +60,7 @@ fn main() {
             field_type_count: compiled_class.field_counts.clone(),
             method_count: compiled_class.methods.len(),
             static_method_count: 0,
-            constructor_count: 0,
+            constructor_count: compiled_class.constructors.len(),
             injector_field_type_count: TypeCount::zero(),
             injector_field_default_value_type_count: TypeCount::zero(),
             method_start_id: 0,
@@ -72,6 +72,9 @@ fn main() {
         let mut cls = RuntimeClass::new(decl, None);
         for (i, method) in compiled_class.methods.iter().enumerate() {
             cls.register_method(i, method.clone());
+        }
+        for (i, ctor) in compiled_class.constructors.iter().enumerate() {
+            cls.register_constructor(i, ctor.clone());
         }
 
         let full_name = compiled_class.class_type.full_name();
@@ -112,21 +115,44 @@ fn main() {
         }
     }
 
-    // 执行所有方法
+    // 执行所有方法（含构造方法）
     for compiled_class in &module.classes {
+        let class_name = compiled_class.class_type.full_name();
+
+        // 注册类静态方法表到 VM（供 InvokeStatic 查找）
+        let mut method_params: Vec<(CompiledMethod, Vec<gorge_core::ir::ValueType>)> = Vec::new();
         for method in &compiled_class.methods {
+            method_params.push((method.clone(), vec![]));
+        }
+
+        // 收集所有需执行的方法：普通方法 + 构造方法
+        let mut all_to_run: Vec<&CompiledMethod> = compiled_class.methods.iter().collect();
+        all_to_run.extend(compiled_class.constructors.iter());
+
+        for method in all_to_run {
             let mut vm = VirtualMachine::new();
 
-            // 注入委托实现到 VM
+            vm.register_class_methods(&class_name, method_params.clone());
+            vm.register_class_field_counts(&class_name, compiled_class.field_counts.clone());
+
+            // 将运行时类注册到 VM（供 InvokeInstance 方法分派）
+            if let Some(runtime_cls) = runtime.classes.get(&class_name) {
+                vm.register_runtime_class(&class_name, runtime_cls.clone());
+            }
+
+            // 注册当前类的委托实现到 VM
+            let mut cls_delegates: Vec<(CompiledMethod, Vec<gorge_core::ir::ValueType>)> = Vec::new();
             for delegate in &compiled_class.delegate_impls {
-                vm.delegate_impls.push((CompiledMethod {
+                cls_delegates.push((CompiledMethod {
                     name: "lambda".into(),
                     codes: delegate.body_ir.clone(),
                     local_count: 16,
                 }, delegate.param_types.clone()));
             }
+            vm.register_class_delegates(&class_name, cls_delegates);
 
             vm.push_frame(method.local_count);
+            vm.set_current_class(&class_name);
             match vm.execute(method) {
                 Ok(()) => {
                     if let Some(v) = vm.get_return_int() {

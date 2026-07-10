@@ -140,7 +140,16 @@ GlobalScope → NamespaceScope (N层) → ClassScope/InterfaceScope/EnumScope
 | gorge (vm_main.rs) | `.gorge` → VM 执行 |
 | 端到端测试 | test.g 编译并执行通过 |
 
-### 总计: 124 个测试, 零 warning
+### 总计: 163 个测试, 零 warning
+
+### 最近修改 (2026-07-10)
+
+1. **B-1 修复：字段 offset 按值类型分组分配**
+   - `compiler.rs`: 新增 `FieldOffsetCounters` 结构体，包含 int/float/bool/string/object 五个独立计数器
+   - `pass3_declare_class_members`: 单一 `field_offset` → `FieldOffsetCounters`
+   - `pass3_declare_field`: 按字段值类型取对应计数器当前值作为 offset，然后该类型计数器 +1
+   - 新增测试 `test_pass3_field_offset_by_value_type`：混合类型字段 offset 验证
+   - 现有测试 `test_pass3_field_offset_allocation`（纯 float 字段）行为不变，通过
 
 ### 最近修改 (2026-07-07)
 1. **LambdaBody 枚举重构**
