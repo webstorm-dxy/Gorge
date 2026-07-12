@@ -308,7 +308,17 @@ pub struct Annotation {
     pub name: String,
     pub generic_type: Option<TypeRef>,
     pub arguments: Vec<Expression>,
+    /// 注解前面的 metadata 块 `[ type name = expr, ... ]`（G4）
+    pub metadatas: Vec<MetadataEntry>,
     pub span: Span,
+}
+
+/// metadata 条目，如 `string displayName = "打击时刻"`（G4）
+#[derive(Debug, Clone)]
+pub struct MetadataEntry {
+    pub type_name: String,
+    pub name: String,
+    pub value: Option<Expression>,
 }
 
 // === 注入器 ===
@@ -512,6 +522,8 @@ pub enum Expression {
     New {
         class_type: TypeRef,
         arguments: Vec<Expression>,
+        /// 可选的注入器初始化 `: { field: val, ... }`
+        injector: Option<Vec<(String, Expression)>>,
         span: Span,
     },
     /// 类型转换表达式 `(TargetType)expr`
@@ -528,6 +540,7 @@ pub enum Expression {
     },
     /// 注入器对象字面量，用于 DI 容器中构造对象
     InjectorObject {
+        class_name: String,
         fields: Vec<(String, Expression)>,
         span: Span,
     },

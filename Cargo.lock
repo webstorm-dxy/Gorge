@@ -27,6 +27,32 @@ name = "gorge_core"
 version = "0.1.0"
 
 [[package]]
+name = "gorge_framework"
+version = "0.1.0"
+dependencies = [
+ "gorge_core",
+ "gorge_macros",
+]
+
+[[package]]
+name = "gorge_macros"
+version = "0.1.0"
+dependencies = [
+ "gorge_core",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "gorge_runner"
+version = "0.1.0"
+dependencies = [
+ "gorge_core",
+ "gorge_framework",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

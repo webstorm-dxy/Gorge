@@ -545,6 +545,7 @@ impl IntermediateCodeOptimizer {
             | IntermediateOperator::InvokeDelegate(_)
             | IntermediateOperator::InvokeConstructor(_)
             | IntermediateOperator::DoConstruct(_)
+            | IntermediateOperator::InvokeSuperConstructor(_)
             | IntermediateOperator::ConstructDelegate(_) => {
                 killed.insert(ExpressionKey::WildcardLoad);
             }

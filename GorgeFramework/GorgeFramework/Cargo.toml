@@ -1,0 +1,8 @@
+[package]
+name = "gorge_framework"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gorge_core = { path = "../../GorgeCore" }
+gorge_macros = { path = "../GorgeMacros" }

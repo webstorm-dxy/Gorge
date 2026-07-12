@@ -823,78 +823,62 @@ impl Parser {
     /// metadata 块为 `[ type name = expr (',' type name = expr)* ]`
     fn parse_annotations(&mut self) -> Vec<Annotation> {
         let mut annotations = Vec::new();
+        let mut pending_metadatas: Vec<MetadataEntry> = Vec::new();
         loop {
-            // 跳过可选的 metadata 块 [...]
             if self.check(&Token::LBracket) {
-                self.skip_metadata_block();
+                let m = self.parse_metadata_block();
+                if !m.is_empty() { pending_metadatas.extend(m); continue; }
             }
-
-            // 解析 @Name 注解
             if self.match_token(&Token::At) {
                 let span = self.current_span();
                 let name = match self.match_identifier() {
                     Some(n) => n,
-                    None => {
-                        self.diagnostics.emit_error(self.current_span(), "期望注解名");
-                        break;
-                    }
+                    None => { self.diagnostics.emit_error(self.current_span(), "期望注解名"); break; }
                 };
-
                 let mut arguments = Vec::new();
-                // 可选的泛型参数
-                let generic_type = if self.match_token(&Token::Less) {
-                    let gt = self.parse_type_ref().ok();
-                    self.expect_token(&Token::Greater).ok();
-                    gt
-                } else {
-                    None
-                };
-
-                // 注解参数 (key = value, ...)
+                let generic_type = if self.match_token(&Token::Less) { let gt = self.parse_type_ref().ok(); self.expect_token(&Token::Greater).ok(); gt } else { None };
                 if self.match_token(&Token::LParen) {
-                    if !self.check(&Token::RParen) {
-                        loop {
-                            // key = value 中的 key 是标识符，value 是表达式
-                            let _key = self.match_identifier();
-                            if self.match_token(&Token::Assign) {
-                                if let Ok(value) = self.parse_expression() {
-                                    arguments.push(value);
-                                }
-                            }
-                            if !self.match_token(&Token::Comma) {
-                                break;
-                            }
-                        }
-                    }
+                    if !self.check(&Token::RParen) { loop { let _ = self.match_identifier(); if self.match_token(&Token::Assign) { if let Ok(v) = self.parse_expression() { arguments.push(v); } } if !self.match_token(&Token::Comma) { break; } } }
                     self.expect_token(&Token::RParen).ok();
                 }
-
-                annotations.push(Annotation { name, generic_type, arguments, span });
-            } else if self.check(&Token::LBracket) {
-                // 只有 metadata 没有 @注解，跳过继续
-                self.skip_metadata_block();
-                continue;
+                annotations.push(Annotation { name, generic_type, arguments, metadatas: std::mem::take(&mut pending_metadatas), span });
+            } else if pending_metadatas.is_empty() {
+                break;
             } else {
+                pending_metadatas.clear();
                 break;
             }
         }
         annotations
     }
 
-    /// 跳过 metadata 块 [ type name = expr, ... ]
+    /// 解析 metadata 块 `[ type name = expr , ... ]`，返回条目列表（G4）
+    fn parse_metadata_block(&mut self) -> Vec<MetadataEntry> {
+        let mut entries = Vec::new();
+        if !self.match_token(&Token::LBracket) { return entries; }
+        while !self.is_at_end() && !self.check(&Token::RBracket) {
+            let type_name = match self.peek().map(|t| &t.token) {
+                Some(Token::TypeInt) => { self.advance(); "int".into() }
+                Some(Token::TypeFloat) => { self.advance(); "float".into() }
+                Some(Token::TypeBool) => { self.advance(); "bool".into() }
+                Some(Token::TypeString) => { self.advance(); "string".into() }
+                Some(Token::TypeObject) => { self.advance(); "object".into() }
+                _ => self.match_identifier().unwrap_or_default(),
+            };
+            if type_name.is_empty() { break; }
+            let name = self.match_identifier().unwrap_or_default();
+            if name.is_empty() { break; }
+            let value = if self.match_token(&Token::Assign) { self.parse_expression().ok() } else { None };
+            entries.push(MetadataEntry { type_name, name, value });
+            self.match_token(&Token::Comma);
+        }
+        self.match_token(&Token::RBracket);
+        entries
+    }
+
     fn skip_metadata_block(&mut self) {
-        if !self.match_token(&Token::LBracket) {
-            return;
-        }
-        // 简单跳过：消费到 ] 为止的所有 token
-        let mut depth = 1;
-        while !self.is_at_end() && depth > 0 {
-            match self.peek().map(|t| &t.token) {
-                Some(Token::LBracket) => { depth += 1; self.advance(); }
-                Some(Token::RBracket) => { depth -= 1; self.advance(); }
-                _ => { self.advance(); }
-            }
-        }
+        // 已改为 parse，保留兼容旧调用
+        let _ = self.parse_metadata_block();
     }
 
     /// 解析修饰符列表
@@ -951,17 +935,50 @@ impl Parser {
             Some(TokenSpan { token: Token::KwReturn, .. }) => self.parse_return_statement(),
             Some(TokenSpan { token: Token::KwBreak, .. }) => {
                 let span = self.advance().unwrap().span;
+                let targets = self.parse_break_targets();
                 self.expect_semicolon()?;
-                Ok(Statement::Break { targets: Vec::new(), span })
+                Ok(Statement::Break { targets, span })
             }
             Some(TokenSpan { token: Token::KwContinue, .. }) => {
                 let span = self.advance().unwrap().span;
+                let targets = self.parse_break_targets();
                 self.expect_semicolon()?;
-                Ok(Statement::Continue { targets: Vec::new(), span })
+                Ok(Statement::Continue { targets, span })
             }
             // var 声明或表达式语句
             _ => self.parse_declaration_or_expression_statement(),
         }
+    }
+
+    /// 解析 break/continue 的多层离块目标序列
+    ///
+    /// 语法：`break`/`continue` 后可跟若干目标，直到 `;`：
+    /// - 整数字面量 → `BreakTarget::ByLayer(n)`（跳出 n 层）
+    /// - 关键字 `for`/`while`/`switch`/`do`/`if`/`else` → `BreakTarget::ByKeyword`（按块类型跳出）
+    ///
+    /// 无目标时默认 `[ByLayer(1)]`（跳出当前一层）。
+    fn parse_break_targets(&mut self) -> Vec<BreakTarget> {
+        let mut targets = Vec::new();
+        loop {
+            match self.peek().map(|t| &t.token) {
+                Some(Token::IntLiteral(n)) => {
+                    let n = *n;
+                    self.advance();
+                    targets.push(BreakTarget::ByLayer(n.max(0) as u32));
+                }
+                Some(Token::KwFor) => { self.advance(); targets.push(BreakTarget::ByKeyword("for".into())); }
+                Some(Token::KwWhile) => { self.advance(); targets.push(BreakTarget::ByKeyword("while".into())); }
+                Some(Token::KwSwitch) => { self.advance(); targets.push(BreakTarget::ByKeyword("switch".into())); }
+                Some(Token::KwDo) => { self.advance(); targets.push(BreakTarget::ByKeyword("do".into())); }
+                Some(Token::KwIf) => { self.advance(); targets.push(BreakTarget::ByKeyword("if".into())); }
+                Some(Token::KwElse) => { self.advance(); targets.push(BreakTarget::ByKeyword("else".into())); }
+                _ => break,
+            }
+        }
+        if targets.is_empty() {
+            targets.push(BreakTarget::ByLayer(1));
+        }
+        targets
     }
 
     /// 解析代码块 `{ statements }`
@@ -1280,6 +1297,57 @@ impl Parser {
         Ok(left)
     }
 
+    /// 尝试解析强制类型转换 `(Type)expr`（调用时 `(` 已被消费）
+    ///
+    /// 消歧策略：
+    /// - 内建类型关键字 `(int)`/`(float)`/`(bool)`/`(string)`/`(object)` 后接 `)` → 一定是转换；
+    /// - 标识符 `(ClassName)` 后接 `)` 且其后紧跟可开启一元表达式的 token（标识符/字面量/
+    ///   `(`/`this`/`new`/`!`/`-`）→ 视为转换，避免与括号表达式 `(x) op y` 混淆。
+    ///
+    /// 返回 `Ok(Some(cast))` 表示已解析为转换；`Ok(None)` 表示不是转换，调用方回退为括号表达式。
+    fn try_parse_cast(&mut self, span: Span) -> Result<Option<Expression>, ()> {
+        // 当前 token 是否为类型名（内建关键字或标识符），且其后为 `)`
+        let (is_builtin, is_ident) = match self.peek().map(|t| &t.token) {
+            Some(Token::TypeInt) | Some(Token::TypeFloat) | Some(Token::TypeBool)
+            | Some(Token::TypeString) | Some(Token::TypeObject) => (true, false),
+            Some(Token::Identifier(_)) => (false, true),
+            _ => (false, false),
+        };
+        if !is_builtin && !is_ident {
+            return Ok(None);
+        }
+        // 其后必须是 `)`
+        if !matches!(self.peek_ahead(1).map(|t| &t.token), Some(Token::RParen)) {
+            return Ok(None);
+        }
+        // 标识符情形需进一步确认 `)` 后是可开启表达式的 token（消歧）
+        if is_ident {
+            let after = self.peek_ahead(2).map(|t| &t.token);
+            let starts_expr = matches!(
+                after,
+                Some(Token::Identifier(_))
+                    | Some(Token::IntLiteral(_))
+                    | Some(Token::FloatLiteral(_))
+                    | Some(Token::StringLiteral(_))
+                    | Some(Token::KwTrue)
+                    | Some(Token::KwFalse)
+                    | Some(Token::LParen)
+                    | Some(Token::KwThis)
+                    | Some(Token::KwNew)
+                    | Some(Token::Bang)
+            );
+            if !starts_expr {
+                return Ok(None);
+            }
+        }
+        // 解析类型引用
+        let target_type = self.parse_type_ref()?;
+        self.expect_token(&Token::RParen)?;
+        // 解析被转换的一元表达式（右结合，绑定到 cast）
+        let expression = Box::new(self.parse_prefix()?);
+        Ok(Some(Expression::Cast { target_type, expression, span }))
+    }
+
     /// 解析前缀表达式
     fn parse_prefix(&mut self) -> Result<Expression, ()> {
         let token_span = match self.advance() {
@@ -1396,6 +1464,10 @@ impl Parser {
 
             // 括号分组
             Token::LParen => {
+                // 尝试识别强制类型转换 `(Type)expr`
+                if let Some(cast) = self.try_parse_cast(span)? {
+                    return Ok(cast);
+                }
                 let inner = self.parse_expression()?;
                 self.expect_token(&Token::RParen)?;
                 Ok(inner)
@@ -1452,7 +1524,35 @@ impl Parser {
                     } else {
                         Vec::new()
                     };
-                    return Ok(Expression::New { class_type, arguments, span });
+                    // 可选注入器初始化 `: { fields }`
+                    let injector = if self.check(&Token::Colon) && matches!(self.peek_ahead(1).map(|t| &t.token), Some(Token::LBrace)) {
+                        self.advance(); // :
+                        self.advance(); // {
+                        let fields = if self.check(&Token::Colon) { // 空注入器 `:{:}`
+                            self.advance();
+                            self.expect_token(&Token::RBrace)?;
+                            Vec::new()
+                        } else if self.check(&Token::Comma) { // 空数组注入器 `:{,}`
+                            self.advance();
+                            self.expect_token(&Token::RBrace)?;
+                            Vec::new()
+                        } else {
+                            let mut f = Vec::new();
+                            while !self.check(&Token::RBrace) && !self.is_at_end() {
+                                let key = self.match_identifier().ok_or_else(|| { self.diagnostics.emit_error(self.current_span(), "期望注入器字段名"); () })?;
+                                self.expect_token(&Token::Colon)?;
+                                let val = self.parse_expression()?;
+                                f.push((key, val));
+                                if !self.match_token(&Token::Comma) { break; }
+                            }
+                            self.expect_token(&Token::RBrace)?;
+                            f
+                        };
+                        Some(fields)
+                    } else {
+                        None
+                    };
+                    return Ok(Expression::New { class_type, arguments, injector, span });
                 }
                 // new Type[size] — 数组构造
                 if self.check(&Token::LBracket) {
@@ -1518,7 +1618,7 @@ impl Parser {
 
         if self.check(&Token::RBrace) {
             self.advance();
-            return Ok(Expression::InjectorObject { fields, span });
+            return Ok(Expression::InjectorObject { class_name: String::new(), fields, span });
         }
 
         loop {
@@ -1546,7 +1646,7 @@ impl Parser {
         }
 
         self.expect_token(&Token::RBrace)?;
-        Ok(Expression::InjectorObject { fields, span })
+        Ok(Expression::InjectorObject { class_name: String::new(), fields, span })
     }
 
     /// 解析注入器数组或普通数组 `[elem1, elem2, ...]`
@@ -1568,7 +1668,7 @@ impl Parser {
         // 空注入器对象 `{:}`
         if self.match_token(&Token::Colon) {
             self.expect_token(&Token::RBrace)?;
-            return Ok(Expression::InjectorObject { fields: Vec::new(), span });
+            return Ok(Expression::InjectorObject { class_name: String::new(), fields: Vec::new(), span });
         }
         // 空注入器数组 `{,}`
         if self.match_token(&Token::Comma) {
@@ -1578,7 +1678,7 @@ impl Parser {
         // 直接闭合 `{}` — 视为空对象注入器
         if self.check(&Token::RBrace) {
             self.advance();
-            return Ok(Expression::InjectorObject { fields: Vec::new(), span });
+            return Ok(Expression::InjectorObject { class_name: String::new(), fields: Vec::new(), span });
         }
 
         // 有内容：lookahead 判读是 key:value 对还是纯表达式列表
@@ -1607,7 +1707,7 @@ impl Parser {
                 }
             }
             self.expect_token(&Token::RBrace)?;
-            Ok(Expression::InjectorObject { fields, span })
+            Ok(Expression::InjectorObject { class_name: String::new(), fields, span })
         } else {
             // 数组注入器：`{ expr, expr, ... }`
             let mut elements = Vec::new();
@@ -1885,7 +1985,20 @@ impl Parser {
                 // 注入器字面量: expr : { key: value } 或 expr : { elem, elem }
                 if self.check(&Token::LBrace) {
                     self.advance(); // 消费 '{'
-                    return self.parse_injector_literal_content(span);
+                    let class_name = match &left {
+                        Expression::Identifier(name, _) => name.clone(),
+                        _ => String::new(),
+                    };
+                    let result = self.parse_injector_literal_content(span)?;
+                    match result {
+                        Expression::InjectorObject { fields, span, .. } => {
+                            return Ok(Expression::InjectorObject { class_name, fields, span });
+                        }
+                        Expression::InjectorArray { elements, span } => {
+                            return Ok(Expression::InjectorArray { elements, span });
+                        }
+                        other => return Ok(other),
+                    }
                 }
                 self.diagnostics.emit_error(span, "Colon 后期望 Lambda 参数列表或注入器字面量");
                 Err(())
@@ -1961,6 +2074,70 @@ mod tests {
                 }
             }
             Err(_) => Err(parser.into_diagnostics()),
+        }
+    }
+
+    /// 辅助函数：解析单条语句
+    fn parse_stmt(source: &str) -> Statement {
+        let (tokens, _) = tokenize(source, 0);
+        let mut parser = Parser::new(tokens);
+        parser.parse_statement().expect("语句解析失败")
+    }
+
+    #[test]
+    fn test_parse_break_default_target() {
+        // 无目标 break 默认 [ByLayer(1)]
+        match parse_stmt("break;") {
+            Statement::Break { targets, .. } => {
+                assert_eq!(targets.len(), 1);
+                assert!(matches!(targets[0], BreakTarget::ByLayer(1)));
+            }
+            other => panic!("应为 Break，实为 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_break_by_layer() {
+        match parse_stmt("break 2;") {
+            Statement::Break { targets, .. } => {
+                assert_eq!(targets.len(), 1);
+                assert!(matches!(targets[0], BreakTarget::ByLayer(2)));
+            }
+            other => panic!("应为 Break，实为 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_break_by_keyword() {
+        match parse_stmt("break while;") {
+            Statement::Break { targets, .. } => {
+                assert_eq!(targets.len(), 1);
+                assert!(matches!(&targets[0], BreakTarget::ByKeyword(k) if k == "while"));
+            }
+            other => panic!("应为 Break，实为 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_break_multi_targets() {
+        // break for for → 两个 for 关键字目标
+        match parse_stmt("break for for;") {
+            Statement::Break { targets, .. } => {
+                assert_eq!(targets.len(), 2);
+                assert!(matches!(&targets[0], BreakTarget::ByKeyword(k) if k == "for"));
+                assert!(matches!(&targets[1], BreakTarget::ByKeyword(k) if k == "for"));
+            }
+            other => panic!("应为 Break，实为 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_continue_by_layer() {
+        match parse_stmt("continue 3;") {
+            Statement::Continue { targets, .. } => {
+                assert!(matches!(targets[0], BreakTarget::ByLayer(3)));
+            }
+            other => panic!("应为 Continue，实为 {:?}", other),
         }
     }
 

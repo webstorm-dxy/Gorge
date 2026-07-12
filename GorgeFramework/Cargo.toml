@@ -1,0 +1,3 @@
+[workspace]
+members = ["GorgeMacros", "GorgeFramework", "GorgeRunner"]
+resolver = "2"

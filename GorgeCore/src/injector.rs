@@ -124,6 +124,59 @@ impl RuntimeInjector {
 
         injector
     }
+
+    /// 从注入器常量定义构造注入器（G2）
+    ///
+    /// 常量中的所有字段值都是显式设置的（非默认）。字段按类型分组存储，
+    /// 索引基于常量定义中该类型字段出现的顺序。
+    pub fn from_constant(constant: &crate::bytecode::InjectorConstantDef) -> Self {
+        // 统计各类型字段数
+        let mut int_count = 0; let mut float_count = 0; let mut bool_count = 0;
+        let mut str_count = 0; let mut obj_count = 0;
+        for f in &constant.fields {
+            match f {
+                crate::bytecode::InjectorConstField::Int(..) => int_count += 1,
+                crate::bytecode::InjectorConstField::Float(..) => float_count += 1,
+                crate::bytecode::InjectorConstField::Bool(..) => bool_count += 1,
+                crate::bytecode::InjectorConstField::String(..) => str_count += 1,
+                crate::bytecode::InjectorConstField::Object(..) => obj_count += 1,
+            }
+        }
+        let mut result = Self {
+            class_decl: Arc::new(crate::declaration::ClassDeclaration::dummy(constant.class_name.clone())),
+            int_fields: vec![(0, true); int_count],
+            float_fields: vec![(0.0, true); float_count],
+            bool_fields: vec![(false, true); bool_count],
+            string_fields: vec![(String::new(), true); str_count],
+            object_fields: vec![(0, true); obj_count],
+        };
+        let mut ii = 0; let mut fi = 0; let mut bi = 0; let mut si = 0; let mut oi = 0;
+        for f in &constant.fields {
+            match f {
+                crate::bytecode::InjectorConstField::Int(_, v) => {
+                    result.int_fields[ii] = (*v, false);
+                    ii += 1;
+                }
+                crate::bytecode::InjectorConstField::Float(_, v) => {
+                    result.float_fields[fi] = (*v, false);
+                    fi += 1;
+                }
+                crate::bytecode::InjectorConstField::Bool(_, v) => {
+                    result.bool_fields[bi] = (*v, false);
+                    bi += 1;
+                }
+                crate::bytecode::InjectorConstField::String(_, v) => {
+                    result.string_fields[si] = (v.clone(), false);
+                    si += 1;
+                }
+                crate::bytecode::InjectorConstField::Object(_, v) => {
+                    result.object_fields[oi] = (*v, false);
+                    oi += 1;
+                }
+            }
+        }
+        result
+    }
 }
 
 impl Injector for RuntimeInjector {

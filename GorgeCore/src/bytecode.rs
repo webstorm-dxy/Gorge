@@ -26,6 +26,20 @@ pub struct CompiledClass {
     pub constructors: Vec<CompiledMethod>,
     pub injector_fields: Vec<InjectorFieldDef>,
     pub delegate_impls: Vec<DelegateImpl>,
+    /// 继承编号冻结（B-3）：本类方法（混合空间）的全局起始编号
+    pub method_start_id: usize,
+    /// 含继承的方法总数
+    pub method_count_total: usize,
+    /// 本类构造方法的全局起始编号
+    pub constructor_start_id: usize,
+    /// 重写映射：被重写父类方法全局 ID → 本类重写方法全局 ID
+    pub method_override_id: Vec<(usize, usize)>,
+    /// 本类实例字段各值类型的起始索引（父类字段总数），顺序 int/float/bool/string/object
+    pub field_start_counts: [usize; 5],
+    /// 接口方法实现映射（F1）：(接口全名, [接口方法本地ID → 类方法全局ID])
+    pub interface_method_impl_id: Vec<(String, Vec<usize>)>,
+    /// 注入器常量池（G2）：编译时求值的注入器字面量
+    pub injector_constants: Vec<InjectorConstantDef>,
 }
 
 /// 委托实现元数据
@@ -46,10 +60,32 @@ pub struct InjectorFieldDef {
     pub has_default: bool,
 }
 
+/// 注入器常量定义（编译时构造的注入器常量，G2）
+///
+/// 每个常量对应源码中的一个注入器字面量（如 `Vector2:{x:1.0,y:2.0}`），
+/// 字段值已求值为常量化，运行时从常量池实例化。
+#[derive(Debug, Clone)]
+pub struct InjectorConstantDef {
+    /// 注入目标的类全名（如 "Vector2"）
+    pub class_name: String,
+    /// 字段名 → 常量值
+    pub fields: Vec<InjectorConstField>,
+}
+
+/// 注入器常量字段
+#[derive(Debug, Clone)]
+pub enum InjectorConstField {
+    Int(String, i64),
+    Float(String, f64),
+    Bool(String, bool),
+    String(String, String),
+    Object(String, usize),
+}
+
 /// 字节码魔数："GORG"
 const MAGIC: [u8; 4] = [b'G', b'O', b'R', b'G'];
 /// 字节码格式版本
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 /// 操作码 → u16 编号的双向映射
 fn opcode_to_u16(op: &IntermediateOperator) -> u16 {
@@ -106,6 +142,7 @@ fn opcode_to_u16(op: &IntermediateOperator) -> u16 {
         IntermediateOperator::IntToString => 64,
         IntermediateOperator::FloatToString => 65,
         IntermediateOperator::BoolToString => 66,
+        IntermediateOperator::ObjectCastToObject => 67,
         IntermediateOperator::Jump(_) => 70,
         IntermediateOperator::JumpIfFalse(_) => 71,
         IntermediateOperator::JumpIfTrue(_) => 72,
@@ -115,6 +152,8 @@ fn opcode_to_u16(op: &IntermediateOperator) -> u16 {
         IntermediateOperator::InvokeDelegate(_) => 83,
         IntermediateOperator::InvokeConstructor(_) => 84,
         IntermediateOperator::DoConstruct(_) => 90,
+        IntermediateOperator::InvokeSuperConstructor(_) => 91,
+        IntermediateOperator::LoadInjectorConstant(_) => 92,
         IntermediateOperator::ReturnInt => 100,
         IntermediateOperator::ReturnFloat => 101,
         IntermediateOperator::ReturnBool => 102,
@@ -213,6 +252,7 @@ fn u16_to_opcode(code: u16, extra: u16) -> IntermediateOperator {
         64 => IntermediateOperator::IntToString,
         65 => IntermediateOperator::FloatToString,
         66 => IntermediateOperator::BoolToString,
+        67 => IntermediateOperator::ObjectCastToObject,
         70 => IntermediateOperator::Jump(extra as usize),
         71 => IntermediateOperator::JumpIfFalse(extra as usize),
         72 => IntermediateOperator::JumpIfTrue(extra as usize),
@@ -222,6 +262,8 @@ fn u16_to_opcode(code: u16, extra: u16) -> IntermediateOperator {
         83 => IntermediateOperator::InvokeDelegate(extra as usize),
         84 => IntermediateOperator::InvokeConstructor(extra as usize),
         90 => IntermediateOperator::DoConstruct(extra as usize),
+        91 => IntermediateOperator::InvokeSuperConstructor(extra as usize),
+        92 => IntermediateOperator::LoadInjectorConstant(extra as usize),
         100 => IntermediateOperator::ReturnInt,
         101 => IntermediateOperator::ReturnFloat,
         102 => IntermediateOperator::ReturnBool,
@@ -273,9 +315,9 @@ pub type BytecodeResult<T> = Result<T, String>;
 pub fn serialize(methods: &[CompiledMethod]) -> BytecodeResult<Vec<u8>> {
     let mut buf = Vec::new();
 
-    // 写入文件头
+    // 写入文件头（V1 格式始终用版本 1）
     buf.extend_from_slice(&MAGIC);
-    buf.extend_from_slice(&VERSION.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
     buf.extend_from_slice(&(methods.len() as u16).to_le_bytes());
 
     for method in methods {
@@ -371,6 +413,64 @@ fn serialize_compiled_class(class: &CompiledClass, buf: &mut Vec<u8>) -> Bytecod
         serialize_method(ctor, buf)?;
     }
 
+    // 继承编号冻结（B-3）
+    buf.extend_from_slice(&(class.method_start_id as u32).to_le_bytes());
+    buf.extend_from_slice(&(class.method_count_total as u32).to_le_bytes());
+    buf.extend_from_slice(&(class.constructor_start_id as u32).to_le_bytes());
+    buf.extend_from_slice(&(class.method_override_id.len() as u16).to_le_bytes());
+    for (from, to) in &class.method_override_id {
+        buf.extend_from_slice(&(*from as u32).to_le_bytes());
+        buf.extend_from_slice(&(*to as u32).to_le_bytes());
+    }
+    for c in &class.field_start_counts {
+        buf.extend_from_slice(&(*c as u32).to_le_bytes());
+    }
+
+    // 接口方法实现映射（F1）
+    buf.extend_from_slice(&(class.interface_method_impl_id.len() as u16).to_le_bytes());
+    for (iface_name, impl_ids) in &class.interface_method_impl_id {
+        let name_bytes = iface_name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(&(impl_ids.len() as u16).to_le_bytes());
+        for id in impl_ids {
+            buf.extend_from_slice(&(*id as u32).to_le_bytes());
+        }
+    }
+
+    // 注入器常量池（G2）
+    buf.extend_from_slice(&(class.injector_constants.len() as u16).to_le_bytes());
+    for c in &class.injector_constants {
+        let cn = c.class_name.as_bytes();
+        buf.extend_from_slice(&(cn.len() as u16).to_le_bytes());
+        buf.extend_from_slice(cn);
+        buf.extend_from_slice(&(c.fields.len() as u16).to_le_bytes());
+        for f in &c.fields {
+            match f {
+                InjectorConstField::Int(name, v) => {
+                    buf.push(0); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                InjectorConstField::Float(name, v) => {
+                    buf.push(1); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                InjectorConstField::Bool(name, v) => {
+                    buf.push(2); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
+                    buf.push(if *v { 1u8 } else { 0u8 });
+                }
+                InjectorConstField::String(name, v) => {
+                    buf.push(3); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
+                    let vb = v.as_bytes(); buf.extend_from_slice(&(vb.len() as u16).to_le_bytes()); buf.extend_from_slice(vb);
+                }
+                InjectorConstField::Object(name, v) => {
+                    buf.push(4); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
+                    buf.extend_from_slice(&(*v as u32).to_le_bytes());
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -422,6 +522,8 @@ fn get_extra_field(op: &IntermediateOperator) -> u16 {
         | IntermediateOperator::InvokeInterface(v)
         | IntermediateOperator::InvokeConstructor(v)
         | IntermediateOperator::DoConstruct(v)
+        | IntermediateOperator::InvokeSuperConstructor(v)
+        | IntermediateOperator::LoadInjectorConstant(v)
         | IntermediateOperator::LoadIntField(v)
         | IntermediateOperator::LoadFloatField(v)
         | IntermediateOperator::LoadBoolField(v)
@@ -499,9 +601,9 @@ fn write_operand(op: &Operand, buf: &mut Vec<u8>) -> BytecodeResult<()> {
             }
         },
     }
+
     Ok(())
 }
-
 fn write_optional_operand(op: Option<&Operand>, buf: &mut Vec<u8>) -> BytecodeResult<()> {
     match op {
         Some(o) => {
@@ -561,6 +663,13 @@ pub fn deserialize_module(data: &[u8]) -> BytecodeResult<CompiledModule> {
             constructors: vec![],
             injector_fields: vec![],
             delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
         };
         Ok(CompiledModule { version: 1, classes: vec![class] })
     } else {
@@ -716,6 +825,93 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize) -> BytecodeResult<(Co
 
     let class_name = full_name.rsplit('.').next().unwrap_or(&full_name).to_string();
 
+    // 继承编号冻结（B-3）
+    if pos + 4 > data.len() { return Err("读取 method_start_id 越界".into()); }
+    let method_start_id = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+    pos += 4;
+    if pos + 4 > data.len() { return Err("读取 method_count_total 越界".into()); }
+    let method_count_total = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+    pos += 4;
+    if pos + 4 > data.len() { return Err("读取 constructor_start_id 越界".into()); }
+    let constructor_start_id = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+    pos += 4;
+    if pos + 2 > data.len() { return Err("读取重写映射计数越界".into()); }
+    let override_count = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+    pos += 2;
+    let mut method_override_id = Vec::with_capacity(override_count);
+    for _ in 0..override_count {
+        if pos + 8 > data.len() { return Err("读取重写映射项越界".into()); }
+        let from = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        let to = u32::from_le_bytes([data[pos+4], data[pos+5], data[pos+6], data[pos+7]]) as usize;
+        method_override_id.push((from, to));
+        pos += 8;
+    }
+    let mut field_start_counts = [0usize; 5];
+    for slot in &mut field_start_counts {
+        if pos + 4 > data.len() { return Err("读取字段起始计数越界".into()); }
+        *slot = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        pos += 4;
+    }
+
+    // 接口方法实现映射（F1）
+    if pos + 2 > data.len() { return Err("读取接口映射计数越界".into()); }
+    let iface_map_count = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+    pos += 2;
+    let mut interface_method_impl_id = Vec::with_capacity(iface_map_count);
+    for _ in 0..iface_map_count {
+        if pos + 2 > data.len() { return Err("读取接口名长度越界".into()); }
+        let nlen = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        pos += 2;
+        if pos + nlen > data.len() { return Err("读取接口名越界".into()); }
+        let iface_name = String::from_utf8_lossy(&data[pos..pos+nlen]).to_string();
+        pos += nlen;
+        if pos + 2 > data.len() { return Err("读取接口方法数越界".into()); }
+        let mcount = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        pos += 2;
+        let mut impl_ids = Vec::with_capacity(mcount);
+        for _ in 0..mcount {
+            if pos + 4 > data.len() { return Err("读取接口方法实现ID越界".into()); }
+            impl_ids.push(u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize);
+            pos += 4;
+        }
+        interface_method_impl_id.push((iface_name, impl_ids));
+    }
+
+    // 注入器常量池（G2）
+    if pos + 2 > data.len() { return Err("读取注入器常量计数越界".into()); }
+    let inj_const_count = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+    pos += 2;
+    let mut injector_constants = Vec::with_capacity(inj_const_count);
+    for _ in 0..inj_const_count {
+        if pos + 2 > data.len() { return Err("读取常量类名长度越界".into()); }
+        let cnlen = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        pos += 2;
+        if pos + cnlen > data.len() { return Err("读取常量类名越界".into()); }
+        let class_name = String::from_utf8_lossy(&data[pos..pos+cnlen]).to_string();
+        pos += cnlen;
+        if pos + 2 > data.len() { return Err("读取常量字段数越界".into()); }
+        let fcount = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        pos += 2;
+        let mut fields = Vec::with_capacity(fcount);
+        for _ in 0..fcount {
+            if pos + 1 > data.len() { return Err("读取字段类型标签越界".into()); }
+            let tag = data[pos]; pos += 1;
+            if pos + 2 > data.len() { return Err("读取字段名长度越界".into()); }
+            let fnlen = u16::from_le_bytes([data[pos], data[pos+1]]) as usize; pos += 2;
+            if pos + fnlen > data.len() { return Err("读取字段名越界".into()); }
+            let fname = String::from_utf8_lossy(&data[pos..pos+fnlen]).to_string(); pos += fnlen;
+            match tag {
+                0 => { if pos + 8 > data.len() { return Err("读取int字段值越界".into()); } let v = i64::from_le_bytes([data[pos],data[pos+1],data[pos+2],data[pos+3],data[pos+4],data[pos+5],data[pos+6],data[pos+7]]); pos += 8; fields.push(InjectorConstField::Int(fname, v)); }
+                1 => { if pos + 8 > data.len() { return Err("读取float字段值越界".into()); } let v = f64::from_le_bytes([data[pos],data[pos+1],data[pos+2],data[pos+3],data[pos+4],data[pos+5],data[pos+6],data[pos+7]]); pos += 8; fields.push(InjectorConstField::Float(fname, v)); }
+                2 => { if pos + 1 > data.len() { return Err("读取bool字段值越界".into()); } let v = data[pos] != 0; pos += 1; fields.push(InjectorConstField::Bool(fname, v)); }
+                3 => { if pos + 2 > data.len() { return Err("读取string字段长度越界".into()); } let slen = u16::from_le_bytes([data[pos],data[pos+1]]) as usize; pos += 2; if pos + slen > data.len() { return Err("读取string字段越界".into()); } let sv = String::from_utf8_lossy(&data[pos..pos+slen]).to_string(); pos += slen; fields.push(InjectorConstField::String(fname, sv)); }
+                4 => { if pos + 4 > data.len() { return Err("读取object字段值越界".into()); } let v = u32::from_le_bytes([data[pos],data[pos+1],data[pos+2],data[pos+3]]) as usize; pos += 4; fields.push(InjectorConstField::Object(fname, v)); }
+                _ => return Err("未知注入器常量字段类型".into()),
+            }
+        }
+        injector_constants.push(InjectorConstantDef { class_name, fields });
+    }
+
     Ok((CompiledClass {
         class_type: GorgeType::class(class_name, None),
         is_native,
@@ -729,6 +925,13 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize) -> BytecodeResult<(Co
         constructors,
         injector_fields,
         delegate_impls,
+        method_start_id,
+        method_count_total,
+        constructor_start_id,
+        method_override_id,
+        field_start_counts,
+        interface_method_impl_id,
+        injector_constants,
     }, pos))
 }
 
@@ -983,6 +1186,34 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_super_constructor() {
+        // 验证 InvokeSuperConstructor 操作码与 right（父类名）序列化往返
+        let codes = vec![CodeWithSpan::new(
+            IntermediateCode::new(
+                IntermediateOperator::InvokeSuperConstructor(0),
+                Operand::int(1),
+                Some(Operand::string("Animal")),
+                None,
+            ),
+            crate::diagnostics::Span::dummy(),
+        )];
+        let method = CompiledMethod {
+            name: "constructor".into(),
+            codes,
+            local_count: 2,
+        };
+        let data = serialize(&[method]).unwrap();
+        let deserialized = deserialize(&data).unwrap();
+        assert_eq!(deserialized[0].codes.len(), 1);
+        let code = &deserialized[0].codes[0].code;
+        assert!(matches!(code.operator, IntermediateOperator::InvokeSuperConstructor(0)));
+        match &code.right {
+            Some(Operand::Immediate(ImmediateValue::String(s))) => assert_eq!(s, "Animal"),
+            _ => panic!("right 应为父类名字符串"),
+        }
+    }
+
+    #[test]
     fn test_roundtrip_multiple_methods() {
         let m1 = CompiledMethod {
             name: "foo".into(),
@@ -1022,7 +1253,12 @@ mod tests {
             constructors: vec![],
             injector_fields: vec![],
             delegate_impls: vec![],
-        };
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],                    injector_constants: vec![],        };
         let module = CompiledModule { version: 2, classes: vec![class] };
         let data = serialize_module(&module).unwrap();
         let deserialized = deserialize_module(&data).unwrap();
@@ -1051,7 +1287,12 @@ mod tests {
                 InjectorFieldDef { name: "position".into(), value_type: ValueType::Object, has_default: false },
             ],
             delegate_impls: vec![],
-        };
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],                    injector_constants: vec![],        };
         let module = CompiledModule { version: 2, classes: vec![class] };
         let data = serialize_module(&module).unwrap();
         let deserialized = deserialize_module(&data).unwrap();
@@ -1094,7 +1335,12 @@ mod tests {
                     outer_value_count: 1,
                 },
             ],
-        };
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],                    injector_constants: vec![],        };
         let module = CompiledModule { version: 2, classes: vec![class] };
         let data = serialize_module(&module).unwrap();
         let deserialized = deserialize_module(&data).unwrap();

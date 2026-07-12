@@ -109,6 +109,13 @@ pub struct VirtualMachine {
     /// 类注册表：类全名 → RuntimeClass（供方法分派使用）
     pub class_table: HashMap<String, Arc<RuntimeClass>>,
 
+    /// Native 类注册表：类全名 → NativeClass（供 native 方法/构造分派）
+    pub native_class_table: HashMap<String, Arc<dyn crate::native::NativeClass>>,
+    /// 类 → 父类名映射（供跨 native/compiled 边界的祖先查找，F2）
+    pub class_super_name: HashMap<String, String>,
+    /// 注入器常量池（G2）：由 runner 反序列化后注册，运行时通过 LoadInjectorConstant 访问
+    pub injector_constants: Vec<crate::bytecode::InjectorConstantDef>,
+
     /// 按类名索引的静态方法表
     class_static_methods: HashMap<String, Vec<(CompiledMethod, Vec<ValueType>)>>,
     /// 当前执行上下文所属的类名
@@ -144,6 +151,9 @@ impl VirtualMachine {
             class_static_fields: HashMap::new(),
             class_delegate_impls: HashMap::new(),
             class_table: HashMap::new(),
+            native_class_table: HashMap::new(),
+            class_super_name: HashMap::new(),
+            injector_constants: Vec::new(),
             class_static_methods: HashMap::new(),
             current_class: String::new(),
             current_injector: None,
@@ -176,6 +186,15 @@ impl VirtualMachine {
         self.class_table.insert(class_name.to_string(), cls);
     }
 
+    /// 注册 native 类（供 native 方法/构造分派使用）
+    pub fn register_native_class(
+        &mut self,
+        class_name: &str,
+        cls: Arc<dyn crate::native::NativeClass>,
+    ) {
+        self.native_class_table.insert(class_name.to_string(), cls);
+    }
+
     /// 注册类的委托实现（供 InvokeDelegate 按类查找）
     pub fn register_class_delegates(&mut self, class_name: &str, delegates: Vec<(CompiledMethod, Vec<ValueType>)>) {
         self.class_delegate_impls.insert(class_name.to_string(), delegates);
@@ -184,6 +203,211 @@ impl VirtualMachine {
     /// 设置当前执行上下文所属的类名
     pub fn set_current_class(&mut self, class_name: &str) {
         self.current_class = class_name.to_string();
+    }
+
+    // ==================== Native 分派 ====================
+
+    /// 把调用参数池中的参数按值类型分组复制到 callee 的局部槽位。
+    ///
+    /// 参数按值类型分组存储（B-2），方法参数占据每种类型最低的连续局部索引。
+    /// 对每种类型从 0 起连续复制「已设置」的参数，遇首个未设置即停，`bound` 为上界。
+    fn copy_params_to_locals(&mut self, bound: usize) {
+        // 逐类型复制（借用 param_pool 的各数组判断 is_set）
+        {
+            let mut j = 0;
+            while j < bound && self.param_pool.int_params.borrow()[j].is_set {
+                let v = self.param_pool.get_int_param(j);
+                self.int_stack.write(j, v);
+                j += 1;
+            }
+        }
+        {
+            let mut j = 0;
+            while j < bound && self.param_pool.float_params.borrow()[j].is_set {
+                let v = self.param_pool.get_float_param(j);
+                self.float_stack.write(j, v);
+                j += 1;
+            }
+        }
+        {
+            let mut j = 0;
+            while j < bound && self.param_pool.bool_params.borrow()[j].is_set {
+                let v = self.param_pool.get_bool_param(j);
+                self.bool_stack.write(j, v);
+                j += 1;
+            }
+        }
+        {
+            let mut j = 0;
+            while j < bound && self.param_pool.string_params.borrow()[j].is_set {
+                let v = self.param_pool.get_string_param(j);
+                self.string_stack.write(j, v);
+                j += 1;
+            }
+        }
+        {
+            let mut j = 0;
+            while j < bound && self.param_pool.object_params.borrow()[j].is_set {
+                let v = self.param_pool.get_object_param(j);
+                self.object_stack.write(j, v);
+                j += 1;
+            }
+        }
+        // 注意：不重置参数池——编译方法可能通过 LoadParameter 再次读取参数池。
+    }
+
+
+    /// 沿编译类的 super_class 链查找最近的 native 祖先类名（F2）
+    ///
+    /// 用于编译子类调用继承自 native 父类的方法时定位 native 实现。
+    /// 通过 `class_super_name` 映射逐级上溯（含 native 父类，class_table 不含 native）。
+    fn find_native_ancestor(&self, class_name: &str) -> Option<String> {
+        let mut current = self.class_super_name.get(class_name).cloned();
+        let mut guard = 0;
+        while let Some(name) = current {
+            if self.native_class_table.contains_key(&name) {
+                return Some(name);
+            }
+            current = self.class_super_name.get(&name).cloned();
+            guard += 1;
+            if guard > 1000 { break; }
+        }
+        None
+    }
+
+    /// 注册类的父类名（供 F2 跨边界祖先查找）
+    pub fn register_class_super(&mut self, class_name: &str, super_name: &str) {
+        self.class_super_name.insert(class_name.to_string(), super_name.to_string());
+    }
+
+    /// 分派 native 静态方法：参数已由 SetXxxParameter 写入参数池，返回值写回参数池。
+    fn dispatch_native_static(&mut self, class_name: &str, method_id: usize) {
+        if let Some(cls) = self.native_class_table.get(class_name).cloned() {
+            let mut ctx = crate::native::NativeContext::new(
+                &self.param_pool,
+                &mut self.objects,
+                &mut self.next_object_id,
+            );
+            cls.invoke_native_static(&mut ctx, method_id);
+        }
+    }
+
+    /// 构造 native 上下文并分派实例方法
+    fn dispatch_native_method(&mut self, class_name: &str, obj_id: usize, method_id: usize) {
+        if let Some(cls) = self.native_class_table.get(class_name).cloned() {
+            let mut ctx = crate::native::NativeContext::new(
+                &self.param_pool,
+                &mut self.objects,
+                &mut self.next_object_id,
+            );
+            cls.invoke_native_method(&mut ctx, obj_id, method_id);
+        }
+    }
+
+    /// 构造 native 上下文并分派构造方法，返回新对象 ID
+    ///
+    /// 注入器专用位在调用前应已由 SetInjector 逻辑写入参数池。
+    fn dispatch_native_construct(
+        &mut self,
+        class_name: &str,
+        target: Option<usize>,
+        ctor_id: usize,
+    ) -> usize {
+        if let Some(cls) = self.native_class_table.get(class_name).cloned() {
+            let mut ctx = crate::native::NativeContext::new(
+                &self.param_pool,
+                &mut self.objects,
+                &mut self.next_object_id,
+            );
+            let obj_id = cls.do_construct_native(&mut ctx, target, ctor_id);
+            // 仅当新建对象（target=None）时才归一化类名为注册键，确保后续 InvokeInstance
+            // 能按同一键找到 native 类。若 target=Some（编译子类 super 调用到 native 父类），
+            // 对象是子类实例，绝不能把其类名改成 native 父类名。
+            if target.is_none() {
+                if let Some(obj) = self.objects.get_mut(&obj_id) {
+                    obj.class_name = class_name.to_string();
+                }
+            }
+            obj_id
+        } else {
+            0
+        }
+    }
+
+    /// 把 native 方法写入参数池的返回值按结果地址类型落到对应栈
+    ///
+    /// native 桥接层将返回值写入参数池的返回位，本方法据结果地址的值类型
+    /// 取出并写入相应类型栈。
+    fn write_native_return_to_result(&mut self, result: Option<&Address>) {
+        if let Some(addr) = result {
+            match addr.value_type {
+                ValueType::Int => {
+                    let v = self.param_pool.get_int_return();
+                    self.int_stack.write(addr.index, v);
+                }
+                ValueType::Float => {
+                    let v = self.param_pool.get_float_return();
+                    self.float_stack.write(addr.index, v);
+                }
+                ValueType::Bool => {
+                    let v = self.param_pool.get_bool_return();
+                    self.bool_stack.write(addr.index, v);
+                }
+                ValueType::String => {
+                    let v = self.param_pool.get_string_return();
+                    self.string_stack.write(addr.index, v);
+                }
+                ValueType::Object => {
+                    let v = self.param_pool.get_object_return();
+                    self.object_stack.write(addr.index, v);
+                }
+            }
+        }
+    }
+
+    /// 建立编译对象与其 native 子对象之间的双向引用
+    ///
+    /// 对应 C# 中 `CompiledGorgeObject.NativeObject` 与 native 对象
+    /// `OuterCompiledObject` 的互指。用于编译类继承 native 类的场景：
+    /// - `compiled_id`：外层编译对象 ID
+    /// - `native_id`：内层 native 子对象 ID
+    ///
+    /// 建立后：
+    /// - 编译对象的 `native_object_id` = native_id
+    /// - native 对象的 `outer_compiled_id` = compiled_id
+    ///
+    /// 注意：本机制的真正触发依赖“编译类继承 native 类”，需要编译器实现继承
+    /// 编号冻结（Backlog B-3）与 native 类导入（Backlog B-4）后才会在端到端流程中
+    /// 被使用；当前通过单元测试直接构造验证。
+    pub fn link_native_and_compiled(&mut self, compiled_id: usize, native_id: usize) {
+        if let Some(compiled) = self.objects.get_mut(&compiled_id) {
+            compiled.native_object_id = Some(native_id);
+        }
+        if let Some(native) = self.objects.get_mut(&native_id) {
+            native.outer_compiled_id = Some(compiled_id);
+        }
+    }
+
+    /// 解析对象的“真实对象” ID（对应 C# `GorgeObject.RealObject`）
+    ///
+    /// 若对象是被编译类包裹的 native 子对象（存在 `outer_compiled_id`），
+    /// 返回外层编译对象 ID；否则返回自身 ID。
+    pub fn resolve_real_object_id(&self, obj_id: usize) -> usize {
+        self.objects
+            .get(&obj_id)
+            .and_then(|o| o.outer_compiled_id)
+            .unwrap_or(obj_id)
+    }
+
+    /// 从指令的 right 操作数解析目标类名（跨类静态调用/构造用）
+    ///
+    /// codegen 把 `InvokeStatic`/`InvokeConstructor` 的目标类名写入 right 操作数
+    /// （String 立即数）。若无 right 或非字符串，返回 None（回退到 current_class）。
+    fn read_target_class(right: Option<&Operand>) -> Option<String> {
+        match right {
+            Some(Operand::Immediate(crate::ir::ImmediateValue::String(s))) => Some(s.clone()),
+            _ => None,
+        }
     }
 
     /// 执行已编译方法的 IR 指令序列
@@ -549,6 +773,12 @@ impl VirtualMachine {
                 let addr = self.get_string_addr(code.result);
                 self.string_stack.write(addr, val.to_string());
             }
+            IntermediateOperator::ObjectCastToObject => {
+                // 对象以 ID 传递，转型仅复制对象 ID（运行期不做类型检查，对齐 C#）
+                let val = self.read_object_operand(&code.left);
+                let addr = self.get_object_addr(code.result);
+                self.object_stack.write(addr, val);
+            }
 
             // === 控制流 ===
             IntermediateOperator::Jump(target) => {
@@ -898,22 +1128,27 @@ impl VirtualMachine {
                 if class_name.is_empty() {
                     return Err("无法确定目标对象的类".into());
                 }
-                // 查找类的方法实现（找不到则静默跳过）
+                // 若目标对象属于 native 类，分派到 native 桥接层
+                if self.native_class_table.contains_key(&class_name) {
+                    self.dispatch_native_method(&class_name, target_obj_id, *method_id);
+                    self.write_native_return_to_result(code.result.as_ref());
+                    return Ok(true);
+                }
+                // 查找类的方法实现
                 let method = match self.class_table
                     .get(&class_name)
                     .and_then(|cls| cls.find_method(*method_id))
                 {
                     Some(m) => m,
-                    None => return Ok(true),
-                };
-                // 参数计数从 left 操作数获取（如果 left 是地址则默认 0）
-                // 实际参数数量由 codegen 在生成 SetXxxParameter 时确定
-                let param_count = match &code.left {
-                    Operand::Immediate(im) => match im {
-                        crate::ir::ImmediateValue::Int(v) => *v as usize,
-                        _ => 0,
-                    },
-                    _ => 0,
+                    None => {
+                        // 编译子类继承 native 类：方法可能属于 native 祖先（F2）。
+                        // 沿 super_class 链找到 native 祖先，方法全局 ID 直接作为其方法索引分派。
+                        if let Some(native_anc) = self.find_native_ancestor(&class_name) {
+                            self.dispatch_native_method(&native_anc, target_obj_id, *method_id);
+                            self.write_native_return_to_result(code.result.as_ref());
+                        }
+                        return Ok(true);
+                    }
                 };
                 // 保存栈状态并执行
                 let saved_pc = self.pc;
@@ -928,11 +1163,10 @@ impl VirtualMachine {
                 self.bool_stack.write(max_locals.saturating_sub(1), false);
                 self.string_stack.write(max_locals.saturating_sub(1), String::new());
                 self.object_stack.write(max_locals.saturating_sub(1), 0);
-                // 将参数从 param_pool 复制到栈指定位置
-                for i in 0..param_count {
-                    let val = self.param_pool.get_int_param(i);
-                    self.int_stack.write(i, val);
-                }
+                // 将参数从 param_pool 复制到 callee 的局部槽位。
+                // 参数按值类型分组存于池中（B-2），方法参数占据每种类型最低的连续局部索引，
+                // 因此对每种类型从 0 起连续复制已设置的参数，遇首个未设置即停。
+                self.copy_params_to_locals(method.local_count);
                 // 将目标对象放在 object_stack[0] 作为 callee 的 this
                 self.object_stack.write(0, target_obj_id);
                 // 执行子方法
@@ -975,21 +1209,24 @@ impl VirtualMachine {
                 return Ok(true);
             }
             IntermediateOperator::InvokeStatic(idx) => {
+                // 解析目标类：优先用 right 携带的类名（跨类调用），否则回退当前类
+                let target_class = Self::read_target_class(code.right.as_ref())
+                    .unwrap_or_else(|| self.current_class.clone());
+                // 若目标类是 native 类，分派到 native 桥接层
+                if self.native_class_table.contains_key(&target_class) {
+                    self.dispatch_native_static(&target_class, *idx);
+                    // 将返回值写回 result 地址（按结果地址类型）
+                    self.write_native_return_to_result(code.result.as_ref());
+                    return Ok(true);
+                }
                 let methods = self.class_static_methods
-                    .get(&self.current_class)
-                    .ok_or_else(|| format!("类 `{}` 未注册方法表", self.current_class))?;
+                    .get(&target_class)
+                    .ok_or_else(|| format!("类 `{}` 未注册方法表", target_class))?;
                 if *idx >= methods.len() {
                     return Err(format!("静态方法索引 {} 越界", idx));
                 }
                 let (static_method, _param_types) = methods[*idx].clone();
                 // left 操作数存参数计数
-                let param_count = match &code.left {
-                    Operand::Immediate(im) => match im {
-                        crate::ir::ImmediateValue::Int(v) => *v as usize,
-                        _ => 0,
-                    },
-                    _ => 0,
-                };
                 let saved_pc = self.pc;
                 let save_len = self.int_stack.data.len();
                 let saved_ints: Vec<i64> = (0..save_len).map(|i| *self.int_stack.read(i)).collect();
@@ -1001,12 +1238,11 @@ impl VirtualMachine {
                 self.bool_stack.write(max_locals.saturating_sub(1), false);
                 self.string_stack.write(max_locals.saturating_sub(1), String::new());
                 self.object_stack.write(max_locals.saturating_sub(1), 0);
-                // 将参数从 param_pool 复制到栈（前 param_count 个位置）
-                for i in 0..param_count {
-                    let val = self.param_pool.get_int_param(i);
-                    self.int_stack.write(i, val);
-                }
-                // 执行子方法
+                // 将参数从 param_pool 复制到 callee 局部槽位（按类型分组，消费后重置池）
+                self.copy_params_to_locals(max_locals);
+                // 执行子方法（切换 current_class 到目标类，执行完恢复）
+                let saved_class = self.current_class.clone();
+                self.current_class = target_class.clone();
                 self.pc = 0;
                 let count = static_method.codes.len();
                 while self.pc < count {
@@ -1018,6 +1254,7 @@ impl VirtualMachine {
                     }
                     self.pc += 1;
                 }
+                self.current_class = saved_class;
                 let result_index = code.result.as_ref().map(|r| r.index);
                 if let Some(ri) = result_index {
                     if let Some(v) = self.return_int {
@@ -1038,7 +1275,97 @@ impl VirtualMachine {
                 self.pc = saved_pc;
                 return Ok(true);
             }
-            IntermediateOperator::InvokeInterface(_) => {}
+            IntermediateOperator::InvokeInterface(iface_method_id) => {
+                // 目标对象在 left；接口全名在 right
+                let target_obj_id = self.read_object_operand(&code.left);
+                if target_obj_id == 0 {
+                    return Err("接口方法调用目标对象为空".into());
+                }
+                let iface_name = match Self::read_target_class(code.right.as_ref()) {
+                    Some(n) => n,
+                    None => return Ok(true),
+                };
+                // 取目标对象的运行时类
+                let class_name = self.objects
+                    .get(&target_obj_id)
+                    .map(|o| o.class_name.clone())
+                    .unwrap_or_default();
+                if class_name.is_empty() {
+                    return Err("无法确定接口调用目标对象的类".into());
+                }
+                // 通过类的接口方法实现映射把接口方法本地ID解析为类方法全局ID
+                let global_method_id = self.class_table
+                    .get(&class_name)
+                    .and_then(|cls| cls.declaration.interface_method_impl_id.get(&iface_name))
+                    .and_then(|ids| ids.get(*iface_method_id))
+                    .copied();
+                let global_method_id = match global_method_id {
+                    Some(id) if id != usize::MAX => id,
+                    _ => return Ok(true), // 未实现或无映射，静默跳过
+                };
+                // 查类方法实现并执行（与 InvokeInstance 相同的执行流程）
+                let method = match self.class_table
+                    .get(&class_name)
+                    .and_then(|cls| cls.find_method(global_method_id))
+                {
+                    Some(m) => m,
+                    None => return Ok(true),
+                };
+                let saved_pc = self.pc;
+                let save_len = self.int_stack.data.len();
+                let saved_ints: Vec<i64> = (0..save_len).map(|i| *self.int_stack.read(i)).collect();
+                let saved_floats: Vec<f64> = (0..save_len).map(|i| *self.float_stack.read(i)).collect();
+                let saved_bools: Vec<bool> = (0..save_len).map(|i| *self.bool_stack.read(i)).collect();
+                let saved_objects: Vec<usize> = (0..save_len).map(|i| *self.object_stack.read(i)).collect();
+                let max_locals = method.local_count;
+                self.int_stack.write(max_locals.saturating_sub(1), 0);
+                self.float_stack.write(max_locals.saturating_sub(1), 0.0);
+                self.bool_stack.write(max_locals.saturating_sub(1), false);
+                self.string_stack.write(max_locals.saturating_sub(1), String::new());
+                self.object_stack.write(max_locals.saturating_sub(1), 0);
+                self.copy_params_to_locals(max_locals);
+                self.object_stack.write(0, target_obj_id);
+                let saved_class = self.current_class.clone();
+                self.current_class = class_name.clone();
+                self.pc = 0;
+                let count = method.codes.len();
+                while self.pc < count {
+                    let cs = &method.codes[self.pc];
+                    let advance = self.execute_one(&cs.code)?;
+                    if !advance {
+                        if self.pc >= count { break; }
+                        continue;
+                    }
+                    self.pc += 1;
+                }
+                self.current_class = saved_class;
+                // 写回返回值
+                if let Some(addr) = code.result.as_ref() {
+                    match addr.value_type {
+                        ValueType::Int => { if let Some(v) = self.return_int { self.int_stack.write(addr.index, v); } }
+                        ValueType::Float => { if let Some(v) = self.return_float { self.float_stack.write(addr.index, v); } }
+                        ValueType::Bool => { if let Some(v) = self.return_bool { self.bool_stack.write(addr.index, v); } }
+                        ValueType::String => { if let Some(v) = self.return_string.clone() { self.string_stack.write(addr.index, v); } }
+                        ValueType::Object => { if let Some(v) = self.return_object { self.object_stack.write(addr.index, v); } }
+                    }
+                }
+                // 恢复调用者栈
+                let result_index = code.result.as_ref().map(|r| r.index);
+                for (i, v) in saved_ints.iter().enumerate() {
+                    if Some(i) != result_index { self.int_stack.write(i, *v); }
+                }
+                for (i, v) in saved_floats.iter().enumerate() {
+                    if Some(i) != result_index { self.float_stack.write(i, *v); }
+                }
+                for (i, v) in saved_bools.iter().enumerate() {
+                    if Some(i) != result_index { self.bool_stack.write(i, *v); }
+                }
+                for (i, v) in saved_objects.iter().enumerate() {
+                    if Some(i) != result_index { self.object_stack.write(i, *v); }
+                }
+                self.pc = saved_pc;
+                return Ok(true);
+            }
             IntermediateOperator::InvokeDelegate(idx) => {
                 let delegates = self.class_delegate_impls
                     .get(&self.current_class)
@@ -1122,14 +1449,30 @@ impl VirtualMachine {
 
             // === 构造 ===
             IntermediateOperator::InvokeConstructor(ctor_id) => {
+                // 解析目标类：优先用 right 携带的类名（跨类构造），否则回退当前类
+                let target_class = Self::read_target_class(code.right.as_ref())
+                    .unwrap_or_else(|| self.current_class.clone());
+                // 若目标类是 native 类，分派到 native 构造桥接层
+                if self.native_class_table.contains_key(&target_class) {
+                    let new_id = self.dispatch_native_construct(&target_class, None, *ctor_id);
+                    // native 构造把对象 ID 也写入返回位，统一以返回位为准
+                    let obj_id = if new_id != 0 {
+                        new_id
+                    } else {
+                        self.param_pool.get_object_return()
+                    };
+                    let result_addr = self.get_object_addr(code.result);
+                    self.object_stack.write(result_addr, obj_id);
+                    return Ok(true);
+                }
                 // 1. 创建对象
                 let obj_id = self.next_object_id;
                 self.next_object_id += 1;
                 let field_counts = self.class_field_counts
-                    .get(&self.current_class)
+                    .get(&target_class)
                     .cloned()
                     .unwrap_or_default();
-                let obj = RuntimeObject::new_simple(self.current_class.clone(), &field_counts);
+                let obj = RuntimeObject::new_simple(target_class.clone(), &field_counts);
                 self.objects.insert(obj_id, obj);
                 self.object_stack.write(0, obj_id);
 
@@ -1139,16 +1482,9 @@ impl VirtualMachine {
 
                 // 3. 查找并执行构造方法（若无显式构造方法则仅创建对象）
                 if let Some(ctor_method) = self.class_table
-                    .get(&self.current_class)
+                    .get(&target_class)
                     .and_then(|cls| cls.find_constructor(*ctor_id))
                 {
-                    let param_count = match &code.left {
-                        Operand::Immediate(im) => match im {
-                            crate::ir::ImmediateValue::Int(v) => *v as usize,
-                            _ => 0,
-                        },
-                        _ => 0,
-                    };
                     let saved_pc = self.pc;
                     let save_len = self.int_stack.data.len();
                     let saved_ints: Vec<i64> = (0..save_len).map(|i| *self.int_stack.read(i)).collect();
@@ -1161,12 +1497,13 @@ impl VirtualMachine {
                     self.bool_stack.write(max_locals.saturating_sub(1), false);
                     self.string_stack.write(max_locals.saturating_sub(1), String::new());
                     self.object_stack.write(max_locals.saturating_sub(1), 0);
-                    for i in 0..param_count {
-                        let val = self.param_pool.get_int_param(i);
-                        self.int_stack.write(i, val);
-                    }
+                    self.copy_params_to_locals(max_locals);
+                    // 重新确立 this（栈准备/参数复制可能覆盖 object_stack[0]）
+                    self.object_stack.write(0, obj_id);
                     self.pc = 0;
                     let count = ctor_method.codes.len();
+                    let saved_ctor_class = self.current_class.clone();
+                    self.current_class = target_class.clone();
                     while self.pc < count {
                         let cs = &ctor_method.codes[self.pc];
                         let advance = self.execute_one(&cs.code)?;
@@ -1176,6 +1513,7 @@ impl VirtualMachine {
                         }
                         self.pc += 1;
                     }
+                    self.current_class = saved_ctor_class;
                     let result_index = code.result.as_ref().map(|r| r.index);
                     for (i, v) in saved_ints.iter().enumerate() {
                         if Some(i) != result_index {
@@ -1218,8 +1556,103 @@ impl VirtualMachine {
                 self.object_stack.write(addr, obj_id);
             }
 
+            // === 父类构造调用（super）===
+            IntermediateOperator::InvokeSuperConstructor(ctor_id) => {
+                // 目标父类名经 right 操作数传递
+                let super_class = match Self::read_target_class(code.right.as_ref()) {
+                    Some(c) => c,
+                    None => return Ok(true),
+                };
+                // 当前 this 对象（object_stack[0]），父类构造在同一对象上执行
+                let this_id = *self.object_stack.read(0);
+
+                // native 父类：在已有 this 上执行 native 构造
+                if self.native_class_table.contains_key(&super_class) {
+                    let _ = self.dispatch_native_construct(&super_class, Some(this_id), *ctor_id);
+                    return Ok(true);
+                }
+
+                // 编译父类：查找父类构造方法并在 this 上执行其体
+                let ctor_method = match self.class_table
+                    .get(&super_class)
+                    .and_then(|cls| cls.find_constructor(*ctor_id))
+                {
+                    Some(m) => m,
+                    None => return Ok(true),
+                };
+                let param_count = match &code.left {
+                    Operand::Immediate(crate::ir::ImmediateValue::Int(v)) => *v as usize,
+                    _ => 0,
+                };
+                let saved_pc = self.pc;
+                let save_len = self.int_stack.data.len();
+                let saved_ints: Vec<i64> = (0..save_len).map(|i| *self.int_stack.read(i)).collect();
+                let saved_floats: Vec<f64> = (0..save_len).map(|i| *self.float_stack.read(i)).collect();
+                let saved_bools: Vec<bool> = (0..save_len).map(|i| *self.bool_stack.read(i)).collect();
+                let saved_objects: Vec<usize> = (0..save_len).map(|i| *self.object_stack.read(i)).collect();
+                let max_locals = ctor_method.local_count;
+                self.int_stack.write(max_locals.saturating_sub(1), 0);
+                self.float_stack.write(max_locals.saturating_sub(1), 0.0);
+                self.bool_stack.write(max_locals.saturating_sub(1), false);
+                self.string_stack.write(max_locals.saturating_sub(1), String::new());
+                self.object_stack.write(max_locals.saturating_sub(1), 0);
+                // 复制父类构造参数（按类型分组从参数池取）
+                for i in 0..param_count {
+                    self.int_stack.write(i, self.param_pool.get_int_param(i));
+                    self.float_stack.write(i, self.param_pool.get_float_param(i));
+                    self.bool_stack.write(i, self.param_pool.get_bool_param(i));
+                    self.string_stack.write(i, self.param_pool.get_string_param(i));
+                    self.object_stack.write(i, self.param_pool.get_object_param(i));
+                }
+                // this 保持为当前对象
+                self.object_stack.write(0, this_id);
+                // 执行父类构造体（切换 current_class 到父类）
+                let saved_class = self.current_class.clone();
+                self.current_class = super_class.clone();
+                self.pc = 0;
+                let count = ctor_method.codes.len();
+                while self.pc < count {
+                    let cs = &ctor_method.codes[self.pc];
+                    let advance = self.execute_one(&cs.code)?;
+                    if !advance {
+                        if self.pc >= count { break; }
+                        continue;
+                    }
+                    self.pc += 1;
+                }
+                self.current_class = saved_class;
+                // 恢复调用者栈（this 已写入对象字段，无需保留父构造的局部）
+                for (i, v) in saved_ints.iter().enumerate() { self.int_stack.write(i, *v); }
+                for (i, v) in saved_floats.iter().enumerate() { self.float_stack.write(i, *v); }
+                for (i, v) in saved_bools.iter().enumerate() { self.bool_stack.write(i, *v); }
+                for (i, v) in saved_objects.iter().enumerate() { self.object_stack.write(i, *v); }
+                self.pc = saved_pc;
+            }
+
             // === Nop ===
             IntermediateOperator::Nop => {}
+
+            // 注入器常量加载（G2）
+            IntermediateOperator::LoadInjectorConstant(idx) => {
+                let constant = match self.injector_constants.get(*idx) {
+                    Some(c) => c.clone(),
+                    None => {
+                        if std::env::var("GORGE_VM_DEBUG").is_ok() {
+                            eprintln!("[vm] LoadInjectorConstant({}) 越界 (总 {})", idx, self.injector_constants.len());
+                        }
+                        return Ok(true);
+                    }
+                };
+                let inj = crate::injector::RuntimeInjector::from_constant(&constant);
+                let inj_id = self.next_object_id;
+                self.next_object_id += 1;
+                if std::env::var("GORGE_VM_DEBUG").is_ok() {
+                    eprintln!("[vm] LoadInjectorConstant({}) class={} id={}", idx, constant.class_name, inj_id);
+                }
+                self.injectors.insert(inj_id, inj);
+                let addr = self.get_object_addr(code.result);
+                self.object_stack.write(addr, inj_id);
+            }
 
             // 未实现的操作码
             _ => {
@@ -1346,6 +1779,9 @@ impl Clone for VirtualMachine {
             class_static_fields: self.class_static_fields.clone(),
             class_delegate_impls: self.class_delegate_impls.clone(),
             class_table: self.class_table.clone(),
+            native_class_table: self.native_class_table.clone(),
+            class_super_name: self.class_super_name.clone(),
+            injector_constants: self.injector_constants.clone(),
             class_static_methods: self.class_static_methods.clone(),
             current_class: self.current_class.clone(),
             current_injector: self.current_injector,
@@ -1896,5 +2332,188 @@ mod tests {
         );
         let _ = vm.execute_one(&load_str).unwrap();
         assert_eq!(vm.string_stack.read(0), "hello");
+    }
+
+    // ==================== Phase A: Native 互操作验收测试 ====================
+
+    /// 手写的最小 native 类，用于验收 VM 的 native 分派链路
+    ///
+    /// 提供：
+    /// - 0 号静态方法 `addOne(int) -> int`：参数 +1
+    /// - 0 号构造方法：创建一个带 1 个 float 字段的对象，字段值取自参数池 float[0]
+    /// - 0 号实例方法 `getValue() -> float`：读取对象 float 字段 0
+    #[derive(Debug)]
+    struct DemoNativeClass {
+        name: String,
+        counts: TypeCount,
+    }
+
+    impl crate::native::NativeClass for DemoNativeClass {
+        fn full_name(&self) -> &str {
+            &self.name
+        }
+
+        fn field_type_count(&self) -> &TypeCount {
+            &self.counts
+        }
+
+        fn invoke_native_method(
+            &self,
+            ctx: &mut crate::native::NativeContext,
+            obj_id: usize,
+            method_id: usize,
+        ) {
+            // 0 号实例方法：getValue() -> float
+            if method_id == 0 {
+                let v = ctx.get_object_float_field(obj_id, 0);
+                ctx.set_float_return(v);
+            }
+        }
+
+        fn invoke_native_static(
+            &self,
+            ctx: &mut crate::native::NativeContext,
+            method_id: usize,
+        ) {
+            // 0 号静态方法：addOne(int) -> int
+            if method_id == 0 {
+                let a = ctx.get_int_param(0);
+                ctx.set_int_return(a + 1);
+            }
+        }
+
+        fn do_construct_native(
+            &self,
+            ctx: &mut crate::native::NativeContext,
+            target: Option<usize>,
+            _ctor_id: usize,
+        ) -> usize {
+            // 从参数池读取 float[0] 作为字段初值
+            let init = ctx.get_float_param(0);
+            let id = match target {
+                Some(id) => id,
+                None => {
+                    let obj = RuntimeObject::new_simple(self.name.clone(), &self.counts);
+                    ctx.register_object(obj)
+                }
+            };
+            ctx.set_object_float_field(id, 0, init);
+            id
+        }
+    }
+
+    /// 构造一个带单个 float 字段的 demo native 类
+    fn make_demo_native() -> std::sync::Arc<DemoNativeClass> {
+        std::sync::Arc::new(DemoNativeClass {
+            name: "Demo.Native".into(),
+            counts: TypeCount { float_count: 1, ..TypeCount::zero() },
+        })
+    }
+
+    #[test]
+    fn test_native_invoke_static_via_ir() {
+        // 验收核心场景：一段 IR 调用 native 静态方法并取回返回值
+        let mut vm = VirtualMachine::new();
+        vm.register_native_class("Demo.Native", make_demo_native());
+        vm.set_current_class("Demo.Native");
+        vm.push_frame(4);
+
+        // 准备参数：param[0] = 41（int）
+        let arg = Address::new(ValueType::Int, 0);
+        vm.int_stack.write(0, 41);
+        let set_param = IntermediateCode::new(
+            IntermediateOperator::SetIntParameter,
+            Operand::Address(arg),
+            None,
+            Some(Address::new(ValueType::Int, 0)),
+        );
+        vm.execute_one(&set_param).unwrap();
+
+        // InvokeStatic(0)，结果写入 int 地址 1
+        let result = Address::new(ValueType::Int, 1);
+        let invoke = IntermediateCode::new(
+            IntermediateOperator::InvokeStatic(0),
+            Operand::int(1),
+            None,
+            Some(result),
+        );
+        vm.execute_one(&invoke).unwrap();
+
+        // native addOne(41) = 42
+        assert_eq!(*vm.int_stack.read(1), 42);
+    }
+
+    #[test]
+    fn test_native_construct_and_instance_method_via_ir() {
+        // 验收：native 构造 + native 实例方法读字段
+        let mut vm = VirtualMachine::new();
+        vm.register_native_class("Demo.Native", make_demo_native());
+        vm.set_current_class("Demo.Native");
+        vm.push_frame(4);
+
+        // 准备构造参数：float param[0] = 3.5
+        vm.float_stack.write(0, 3.5);
+        let set_fp = IntermediateCode::new(
+            IntermediateOperator::SetFloatParameter,
+            Operand::Address(Address::new(ValueType::Float, 0)),
+            None,
+            Some(Address::new(ValueType::Int, 0)),
+        );
+        vm.execute_one(&set_fp).unwrap();
+
+        // InvokeConstructor(0)，对象 ID 写入 object 地址 1
+        let obj_addr = Address::new(ValueType::Object, 1);
+        let construct = IntermediateCode::new(
+            IntermediateOperator::InvokeConstructor(0),
+            Operand::int(1),
+            None,
+            Some(obj_addr),
+        );
+        vm.execute_one(&construct).unwrap();
+        let obj_id = *vm.object_stack.read(1);
+        assert!(obj_id != 0, "构造应返回有效对象 ID");
+        assert!(vm.objects.contains_key(&obj_id), "对象应进入对象表");
+
+        // 调用实例方法 getValue()：InvokeInstance(0)，left = 目标对象 ID
+        let ret = Address::new(ValueType::Float, 2);
+        let invoke = IntermediateCode::new(
+            IntermediateOperator::InvokeInstance(0),
+            Operand::Address(obj_addr),
+            None,
+            Some(ret),
+        );
+        vm.execute_one(&invoke).unwrap();
+
+        // 字段初值 3.5 应被读回
+        assert_eq!(*vm.float_stack.read(2), 3.5);
+    }
+
+    #[test]
+    fn test_native_compiled_bidirectional_link() {
+        // 验收 A5：native 对象与编译对象的双向引用与 RealObject 解析
+        let mut vm = VirtualMachine::new();
+
+        // 手工放入两个对象：一个编译对象、一个 native 子对象
+        let compiled_id = 1usize;
+        let native_id = 2usize;
+        vm.objects.insert(
+            compiled_id,
+            RuntimeObject::new_simple("Compiled.Sub".into(), &TypeCount::zero()),
+        );
+        vm.objects.insert(
+            native_id,
+            RuntimeObject::new_simple("Demo.Native".into(), &TypeCount::zero()),
+        );
+
+        vm.link_native_and_compiled(compiled_id, native_id);
+
+        // 双向引用建立
+        assert_eq!(vm.objects.get(&compiled_id).unwrap().native_object_id, Some(native_id));
+        assert_eq!(vm.objects.get(&native_id).unwrap().outer_compiled_id, Some(compiled_id));
+
+        // native 子对象的真实对象应解析为外层编译对象
+        assert_eq!(vm.resolve_real_object_id(native_id), compiled_id);
+        // 普通对象的真实对象是自身
+        assert_eq!(vm.resolve_real_object_id(compiled_id), compiled_id);
     }
 }

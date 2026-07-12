@@ -230,6 +230,11 @@ pub enum IntermediateOperator {
     FloatCastToString,
     BoolCastToString,
 
+    /// 对象引用类型转换（向上/向下转型）
+    ///
+    /// 对象以 ID 传递，运行期不做类型检查，仅在类型系统层面转换（对齐 C# `ObjectCastToObject`）。
+    ObjectCastToObject,
+
     // === 控制流 ===
     Jump(usize),       // 无条件跳转（目标代码索引）
     JumpIfFalse(usize), // 条件为假跳转
@@ -244,6 +249,14 @@ pub enum IntermediateOperator {
 
     // === 对象创建 ===
     DoConstruct(usize), // 类 ID
+
+    /// 在当前 this 对象上执行父类构造方法（super 调用），不创建新对象
+    /// 参数为父类构造方法 ID，目标父类名经 right 操作数传递
+    InvokeSuperConstructor(usize),
+
+    /// 加载模块常量池中的注入器对象（G2），索引为类内常量池下标
+    /// left = 常量索引（int），result = 注入器对象 ID
+    LoadInjectorConstant(usize),
 
     // === 构造委托 ===
     ConstructDelegate(usize), // 委托实现索引

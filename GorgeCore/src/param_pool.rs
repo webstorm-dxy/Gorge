@@ -37,6 +37,12 @@ pub struct InvokeParameterPool {
     pub bool_return: RefCell<bool>,
     pub string_return: RefCell<String>,
     pub object_return: RefCell<usize>,
+
+    /// 构造方法传递注入器的专用位
+    ///
+    /// 对应 C# `InvokeParameterPool.Injector`。注入器作为构造依据单独传递，
+    /// 而不占用 object 参数位。存储注入器对象 ID（0 表示无注入器）。
+    pub injector: RefCell<usize>,
 }
 
 impl InvokeParameterPool {
@@ -52,6 +58,7 @@ impl InvokeParameterPool {
             bool_return: RefCell::new(false),
             string_return: RefCell::new(String::new()),
             object_return: RefCell::new(0),
+            injector: RefCell::new(0),
         }
     }
 
@@ -175,6 +182,16 @@ impl InvokeParameterPool {
         *self.object_return.borrow_mut() = value;
     }
 
+    /// 获取注入器专用位（注入器对象 ID，0 表示无）
+    pub fn get_injector(&self) -> usize {
+        *self.injector.borrow()
+    }
+
+    /// 设置注入器专用位（注入器对象 ID）
+    pub fn set_injector(&self, value: usize) {
+        *self.injector.borrow_mut() = value;
+    }
+
     /// 重置所有参数
     pub fn reset(&self) {
         for p in self.int_params.borrow_mut().iter_mut() {
@@ -192,6 +209,7 @@ impl InvokeParameterPool {
         for p in self.object_params.borrow_mut().iter_mut() {
             *p = PoolEntry::default();
         }
+        *self.injector.borrow_mut() = 0;
     }
 }
 

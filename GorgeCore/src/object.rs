@@ -30,6 +30,14 @@ pub trait GorgeObject: Debug {
 ///
 /// 字段按 Native/Compiled 分界存储。index < native_bounds 时读 native_object，
 /// 否则从 compiled_fields 读取。
+///
+/// # Native 与编译对象的双向引用
+/// 当编译类继承某 native 类时，两侧各自是对象表中的一个 RuntimeObject：
+/// - 编译对象通过 `native_object_id` 指向其 native 子对象（对应 C# `CompiledGorgeObject.NativeObject`）；
+/// - native 子对象通过 `outer_compiled_id` 指回外层编译对象（对应 C# native 对象的 `OuterCompiledObject`）。
+///
+/// `real_object_id` 用于类型转换时保留“真实对象”引用：通常为自身，
+/// 但对被编译类包裹的 native 对象，指向外层编译对象（对应 C# `RealObject`）。
 #[derive(Debug)]
 pub struct RuntimeObject {
     pub class_name: String,
@@ -37,6 +45,10 @@ pub struct RuntimeObject {
     pub native_object: Option<Box<dyn GorgeObject>>,
     pub compiled_fields: FixedFieldValuePool,
     pub native_field_bounds: TypeCount,
+    /// 指向本编译对象的 native 子对象 ID（编译类继承 native 类时使用）
+    pub native_object_id: Option<usize>,
+    /// 指回外层编译对象 ID（native 对象被编译类包裹时使用）
+    pub outer_compiled_id: Option<usize>,
 }
 
 impl RuntimeObject {
@@ -49,6 +61,8 @@ impl RuntimeObject {
             native_object: None,
             compiled_fields: FixedFieldValuePool::new(&field_type_count),
             native_field_bounds: TypeCount::zero(),
+            native_object_id: None,
+            outer_compiled_id: None,
         }
     }
 
@@ -60,6 +74,8 @@ impl RuntimeObject {
             native_object: None,
             compiled_fields: FixedFieldValuePool::new(field_counts),
             native_field_bounds: TypeCount::zero(),
+            native_object_id: None,
+            outer_compiled_id: None,
         }
     }
 }

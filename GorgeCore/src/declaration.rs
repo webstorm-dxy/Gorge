@@ -26,6 +26,25 @@ pub struct ClassDeclaration {
     pub method_override_id: HashMap<usize, usize>,
 }
 
+impl ClassDeclaration {
+    /// 创建一个仅含名字的最小声明（用于注入器常量构造等场景）
+    pub fn dummy(name: String) -> Self {
+        Self {
+            class_type: crate::types::GorgeType::class(name, None),
+            is_native: false, annotations: vec![], fields: vec![], methods: vec![],
+            static_methods: vec![], constructors: vec![], injector_fields: vec![],
+            super_class: None, super_interfaces: vec![],
+            field_type_count: crate::types::TypeCount::zero(),
+            method_count: 0, static_method_count: 0, constructor_count: 0,
+            injector_field_type_count: crate::types::TypeCount::zero(),
+            injector_field_default_value_type_count: crate::types::TypeCount::zero(),
+            method_start_id: 0, constructor_start_id: 0,
+            interface_method_impl_id: HashMap::new(),
+            method_override_id: HashMap::new(),
+        }
+    }
+}
+
 /// 字段声明信息
 #[derive(Debug, Clone)]
 pub struct FieldInfo {

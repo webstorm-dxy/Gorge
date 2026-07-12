@@ -1,0 +1,12 @@
+[package]
+name = "gorge_runner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gorge_runner"
+path = "src/main.rs"
+
+[dependencies]
+gorge_core = { path = "../../GorgeCore" }
+gorge_framework = { path = "../GorgeFramework" }

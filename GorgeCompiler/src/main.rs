@@ -79,40 +79,47 @@ fn main() {
         std::process::exit(1);
     }
 
-    // 优化 + 收集编译方法
+    // 优化 + 收集编译方法（保留所属类 ID 与是否构造，供精确归属）
     let mut methods: Vec<gorge_core::ir::CompiledMethod> = Vec::new();
+    let mut method_meta: Vec<(Option<crate::symbol::ClassId>, bool)> = Vec::new();
     for compiled in &compiler.compiled_methods {
         let optimized = optimizer::IntermediateCodeOptimizer::optimize(&compiled.codes);
+        if std::env::var("GORGE_DUMP_IR").is_ok() {
+            eprintln!("=== {} ===", compiled.name);
+            for (i, c) in optimized.iter().enumerate() {
+                eprintln!("  {:3}: {:?} L={:?} R={:?} => {:?}", i, c.code.operator, c.code.left, c.code.right, c.code.result);
+            }
+        }
         methods.push(gorge_core::ir::CompiledMethod {
             name: compiled.name.clone(),
             codes: optimized,
             local_count: compiled.total_locals,
         });
+        method_meta.push((compiled.class_id, compiled.is_constructor));
     }
 
     // 从符号表构建类元数据
     let mut classes: Vec<CompiledClass> = Vec::new();
-    collect_classes(&compiler.symbol_table, compiler.symbol_table.global_scope, &mut classes, &methods);
+    collect_classes(&compiler.symbol_table, compiler.symbol_table.global_scope, &mut classes, &methods, &method_meta);
 
     // 将注入器字段附加到对应类
     if !compiler.injector_fields.is_empty() {
         let bytecode_fields: Vec<gorge_core::bytecode::InjectorFieldDef> = compiler
-            .injector_fields
-            .iter()
-            .map(|f| gorge_core::bytecode::InjectorFieldDef {
-                name: f.name.clone(),
-                value_type: f.value_type,
-                has_default: f.has_default,
-            })
-            .collect();
-        for class in &mut classes {
-            class.injector_fields = bytecode_fields.clone();
+            .injector_fields.iter().map(|f| gorge_core::bytecode::InjectorFieldDef {
+                name: f.name.clone(), value_type: f.value_type, has_default: f.has_default,
+            }).collect();
+        for class in &mut classes { class.injector_fields = bytecode_fields.clone(); }
+    }
+
+    // 附加注入器常量池（G2）
+    for class in &mut classes {
+        let key = &class.class_type.full_name();
+        if let Some(ics) = compiler.injector_constants.get(key) {
+            class.injector_constants = ics.clone();
         }
     }
 
-    for class in &mut classes {
-        class.delegate_impls = compiler.delegate_impls.clone();
-    }
+    for class in &mut classes { class.delegate_impls = compiler.delegate_impls.clone(); }
 
     if classes.is_empty() {
         // 如果没有类声明，创建一个默认类包装所有方法
@@ -126,6 +133,13 @@ fn main() {
             constructors: vec![],
             injector_fields: vec![],
             delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
         });
     }
 
@@ -153,6 +167,7 @@ fn collect_classes(
     scope_id: ScopeId,
     classes: &mut Vec<CompiledClass>,
     all_methods: &[gorge_core::ir::CompiledMethod],
+    method_meta: &[(Option<crate::symbol::ClassId>, bool)],
 ) {
     let scope = &st.scopes.get(scope_id.0);
 
@@ -160,28 +175,22 @@ fn collect_classes(
         match entry {
             SymbolEntry::Class(class_id) => {
                 let info = &st.classes.get(class_id.0);
+                // 按声明顺序收集本类的编译方法实现。
+                // all_methods 中属于本类的非构造方法按生成顺序（= 声明顺序）排列，
+                // 与 info.methods 的声明顺序一致，故按顺序一一对应（正确处理同名重载）。
                 let class_methods: Vec<gorge_core::ir::CompiledMethod> = all_methods
                     .iter()
-                    .filter(|m| {
-                        info.methods.iter().any(|mid| {
-                            let mi = st.methods.get(mid.0);
-                            mi.name == m.name
-                        })
-                    })
-                    .cloned()
+                    .zip(method_meta.iter())
+                    .filter(|(_m, (cid, is_ctor))| !*is_ctor && *cid == Some(*class_id))
+                    .map(|(m, _)| m.clone())
                     .collect();
 
-                // 匹配构造方法
+                // 匹配构造方法（按 class_id 精确归属）
                 let class_ctors: Vec<gorge_core::ir::CompiledMethod> = all_methods
                     .iter()
-                    .filter(|m| m.name == "constructor")
-                    .filter(|_m| {
-                        info.constructors.iter().any(|cid| {
-                            let ci = st.constructors.get(cid.0);
-                            *class_id == ci.class_id
-                        })
-                    })
-                    .cloned()
+                    .zip(method_meta.iter())
+                    .filter(|(_m, (cid, is_ctor))| *is_ctor && *cid == Some(*class_id))
+                    .map(|(m, _)| m.clone())
                     .collect();
 
                 let mut field_counts = TypeCount::zero();
@@ -210,20 +219,37 @@ fn collect_classes(
                     constructors: class_ctors,
                     injector_fields: vec![],
                     delegate_impls: vec![],
+                    // 继承编号冻结（B-3）
+                    method_start_id: info.method_start_id,
+                    method_count_total: info.method_count_total,
+                    constructor_start_id: info.constructor_start_id,
+                    method_override_id: info.method_override_id.iter().map(|(k, v)| (*k, *v)).collect(),
+                    field_start_counts: [
+                        info.field_start_type_count.int,
+                        info.field_start_type_count.float,
+                        info.field_start_type_count.bool,
+                        info.field_start_type_count.string,
+                        info.field_start_type_count.object,
+                    ],
+                    interface_method_impl_id: info.interface_method_impl_id
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    injector_constants: vec![],
                 });
 
                 let class_scope = info.scope_id;
-                collect_classes(st, class_scope, classes, all_methods);
+                collect_classes(st, class_scope, classes, all_methods, method_meta);
             }
             SymbolEntry::Namespace(ns_id) => {
                 let ns_info = st.namespaces.get(ns_id.0);
-                collect_classes(st, ns_info.scope_id, classes, all_methods);
+                collect_classes(st, ns_info.scope_id, classes, all_methods, method_meta);
             }
             _ => {}
         }
     }
 
     for child_id in &scope.children {
-        collect_classes(st, *child_id, classes, all_methods);
+        collect_classes(st, *child_id, classes, all_methods, method_meta);
     }
 }

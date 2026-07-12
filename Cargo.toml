@@ -1,3 +1,9 @@
 [workspace]
-members = ["GorgeCompiler", "GorgeCore"]
+members = [
+    "GorgeCompiler",
+    "GorgeCore",
+    "GorgeFramework/GorgeMacros",
+    "GorgeFramework/GorgeFramework",
+    "GorgeFramework/GorgeRunner",
+]
 resolver = "2"

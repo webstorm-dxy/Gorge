@@ -117,6 +117,34 @@ pub struct ClassInfo {
     pub annotations: Vec<AnnotationId>,
     /// 来源 span
     pub span: Span,
+    /// 本类方法（静态+实例混合）的全局起始编号 = 父类的 method_count_total
+    ///
+    /// 继承编号冻结（B-3）后填充。本类第 i 个方法的全局 ID = method_start_id + i。
+    pub method_start_id: usize,
+    /// 含继承的方法总数 = method_start_id + 本类方法数
+    pub method_count_total: usize,
+    /// 本类构造方法的全局起始编号 = 父类的 constructor_count_total
+    pub constructor_start_id: usize,
+    /// 含继承的构造方法总数
+    pub constructor_count_total: usize,
+    /// 重写映射：被重写的父类方法全局 ID → 本类重写方法全局 ID
+    pub method_override_id: std::collections::HashMap<usize, usize>,
+    /// 本类实例字段各值类型的起始索引（= 父类的 field_type_count_total）
+    pub field_start_type_count: crate::symbol::FrozenTypeCount,
+    /// 含继承的实例字段各值类型总数
+    pub field_type_count_total: crate::symbol::FrozenTypeCount,
+    /// 接口方法实现映射：接口全名 → [接口方法本地ID → 类实现方法全局ID]（F1）
+    pub interface_method_impl_id: std::collections::HashMap<String, Vec<usize>>,
+}
+
+/// 按值类型分组的计数（编译器内部用，避免依赖 gorge_core）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrozenTypeCount {
+    pub int: usize,
+    pub float: usize,
+    pub bool: usize,
+    pub string: usize,
+    pub object: usize,
 }
 
 /// 接口信息
@@ -607,6 +635,14 @@ impl SymbolTable {
             injector: None,
             annotations: Vec::new(),
             span,
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            constructor_count_total: 0,
+            method_override_id: std::collections::HashMap::new(),
+            field_start_type_count: FrozenTypeCount::default(),
+            field_type_count_total: FrozenTypeCount::default(),
+            interface_method_impl_id: std::collections::HashMap::new(),
         }));
 
         // 回填 class_id 到 Scope 中

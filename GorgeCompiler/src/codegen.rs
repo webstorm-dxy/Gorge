@@ -5,10 +5,34 @@ use std::collections::HashSet;
 
 use gorge_core::diagnostics::{Diagnostics, Span};
 use gorge_core::ir::*;
-use gorge_core::bytecode::DelegateImpl;
+use gorge_core::bytecode::{DelegateImpl, InjectorConstField, InjectorConstantDef};
 
 use crate::ast::*;
 use crate::symbol::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind { For, While, DoWhile, Switch, If, Else }
+
+struct PendingLeave { code_index: usize, targets: std::collections::VecDeque<BreakTarget>, is_break: bool, done: bool }
+
+struct BlockCtx { kind: BlockKind, is_else: bool }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchLevel { Exact, Castable, None }
+
+#[derive(Debug, Default)]
+struct ParamIndexCounters { int: usize, float: usize, bool: usize, string: usize, object: usize }
+impl ParamIndexCounters {
+    fn reset(&mut self) { *self = Self::default(); }
+    fn next(&mut self, vt: ValueType) -> usize {
+        let c = match vt {
+            ValueType::Int => &mut self.int, ValueType::Float => &mut self.float,
+            ValueType::Bool => &mut self.bool, ValueType::String => &mut self.string,
+            ValueType::Object => &mut self.object,
+        };
+        let cur = *c; *c += 1; cur
+    }
+}
 
 /// 代码生成器
 ///
@@ -32,10 +56,16 @@ pub struct CodeGenerator<'a> {
     next_local: HashMap<ValueType, usize>,
     /// 委托变量名 → delegate_impl 索引
     delegate_vars: HashMap<String, usize>,
-    /// 类字段名 → (偏移, 值类型) 映射
+    var_class: HashMap<String, String>,
+    var_types: HashMap<String, TypeInfo>,
     field_info: HashMap<String, (usize, ValueType)>,
-    /// 参数索引计数器（每次方法调用前重置）
-    param_index: usize,
+    field_types: HashMap<String, TypeInfo>,
+    injector_field_info: HashMap<String, (usize, ValueType)>,
+    param_counters: ParamIndexCounters,
+    pub current_class_name: Option<String>,
+    block_stack: Vec<BlockCtx>,
+    pending_leaves: Vec<PendingLeave>,
+    pub injector_constants: Vec<InjectorConstantDef>,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -61,8 +91,16 @@ impl<'a> CodeGenerator<'a> {
             param_vars: HashMap::new(),
             next_local,
             delegate_vars: HashMap::new(),
+            var_class: HashMap::new(),
+            var_types: HashMap::new(),
             field_info: HashMap::new(),
-            param_index: 0,
+            field_types: HashMap::new(),
+            injector_field_info: HashMap::new(),
+            param_counters: ParamIndexCounters::default(),
+            current_class_name: None,
+            block_stack: Vec::new(),
+            pending_leaves: Vec::new(),
+            injector_constants: Vec::new(),
         }
     }
 
@@ -75,9 +113,58 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    /// 记录变量/参数的类名，用于实例方法解析
+    pub fn register_var_class(&mut self, name: &str, class_name: &str) {
+        self.var_class.insert(name.to_string(), class_name.to_string());
+    }
+
+    /// 记录变量/参数的完整类型信息
+    pub fn register_var_type(&mut self, name: &str, ty: TypeInfo) {
+        self.var_types.insert(name.to_string(), ty);
+    }
+
+    /// 布置一个调用参数：按值类型分组分配索引
+    fn emit_set_param(&mut self, arg_op: Operand, span: Span) {
+        let arg_vt = Self::operand_value_type(&arg_op);
+        let index = self.param_counters.next(arg_vt);
+        let param_addr = Address::new(ValueType::Int, index);
+        let op = match arg_vt {
+            ValueType::Int => IntermediateOperator::SetIntParameter,
+            ValueType::Float => IntermediateOperator::SetFloatParameter,
+            ValueType::Bool => IntermediateOperator::SetBoolParameter,
+            ValueType::String => IntermediateOperator::SetStringParameter,
+            ValueType::Object => IntermediateOperator::SetObjectParameter,
+        };
+        self.emit(IntermediateCode::new(op, arg_op, None, Some(param_addr)), span);
+    }
+
     /// 获取方法体中的所有 IR 指令
     pub fn into_codes(self) -> Vec<CodeWithSpan> {
         self.codes
+    }
+
+    pub fn emit_super_constructor_call(&mut self, super_class_name: &str, base_arguments: &[Expression], span: Span) {
+        self.param_counters.reset();
+        for arg in base_arguments {
+            let arg_op = self.generate_expression(arg);
+            self.emit_set_param(arg_op, span);
+        }
+        self.emit(IntermediateCode::new(
+            IntermediateOperator::InvokeSuperConstructor(0),
+            Operand::int(base_arguments.len() as i64),
+            Some(Operand::string(super_class_name.to_string())),
+            None,
+        ), span);
+    }
+
+    fn unresolved_leaves(&self) -> Vec<Span> {
+        self.pending_leaves.iter().filter(|l| !l.done).filter_map(|l| self.codes.get(l.code_index).map(|c| c.span)).collect()
+    }
+
+    pub fn report_unresolved_leaves(&mut self) {
+        for span in self.unresolved_leaves() {
+            self.diagnostics.emit_error(span, "break/continue 的离块目标非法。".to_string());
+        }
     }
 
     // ==================== 临时变量 / 局部变量管理 ====================
@@ -268,8 +355,8 @@ impl<'a> CodeGenerator<'a> {
                 }
                 self.generate_delegate_call(method, arguments, *span)
             }
-            Expression::New { class_type, arguments, span } => {
-                self.generate_new(class_type, arguments, *span)
+            Expression::New { class_type, arguments, injector, span } => {
+                self.generate_new(class_type, arguments, injector.as_deref(), *span)
             }
             Expression::Conditional { condition, then_branch, else_branch, span } => {
                 self.generate_conditional(condition, then_branch, else_branch.as_deref(), *span)
@@ -281,21 +368,24 @@ impl<'a> CodeGenerator<'a> {
             Expression::Null(_span) => {
                 Operand::Address(Address::new(ValueType::Object, 0))
             }
-            Expression::InjectorObject { fields, span } => {
-                // 注入器对象：为每个字段生成值表达式
-                for (_key, value) in fields {
-                    let _val = self.generate_expression(value);
-                }
+            Expression::InjectorObject { class_name, fields, span } => {
+                // 注入器对象：为每个字段生成值表达式，存入常量池（G2）
+                let const_fields: Vec<InjectorConstField> = fields
+                    .iter()
+                    .filter_map(|(name, val_expr)| {
+                        match val_expr {
+                            Expression::Literal(Literal::Float(v), _) => Some(InjectorConstField::Float(name.clone(), *v)),
+                            Expression::Literal(Literal::Int(v), _) => Some(InjectorConstField::Int(name.clone(), *v)),
+                            Expression::Literal(Literal::Bool(v), _) => Some(InjectorConstField::Bool(name.clone(), *v)),
+                            Expression::Literal(Literal::String(v), _) => Some(InjectorConstField::String(name.clone(), v.clone())),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                let idx = self.injector_constants.len();
+                self.injector_constants.push(InjectorConstantDef { class_name: class_name.clone(), fields: const_fields });
                 let temp = self.alloc_temp(ValueType::Object);
-                self.emit(
-                    IntermediateCode::new(
-                        IntermediateOperator::DoConstruct(0),
-                        Operand::Address(Address::new(ValueType::Object, 0)),
-                        None,
-                        Some(temp),
-                    ),
-                    *span,
-                );
+                self.emit(IntermediateCode::new(IntermediateOperator::LoadInjectorConstant(idx), Operand::int(0), None, Some(temp)), *span);
                 Operand::Address(temp)
             }
             Expression::InjectorArray { elements, span } => {
@@ -614,35 +704,11 @@ impl<'a> CodeGenerator<'a> {
                 for (i, &method_id) in class_info.methods.iter().enumerate() {
                     let mi = self.symbol_table.methods.get(method_id.0);
                     if mi.name == method && mi.is_static {
-                        // 设置调用参数（分配参数索引）
-                        self.param_index = 0;
+                        // 设置调用参数（按值类型分组分配索引）
+                        self.param_counters.reset();
                         for arg in arguments {
                             let arg_op = self.generate_expression(arg);
-                            let arg_vt = Self::operand_value_type(&arg_op);
-                            let param_addr = Address::new(ValueType::Int, self.param_index);
-                            self.param_index += 1;
-                            match arg_vt {
-                                ValueType::Int => {
-                                    self.emit(IntermediateCode::new(
-                                        IntermediateOperator::SetIntParameter, arg_op, None, Some(param_addr)), span);
-                                }
-                                ValueType::Float => {
-                                    self.emit(IntermediateCode::new(
-                                        IntermediateOperator::SetFloatParameter, arg_op, None, Some(param_addr)), span);
-                                }
-                                ValueType::Bool => {
-                                    self.emit(IntermediateCode::new(
-                                        IntermediateOperator::SetBoolParameter, arg_op, None, Some(param_addr)), span);
-                                }
-                                ValueType::String => {
-                                    self.emit(IntermediateCode::new(
-                                        IntermediateOperator::SetStringParameter, arg_op, None, Some(param_addr)), span);
-                                }
-                                ValueType::Object => {
-                                    self.emit(IntermediateCode::new(
-                                        IntermediateOperator::SetObjectParameter, arg_op, None, Some(param_addr)), span);
-                                }
-                            }
+                            self.emit_set_param(arg_op, span);
                         }
                         // 生成 InvokeStatic（left 操作数存参数计数）
                         let idx = i;
@@ -651,7 +717,7 @@ impl<'a> CodeGenerator<'a> {
                             IntermediateCode::new(
                                 IntermediateOperator::InvokeStatic(idx),
                                 Operand::int(arguments.len() as i64),
-                                None,
+                                Some(Operand::string(class_name.clone())),
                                 Some(result),
                             ),
                             span,
@@ -678,20 +744,10 @@ impl<'a> CodeGenerator<'a> {
                     for (i, &method_id) in class_info.methods.iter().enumerate() {
                         let mi = self.symbol_table.methods.get(method_id.0);
                         if mi.name == method && !mi.is_static {
-                            self.param_index = 0;
+                            self.param_counters.reset();
                             for arg in arguments {
                                 let arg_op = self.generate_expression(arg);
-                                let arg_vt = Self::operand_value_type(&arg_op);
-                                let param_addr = Address::new(ValueType::Int, self.param_index);
-                                self.param_index += 1;
-                                let set_param = match arg_vt {
-                                    ValueType::Int => IntermediateOperator::SetIntParameter,
-                                    ValueType::Float => IntermediateOperator::SetFloatParameter,
-                                    ValueType::Bool => IntermediateOperator::SetBoolParameter,
-                                    ValueType::String => IntermediateOperator::SetStringParameter,
-                                    ValueType::Object => IntermediateOperator::SetObjectParameter,
-                                };
-                                self.emit(IntermediateCode::new(set_param, arg_op, None, Some(param_addr)), span);
+                                self.emit_set_param(arg_op, span);
                             }
                             let result = self.alloc_temp(Self::type_to_value_type(&mi.return_type));
                             self.emit(
@@ -709,20 +765,10 @@ impl<'a> CodeGenerator<'a> {
                 }
             }
             // 无法静态解析（如变量调用），发出 InvokeInstance(0) 让 VM 运行时分派
-            self.param_index = 0;
+            self.param_counters.reset();
             for arg in arguments {
                 let arg_op = self.generate_expression(arg);
-                let arg_vt = Self::operand_value_type(&arg_op);
-                let param_addr = Address::new(ValueType::Int, self.param_index);
-                self.param_index += 1;
-                let set_param = match arg_vt {
-                    ValueType::Int => IntermediateOperator::SetIntParameter,
-                    ValueType::Float => IntermediateOperator::SetFloatParameter,
-                    ValueType::Bool => IntermediateOperator::SetBoolParameter,
-                    ValueType::String => IntermediateOperator::SetStringParameter,
-                    ValueType::Object => IntermediateOperator::SetObjectParameter,
-                };
-                self.emit(IntermediateCode::new(set_param, arg_op, None, Some(param_addr)), span);
+                self.emit_set_param(arg_op, span);
             }
             // 生成 receiver 的代码并将地址作为 InvokeInstance 的 left（目标对象引用）
             let recv_addr_op = self.generate_expression(receiver);
@@ -785,34 +831,10 @@ impl<'a> CodeGenerator<'a> {
 
         let delegate_idx = self.delegate_vars.get(var_name).copied();
 
-        self.param_index = 0;
-        for (_i, arg) in arguments.iter().enumerate() {
+        self.param_counters.reset();
+        for arg in arguments.iter() {
             let arg_op = self.generate_expression(arg);
-            let arg_vt = Self::operand_value_type(&arg_op);
-            let param_addr = Address::new(ValueType::Int, self.param_index);
-            self.param_index += 1;
-            match arg_vt {
-                ValueType::Int => {
-                    self.emit(IntermediateCode::new(
-                        IntermediateOperator::SetIntParameter, arg_op, None, Some(param_addr)), span);
-                }
-                ValueType::Float => {
-                    self.emit(IntermediateCode::new(
-                        IntermediateOperator::SetFloatParameter, arg_op, None, Some(param_addr)), span);
-                }
-                ValueType::Bool => {
-                    self.emit(IntermediateCode::new(
-                        IntermediateOperator::SetBoolParameter, arg_op, None, Some(param_addr)), span);
-                }
-                ValueType::String => {
-                    self.emit(IntermediateCode::new(
-                        IntermediateOperator::SetStringParameter, arg_op, None, Some(param_addr)), span);
-                }
-                ValueType::Object => {
-                    self.emit(IntermediateCode::new(
-                        IntermediateOperator::SetObjectParameter, arg_op, None, Some(param_addr)), span);
-                }
-            }
+            self.emit_set_param(arg_op, span);
         }
 
         let result = self.alloc_temp(ValueType::Int);
@@ -830,36 +852,49 @@ impl<'a> CodeGenerator<'a> {
     /// 生成 new 表达式代码
     fn generate_new(
         &mut self,
-        _class_type: &TypeRef,
+        class_type: &TypeRef,
         arguments: &[Expression],
+        injector: Option<&[(String, Expression)]>,
         span: Span,
     ) -> Operand {
+        // 若有注入器字段，先创建注入器常量并用 SetInjector 激活（G3）
+        if let Some(fields) = injector {
+            let class_name = match class_type {
+                TypeRef::Simple { name, .. } => name.clone(),
+                _ => String::new(),
+            };
+            let const_fields: Vec<InjectorConstField> = fields
+                .iter()
+                .filter_map(|(name, val_expr)| match val_expr {
+                    Expression::Literal(Literal::Float(v), _) => Some(InjectorConstField::Float(name.clone(), *v)),
+                    Expression::Literal(Literal::Int(v), _) => Some(InjectorConstField::Int(name.clone(), *v)),
+                    Expression::Literal(Literal::Bool(v), _) => Some(InjectorConstField::Bool(name.clone(), *v)),
+                    Expression::Literal(Literal::String(v), _) => Some(InjectorConstField::String(name.clone(), v.clone())),
+                    _ => None,
+                })
+                .collect();
+            let idx = self.injector_constants.len();
+            self.injector_constants.push(InjectorConstantDef { class_name: class_name.clone(), fields: const_fields });
+            // 创建注入器对象
+            let inj_temp = self.alloc_temp(ValueType::Object);
+            self.emit(IntermediateCode::new(IntermediateOperator::LoadInjectorConstant(idx), Operand::int(0), None, Some(inj_temp)), span);
+            // SetInjector 使当前构造过程使用此注入器
+            self.emit(IntermediateCode::new(IntermediateOperator::SetInjector, Operand::Address(inj_temp), None, None), span);
+        }
         // 设置构造参数
-        self.param_index = 0;
+        self.param_counters.reset();
         for arg in arguments {
             let arg_op = self.generate_expression(arg);
-            let arg_vt = Self::operand_value_type(&arg_op);
-            let param_addr = Address::new(ValueType::Int, self.param_index);
-            self.param_index += 1;
-            let set_param = match arg_vt {
-                ValueType::Int => IntermediateOperator::SetIntParameter,
-                ValueType::Float => IntermediateOperator::SetFloatParameter,
-                ValueType::Bool => IntermediateOperator::SetBoolParameter,
-                ValueType::String => IntermediateOperator::SetStringParameter,
-                ValueType::Object => IntermediateOperator::SetObjectParameter,
-            };
-            self.emit(
-                IntermediateCode::new(set_param, arg_op, None, Some(param_addr)),
-                span,
-            );
+            self.emit_set_param(arg_op, span);
         }
         // 调用构造方法
+        let target = match class_type { TypeRef::Simple { name, .. } => Some(name.clone()), _ => None };
         let temp = self.alloc_temp(ValueType::Object);
         self.emit(
             IntermediateCode::new(
                 IntermediateOperator::InvokeConstructor(0),
                 Operand::int(arguments.len() as i64),
-                None,
+                target.map(Operand::string),
                 Some(temp),
             ),
             span,

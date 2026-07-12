@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::class::{GorgeClass, RuntimeClass};
 use crate::declaration::{EnumDef};
 use crate::interface::GorgeInterface;
+use crate::native::NativeClass;
 use crate::types::{GorgeType, BasicType};
 use crate::vm::VirtualMachine;
 
@@ -11,6 +12,8 @@ use crate::vm::VirtualMachine;
 /// 对应 C# 的 GorgeLanguageRuntime，是所有编译产物的注册中心和类型转换判定的最终权威。
 pub struct GorgeRuntime {
     pub classes: HashMap<String, Arc<RuntimeClass>>,
+    /// Native 类注册表：类全名 → NativeClass 实现
+    pub native_classes: HashMap<String, Arc<dyn NativeClass>>,
     pub interfaces: HashMap<String, Arc<GorgeInterface>>,
     pub enums: HashMap<String, Arc<EnumDef>>,
     pub vm: VirtualMachine,
@@ -20,6 +23,7 @@ impl GorgeRuntime {
     pub fn new() -> Self {
         Self {
             classes: HashMap::new(),
+            native_classes: HashMap::new(),
             interfaces: HashMap::new(),
             enums: HashMap::new(),
             vm: VirtualMachine::new(),
@@ -37,6 +41,27 @@ impl GorgeRuntime {
     /// 按全名获取类
     pub fn get_class(&self, full_name: &str) -> Option<&Arc<RuntimeClass>> {
         self.classes.get(full_name)
+    }
+
+    /// 注册一个 native 类
+    ///
+    /// native 类与编译类共享同一命名空间的全名查找。注册后可被 VM 分派
+    /// 静态方法、实例方法与构造方法。
+    pub fn register_native_class(&mut self, class: Arc<dyn NativeClass>) {
+        let key = class.full_name().to_string();
+        self.native_classes.insert(key.clone(), class.clone());
+        // 同步注册到 VM，供运行期分派
+        self.vm.register_native_class(&key, class);
+    }
+
+    /// 按全名获取 native 类
+    pub fn get_native_class(&self, full_name: &str) -> Option<&Arc<dyn NativeClass>> {
+        self.native_classes.get(full_name)
+    }
+
+    /// 判断某全名是否为已注册的 native 类
+    pub fn is_native_class(&self, full_name: &str) -> bool {
+        self.native_classes.contains_key(full_name)
     }
 
     /// 注册接口
@@ -63,17 +88,56 @@ impl GorgeRuntime {
         if from.basic_type == BasicType::Int && to.basic_type == BasicType::Float {
             return true;
         }
-        // Null → 任意 Object / Interface / Delegate
-        if from.is_null() && matches!(to.basic_type, BasicType::Object | BasicType::Interface | BasicType::Delegate) {
+        // Enum → Int
+        if from.basic_type == BasicType::Enum && to.basic_type == BasicType::Int {
+            return true;
+        }
+        // Null → 任意 Object / Interface / Delegate / String
+        if from.is_null()
+            && matches!(
+                to.basic_type,
+                BasicType::Object | BasicType::Interface | BasicType::Delegate | BasicType::String
+            )
+        {
             return true;
         }
         // object 到 object 的基础规则（通过类层次检查）
         if from.basic_type == BasicType::Object && to.basic_type == BasicType::Object {
+            // 数组协变：元素类型可自动转换（sub_types[0] 为元素类型）
+            if !from.sub_types.is_empty() && !to.sub_types.is_empty() {
+                if self.can_auto_cast_to(&from.sub_types[0], &to.sub_types[0]) {
+                    return true;
+                }
+            }
             return self.is_subclass_of(from, to);
         }
         // 类到接口
         if from.basic_type == BasicType::Object && to.basic_type == BasicType::Interface {
             return self.class_implements_interface(from, to);
+        }
+        // 接口 → Object
+        if from.basic_type == BasicType::Interface && to.basic_type == BasicType::Object {
+            return true;
+        }
+        // Delegate 协变（返回）/逆变（参数）：sub_types[0]=返回类型，其余为参数类型
+        if from.basic_type == BasicType::Delegate && to.basic_type == BasicType::Delegate {
+            if from.sub_types.is_empty() || to.sub_types.is_empty() {
+                return false;
+            }
+            if from.sub_types.len() != to.sub_types.len() {
+                return false;
+            }
+            // 返回协变
+            if !self.can_auto_cast_to(&from.sub_types[0], &to.sub_types[0]) {
+                return false;
+            }
+            // 参数逆变
+            for i in 1..from.sub_types.len() {
+                if !self.can_auto_cast_to(&to.sub_types[i], &from.sub_types[i]) {
+                    return false;
+                }
+            }
+            return true;
         }
         false
     }
@@ -198,5 +262,40 @@ mod tests {
         let from = GorgeType::class("Derived", None);
         let to = GorgeType::class("Base", None);
         assert!(runtime.can_auto_cast_to(&from, &to));
+    }
+
+    #[test]
+    fn test_cast_rules_e2() {
+        let runtime = GorgeRuntime::new();
+        // Int → Float
+        assert!(runtime.can_auto_cast_to(&GorgeType::new(BasicType::Int), &GorgeType::new(BasicType::Float)));
+        // Enum → Int
+        assert!(runtime.can_auto_cast_to(&GorgeType::new(BasicType::Enum), &GorgeType::new(BasicType::Int)));
+        // null → String
+        assert!(runtime.can_auto_cast_to(&GorgeType::null(), &GorgeType::new(BasicType::String)));
+        // 接口 → Object
+        assert!(runtime.can_auto_cast_to(&GorgeType::new(BasicType::Interface), &GorgeType::new(BasicType::Object)));
+        // Float → Int 不自动转换，但可强制转换
+        assert!(!runtime.can_auto_cast_to(&GorgeType::new(BasicType::Float), &GorgeType::new(BasicType::Int)));
+        assert!(runtime.can_cast_to(&GorgeType::new(BasicType::Float), &GorgeType::new(BasicType::Int)));
+    }
+
+    #[test]
+    fn test_delegate_variance_e2() {
+        let runtime = GorgeRuntime::new();
+        // delegate<Float(Int)> vs delegate<Float(Int)> 相同 → 可转
+        let mk = |ret: BasicType, param: BasicType| {
+            let mut d = GorgeType::new(BasicType::Delegate);
+            d.sub_types = vec![GorgeType::new(ret), GorgeType::new(param)];
+            d
+        };
+        // 返回协变：源返回 Int 可转目标返回 Float
+        let from = mk(BasicType::Int, BasicType::Float);
+        let to = mk(BasicType::Float, BasicType::Float);
+        assert!(runtime.can_auto_cast_to(&from, &to), "返回协变应成立");
+        // 参数逆变：目标参数 Int 可转源参数 Float（源参数更宽）
+        let from2 = mk(BasicType::Float, BasicType::Float);
+        let to2 = mk(BasicType::Float, BasicType::Int);
+        assert!(runtime.can_auto_cast_to(&from2, &to2), "参数逆变应成立");
     }
 }

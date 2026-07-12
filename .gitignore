@@ -1,5 +1,6 @@
 # Rust
 /target/
+/GorgeFramework/target/
 
 # 知识库
 /references/

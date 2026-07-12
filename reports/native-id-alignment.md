@@ -252,17 +252,19 @@ for arg in arguments {
 5. **N1**：命名空间写入 `class_type`，全名一致。
 6. **P1**：桥接读参数用类型分组下标；端到端测试先用单一类型参数方法。
 
-## 9. 编译器修正 Backlog（不阻塞本轮，但需记录）
+## 9. 编译器修正 Backlog（状态更新）
 
-- **B-1**：`pass3_declare_field` 字段 offset 改为按值类型分组计数（对齐
-  `FixedFieldValuePool` 类型分离存储）。影响混合类型字段的类。
-- **B-2**：`generate_method_call` 参数 index 改为按值类型分组计数（对齐类型分离
-  `param_pool`）。影响混合类型参数的方法。
-- **B-3**：实现继承编号冻结（`method_start_id` / `method_override_id` /
-  `static_method_count` / `constructor_start_id`），支持 native 类被编译类继承。
-- **B-4**：编译器需支持**导入 native 类声明**（当前符号表无 native 类导入路径），
-  否则源码 `.g` 无法引用 `GorgeFramework.*`。这是 Phase C 端到端的前置，
-  将在 Phase A/C 之间评估处理方式（见下）。
+- **B-1** ✅ 已完成：`pass3_declare_field` 字段 offset 按值类型分组计数（对齐
+  `FixedFieldValuePool` 类型分离存储）。
+- **B-2** ✅ 已完成：codegen 参数 index 按值类型分组（`emit_set_param` + `ParamIndexCounters`），
+  宏侧 `grouped_param_indices` 同步；混合类型参数方法（如 `Vector2.lerp`）端到端验证。
+- **B-3** ✅ 已完成（编译类继承编译类）：`freeze_inheritance` 计算 `method_start_id` /
+  `method_count_total` / `constructor_start_id` / `method_override_id` / 字段索引继承冻结；
+  字节码序列化承载；runner 重建继承链；新增 `InvokeSuperConstructor` 操作码实现 super
+  构造链。方法继承/重写、字段继承、super 构造全链路端到端验证（override=42, getLegs=4,
+  getLoyalty=100）。native 类被编译类继承（依赖 A5 双向引用）仍留待后续。
+- **B-4** ✅ 已完成（Phase C）：跨类静态/构造/实例分派打通，`.g` 用手写 native 存根声明
+  引用框架类，gorge_runner 注册 native 实现执行。更规整的 native 声明自动导入可后续增强。
 
 ## 10. 关于 B-4（native 类导入）的说明
 
