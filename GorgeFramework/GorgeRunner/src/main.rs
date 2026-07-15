@@ -60,6 +60,7 @@ fn main() {
             method_start_id: cc.method_start_id, constructor_start_id: cc.constructor_start_id,
             interface_method_impl_id: cc.interface_method_impl_id.iter().map(|(k,v)| (k.clone(),v.clone())).collect(),
             method_override_id: cc.method_override_id.iter().cloned().collect(),
+            injector_constructor_impl_id: cc.injector_constructor_impl_id.clone(),
         };
         let mut rc = RuntimeClass::new(decl, sa);
         for (i, m) in cc.methods.iter().enumerate() { rc.register_method(i, m.clone()); }
@@ -85,5 +86,6 @@ fn main() {
     if let Some(v) = vm.get_return_int() { println!("{} -> 返回 (int): {}", entry_method.name, v); }
     if let Some(v) = vm.get_return_float() { println!("{} -> 返回 (float): {}", entry_method.name, v); }
     if let Some(v) = vm.get_return_bool() { println!("{} -> 返回 (bool): {}", entry_method.name, v); }
+    if let Some(v) = vm.get_return_string() { println!("{} -> 返回 (string): {}", entry_method.name, v); }
     vm.pop_frame();
 }

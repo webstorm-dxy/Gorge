@@ -13,7 +13,9 @@ native class Vector2
 
 class Program
 {
-	// 构造 Vector2 := { x: 3.0, y: 4.0 } → SetInjector → 构造方法体读 ^x
+	// 构造 Vector2(0,0):{x:3,y:4}：注入器构造先 FieldInitialize(注入器) 写 x=3,y=4，
+	// 随后构造体用显式参数 (0,0) 覆盖 → get_x()=0（对齐 C# 注入器构造：参数覆盖注入器）。
+	// 注入器覆写在「仅注入器、无覆盖参数」的构造路径才成为最终值。
 	static float TestInjectorX()
 	{
 		Vector2 v = new Vector2(0.0, 0.0) :{ x : 3.0, y : 4.0 };

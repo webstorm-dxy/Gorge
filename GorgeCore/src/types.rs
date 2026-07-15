@@ -64,6 +64,7 @@ impl GorgeType {
         }
     }
 
+    /// 返回完整的类型名称（含命名空间）
     pub fn full_name(&self) -> String {
         match self.basic_type {
             BasicType::Int => "int".into(),
@@ -81,6 +82,11 @@ impl GorgeType {
                 }
             }
         }
+    }
+
+    /// 返回不含命名空间的简单类名
+    pub fn name(&self) -> String {
+        self.class_name.as_deref().unwrap_or("?").to_string()
     }
 
     pub fn is_void(&self) -> bool {

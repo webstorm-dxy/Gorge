@@ -140,6 +140,8 @@ impl RuntimeInjector {
                 crate::bytecode::InjectorConstField::Bool(..) => bool_count += 1,
                 crate::bytecode::InjectorConstField::String(..) => str_count += 1,
                 crate::bytecode::InjectorConstField::Object(..) => obj_count += 1,
+                crate::bytecode::InjectorConstField::InjectObject(..) => obj_count += 1,
+                crate::bytecode::InjectorConstField::Array(..) => obj_count += 1,
             }
         }
         let mut result = Self {
@@ -173,9 +175,120 @@ impl RuntimeInjector {
                     result.object_fields[oi] = (*v, false);
                     oi += 1;
                 }
+                // 嵌套注入器和数组在常量中占 object 槽位，值由运行时填充
+                crate::bytecode::InjectorConstField::InjectObject(..) => {
+                    result.object_fields[oi] = (0, false);
+                    oi += 1;
+                }
+                crate::bytecode::InjectorConstField::Array(..) => {
+                    result.object_fields[oi] = (0, false);
+                    oi += 1;
+                }
             }
         }
         result
+    }
+
+    /// 注入器所属类的简单名（用于编辑期比较判定同类）。
+    pub fn class_name(&self) -> String {
+        self.class_decl.class_type.name()
+    }
+
+    /// object 类型字段的数量（供 VM 递归比较/哈希遍历）。
+    pub fn object_field_count(&self) -> usize {
+        self.object_fields.len()
+    }
+
+    /// int/float/bool/string 类型字段的数量（供 VM 递归哈希遍历）。
+    pub fn int_field_count(&self) -> usize { self.int_fields.len() }
+    pub fn float_field_count(&self) -> usize { self.float_fields.len() }
+    pub fn bool_field_count(&self) -> usize { self.bool_fields.len() }
+    pub fn string_field_count(&self) -> usize { self.string_fields.len() }
+
+    /// 编辑期比较：仅比较非 object 字段（int/float/bool/string）。
+    ///
+    /// 对齐 C# `Injector.EditableEquals` 中值类型字段的判定逻辑：
+    /// - 类名不同直接不相等；
+    /// - 每个字段先比较「是否使用默认值」标记，两者都为默认则视为相等（跳过值比较），
+    ///   否则比较实际值。
+    ///
+    /// **注意**：object 类型字段的比较需要对象图上下文（可能嵌套注入器/列表），
+    /// 由 VM 层的 `editable_equals_objects` 递归完成；本方法只负责值类型字段，
+    /// object 字段的完整比较请调用 VM 层入口。
+    pub fn editable_equals_values(&self, other: &RuntimeInjector) -> bool {
+        if self.class_name() != other.class_name() {
+            return false;
+        }
+        if self.int_fields.len() != other.int_fields.len()
+            || self.float_fields.len() != other.float_fields.len()
+            || self.bool_fields.len() != other.bool_fields.len()
+            || self.string_fields.len() != other.string_fields.len()
+            || self.object_fields.len() != other.object_fields.len()
+        {
+            return false;
+        }
+        for (a, b) in self.int_fields.iter().zip(other.int_fields.iter()) {
+            if a.1 != b.1 { return false; }
+            if !a.1 && a.0 != b.0 { return false; }
+        }
+        for (a, b) in self.float_fields.iter().zip(other.float_fields.iter()) {
+            if a.1 != b.1 { return false; }
+            if !a.1 && a.0 != b.0 { return false; }
+        }
+        for (a, b) in self.bool_fields.iter().zip(other.bool_fields.iter()) {
+            if a.1 != b.1 { return false; }
+            if !a.1 && a.0 != b.0 { return false; }
+        }
+        for (a, b) in self.string_fields.iter().zip(other.string_fields.iter()) {
+            if a.1 != b.1 { return false; }
+            if !a.1 && a.0 != b.0 { return false; }
+        }
+        true
+    }
+
+    /// 读取第 `index` 个 object 字段的 (对象ID, 是否默认值)。
+    pub fn object_field(&self, index: usize) -> (usize, bool) {
+        self.object_fields[index]
+    }
+
+    /// 将本注入器的所有字段值（含默认值标记）拷贝到目标注入器。
+    ///
+    /// 对齐 C# `CompiledInjector.Clone` 的字段复制语义：值类型逐个复制，
+    /// object 字段复制对象 ID（浅拷贝引用，与 C# 对 object 槽位的处理一致）。
+    /// 仅复制两者共有范围内的字段（按各类型取较小长度），避免越界。
+    pub fn clone_to(&self, target: &mut RuntimeInjector) {
+        let n = self.int_fields.len().min(target.int_fields.len());
+        target.int_fields[..n].clone_from_slice(&self.int_fields[..n]);
+        let n = self.float_fields.len().min(target.float_fields.len());
+        target.float_fields[..n].clone_from_slice(&self.float_fields[..n]);
+        let n = self.bool_fields.len().min(target.bool_fields.len());
+        target.bool_fields[..n].clone_from_slice(&self.bool_fields[..n]);
+        let n = self.string_fields.len().min(target.string_fields.len());
+        target.string_fields[..n].clone_from_slice(&self.string_fields[..n]);
+        let n = self.object_fields.len().min(target.object_fields.len());
+        target.object_fields[..n].clone_from_slice(&self.object_fields[..n]);
+    }
+
+    /// 将本注入器的值类型字段（int/float/bool/string）混入哈希器。
+    ///
+    /// 对齐 C# `Injector.EditableHashCode`：默认值字段混入固定标记 `true`，
+    /// 否则混入实际值。object 字段的哈希需要对象图上下文，由 VM 层
+    /// `editable_hash_code_object` 递归完成。
+    pub fn hash_values<H: std::hash::Hasher>(&self, state: &mut H) {
+        use std::hash::Hash;
+        self.class_name().hash(state);
+        for (v, is_def) in &self.int_fields {
+            if *is_def { true.hash(state); } else { v.hash(state); }
+        }
+        for (v, is_def) in &self.float_fields {
+            if *is_def { true.hash(state); } else { v.to_bits().hash(state); }
+        }
+        for (v, is_def) in &self.bool_fields {
+            if *is_def { true.hash(state); } else { v.hash(state); }
+        }
+        for (v, is_def) in &self.string_fields {
+            if *is_def { true.hash(state); } else { v.hash(state); }
+        }
     }
 }
 
@@ -283,6 +396,7 @@ mod tests {
             constructor_start_id: 0,
             interface_method_impl_id: HashMap::new(),
             method_override_id: HashMap::new(),
+            injector_constructor_impl_id: vec![],
         })
     }
 
@@ -304,5 +418,61 @@ mod tests {
         assert!(!injector.get_injector_int_default_value(0));
         injector.set_injector_int_default_value(0);
         assert!(injector.get_injector_int_default_value(0));
+    }
+
+    #[test]
+    fn test_editable_equals_values_same() {
+        // 两个全默认的同类注入器应相等
+        let a = RuntimeInjector::new(make_dummy_decl());
+        let b = RuntimeInjector::new(make_dummy_decl());
+        assert!(a.editable_equals_values(&b));
+    }
+
+    #[test]
+    fn test_editable_equals_values_default_marker_diff() {
+        // 一个字段被显式赋值（default-marker 不同）→ 不相等
+        let a = RuntimeInjector::new(make_dummy_decl());
+        let mut b = RuntimeInjector::new(make_dummy_decl());
+        b.set_injector_int(0, 5);
+        assert!(!a.editable_equals_values(&b));
+    }
+
+    #[test]
+    fn test_editable_equals_values_value_diff() {
+        // 两个都显式赋值但值不同 → 不相等
+        let mut a = RuntimeInjector::new(make_dummy_decl());
+        let mut b = RuntimeInjector::new(make_dummy_decl());
+        a.set_injector_int(0, 1);
+        b.set_injector_int(0, 2);
+        assert!(!a.editable_equals_values(&b));
+        // 值相同 → 相等
+        b.set_injector_int(0, 1);
+        assert!(a.editable_equals_values(&b));
+    }
+
+    #[test]
+    fn test_editable_hash_code_equal_injectors_same_hash() {
+        use std::hash::{DefaultHasher, Hasher};
+        let mut a = RuntimeInjector::new(make_dummy_decl());
+        let mut b = RuntimeInjector::new(make_dummy_decl());
+        a.set_injector_int(0, 7);
+        b.set_injector_int(0, 7);
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        a.hash_values(&mut ha);
+        b.hash_values(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn test_clone_to_copies_fields_and_markers() {
+        let mut src = RuntimeInjector::new(make_dummy_decl());
+        src.set_injector_int(0, 42); // 字段0 显式赋值
+        // 字段1 保持默认
+        let mut dst = RuntimeInjector::new(make_dummy_decl());
+        src.clone_to(&mut dst);
+        assert_eq!(dst.get_injector_int(0), 42);
+        assert!(!dst.get_injector_int_default_value(0)); // 复制了非默认标记
+        assert!(dst.get_injector_int_default_value(1));  // 字段1 仍为默认
     }
 }

@@ -61,11 +61,13 @@ impl QualifiedName {
 ///
 /// # 字段
 ///
-/// * `name` - 导入的目标限定名
+/// * `name` - 导入的目标限定名或别名表达式
+/// * `alias` - 如果为 `using Alias = expr;` 语法，则为别名（K3）
 /// * `span` - 该指令在源代码中的位置信息
 #[derive(Debug, Clone)]
 pub struct UsingDirective {
     pub name: QualifiedName,
+    pub alias: Option<String>,
     pub span: Span,
 }
 
@@ -104,6 +106,8 @@ pub struct ClassDeclaration {
     pub annotations: Vec<Annotation>,
     pub modifiers: Vec<Modifier>,
     pub name: String,
+    /// 泛型参数名列表 `class Foo<T, U>`（J1）
+    pub generic_params: Vec<String>,
     pub super_class: Option<TypeRef>,
     pub super_interfaces: Vec<TypeRef>,
     pub members: Vec<ClassMember>,

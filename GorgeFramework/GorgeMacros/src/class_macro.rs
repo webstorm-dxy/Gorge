@@ -66,6 +66,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // 生成注入器默认值查询方法
     let injector_defaults = build_injector_defaults(&fields);
 
+    // 生成注入器字段初始化方法（native 构造时应用注入器覆写，对齐 C# FieldInitialize）
+    let field_initialize = build_field_initialize(&struct_ident, &fields);
+
     let expanded = quote! {
         #[derive(Debug)]
         #clean_struct
@@ -92,6 +95,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#field_index_consts)*
             #(#inject_index_consts)*
             #injector_defaults
+            #field_initialize
         }
     };
 
@@ -326,4 +330,114 @@ fn build_injector_defaults(fields: &[FieldSpec]) -> TokenStream2 {
         }
     }
     quote! { #(#methods)* }
+}
+
+/// 生成注入器字段初始化方法 `gorge_field_initialize(ctx, this)`。
+///
+/// 对齐 C# 自动生成的 `FieldInitialize(injector)`：对每个既是对象字段
+/// (`#[gorge_field]`) 又是注入器字段 (`#[inject]`) 的同名字段，从当前注入器
+/// 读取该字段值（`ctx.injector_xxx(注入器索引)`）——若注入器未显式设置该字段
+/// （返回 `None`），则回退到注入器默认值 `gorge_injector_default_<name>()`（若声明了
+/// `#[inject(default=..)]`）或该 Rust 类型的 `Default`。最终写入对象字段。
+///
+/// native 构造方法体在设置显式参数前应先调用本方法，使 `:{...}` 注入器覆写生效。
+fn build_field_initialize(struct_ident: &syn::Ident, fields: &[FieldSpec]) -> TokenStream2 {
+    // 对象字段与注入器字段各自按值类型分组编号，需分别计数以取得正确索引
+    let mut field_counters = KindCounts::default();
+    let mut inject_counters = KindCounts::default();
+    let mut stmts = Vec::new();
+
+    for f in fields {
+        // 对象字段索引（仅当是对象字段时推进对应计数器）
+        let field_idx = if f.is_field {
+            Some(match f.kind {
+                ValueKind::Int => bump(&mut field_counters.int),
+                ValueKind::Float => bump(&mut field_counters.float),
+                ValueKind::Bool => bump(&mut field_counters.bool),
+                ValueKind::String => bump(&mut field_counters.string),
+                ValueKind::Object => bump(&mut field_counters.object),
+            })
+        } else {
+            None
+        };
+        // 注入器字段索引
+        let inject_idx = if f.is_inject {
+            Some(match f.kind {
+                ValueKind::Int => bump(&mut inject_counters.int),
+                ValueKind::Float => bump(&mut inject_counters.float),
+                ValueKind::Bool => bump(&mut inject_counters.bool),
+                ValueKind::String => bump(&mut inject_counters.string),
+                ValueKind::Object => bump(&mut inject_counters.object),
+            })
+        } else {
+            None
+        };
+
+        // 仅处理既是对象字段又是注入器字段的字段
+        let (fi, ii) = match (field_idx, inject_idx) {
+            (Some(fi), Some(ii)) => (fi, ii),
+            _ => continue,
+        };
+
+        // 默认值表达式：有 #[inject(default=..)] 用生成的默认值方法，否则用 Default::default()
+        let default_method = format_ident!("gorge_injector_default_{}", f.name);
+        let default_expr: TokenStream2 = if f.default_value.is_some() {
+            quote! { <#struct_ident>::#default_method() }
+        } else {
+            quote! { ::core::default::Default::default() }
+        };
+
+        // 按值类型选择注入器读取器与对象字段写入器；注入器值可能需类型转换以匹配字段 Rust 类型
+        let stmt = match f.kind {
+            ValueKind::Float => quote! {
+                {
+                    let __v = ctx.injector_float(#ii).map(|x| x as f32).unwrap_or_else(|| #default_expr);
+                    ctx.set_object_float_field(this, #fi, __v as f64);
+                }
+            },
+            ValueKind::Int => quote! {
+                {
+                    let __v = ctx.injector_int(#ii).map(|x| x as i32).unwrap_or_else(|| #default_expr);
+                    ctx.set_object_int_field(this, #fi, __v as i64);
+                }
+            },
+            ValueKind::Bool => quote! {
+                {
+                    let __v = ctx.injector_bool(#ii).unwrap_or_else(|| #default_expr);
+                    ctx.set_object_bool_field(this, #fi, __v);
+                }
+            },
+            ValueKind::String => quote! {
+                {
+                    let __v = ctx.injector_string(#ii).unwrap_or_else(|| #default_expr);
+                    ctx.set_object_string_field(this, #fi, __v);
+                }
+            },
+            ValueKind::Object => quote! {
+                {
+                    if let ::core::option::Option::Some(__v) = ctx.injector_object(#ii) {
+                        ctx.set_object_object_field(this, #fi, __v);
+                    }
+                }
+            },
+        };
+        stmts.push(stmt);
+    }
+
+    if stmts.is_empty() {
+        // 无注入器对象字段：仍生成空方法，使构造入口可无条件调用
+        return quote! {
+            /// 应用注入器字段覆写（本类无可覆写字段，空实现）。
+            #[allow(dead_code, unused_variables)]
+            pub fn gorge_field_initialize(ctx: &mut ::gorge_core::native::NativeContext, this: usize) {}
+        };
+    }
+
+    quote! {
+        /// 应用注入器字段覆写到对象字段（native 构造时调用，对齐 C# FieldInitialize）。
+        #[allow(dead_code)]
+        pub fn gorge_field_initialize(ctx: &mut ::gorge_core::native::NativeContext, this: usize) {
+            #(#stmts)*
+        }
+    }
 }

@@ -203,9 +203,26 @@ impl Parser {
             }
 
             // using 声明（可多次出现）
+            // K3: 支持 `using Alias = expr;` 别名语法
             if self.match_token(&Token::KwUsing) {
-                if let Ok(name) = self.parse_qualified_name() {
-                    usings.push(UsingDirective { name, span: Span::dummy() });
+                let first = self.match_identifier();
+                // 检测别名语法：using Alias = ...
+                if first.is_some() && self.match_token(&Token::Assign) {
+                    if let Ok(name) = self.parse_qualified_name() {
+                        usings.push(UsingDirective { name, alias: first, span: Span::dummy() });
+                    }
+                } else if let Some(first_part) = first {
+                    // 普通 using 语法：using QualifiedName
+                    let mut parts = vec![first_part];
+                    let span_start = self.current_span();
+                    while self.match_token(&Token::Dot) {
+                        if let Some(part) = self.match_identifier() {
+                            parts.push(part);
+                        } else {
+                            break;
+                        }
+                    }
+                    usings.push(UsingDirective { name: QualifiedName { parts, span: span_start }, alias: None, span: Span::dummy() });
                 }
                 let _ = self.expect_semicolon();
                 continue;
@@ -274,6 +291,7 @@ impl Parser {
             if let Ok(name) = self.parse_qualified_name() {
                 usings.push(UsingDirective {
                     name,
+                    alias: None,
                     span: Span::dummy(),
                 });
             }
@@ -473,6 +491,14 @@ impl Parser {
         name: String,
     ) -> Result<FieldDeclaration, ()> {
         let span = self.current_span();
+        // Gorge 语法中字段声明不允许修饰符（fieldDeclaration 无 modifier，
+        // 只有方法可带 static 等）。检测到修饰符即报编译错误，对齐 C# 语法。
+        if !modifiers.is_empty() {
+            self.diagnostics.emit_error(
+                span,
+                format!("字段 `{}` 不允许修饰符（Gorge 中只有方法可带 static/native 等修饰符）", name),
+            );
+        }
         let initializer = if self.match_token(&Token::Assign) {
             Some(self.parse_expression()?)
         } else {
@@ -652,6 +678,9 @@ impl Parser {
             ()
         })?;
 
+        // J1: 泛型参数 `class Foo<T, U>`
+        let generic_params = self.parse_generic_params()?;
+
         // 继承关系
         let super_class = if self.match_token(&Token::Colon) {
             Some(self.parse_type_ref()?)
@@ -694,12 +723,33 @@ impl Parser {
             annotations,
             modifiers,
             name,
+            generic_params,
             super_class,
             super_interfaces,
             injector,
             members,
             span,
         })
+    }
+
+    /// 解析泛型参数列表 `<T, U, ...>`（J1）
+    fn parse_generic_params(&mut self) -> Result<Vec<String>, ()> {
+        if !self.match_token(&Token::Less) {
+            return Ok(Vec::new());
+        }
+        let mut params = Vec::new();
+        loop {
+            let name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "泛型参数期望标识符");
+                ()
+            })?;
+            params.push(name);
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect_token(&Token::Greater)?;
+        Ok(params)
     }
 
     /// 解析接口声明（关键字已消费）
@@ -893,6 +943,13 @@ impl Parser {
             };
             if let Some(modifier) = m {
                 self.advance();
+                // K1c: 检测重复修饰符
+                if modifiers.contains(&modifier) {
+                    self.diagnostics.emit_error(
+                        self.current_span(),
+                        format!("重复的修饰符 `{:?}`", modifier),
+                    );
+                }
                 modifiers.push(modifier);
             } else {
                 break;
@@ -2310,6 +2367,21 @@ mod tests {
             }
             _ => panic!("期望类声明"),
         }
+    }
+
+    #[test]
+    fn test_static_field_modifier_rejected() {
+        // Gorge 语法不允许字段带修饰符（只有方法可 static），应报编译错误
+        let source = "class Config { static int count; }";
+        let result = parse_source(source);
+        assert!(result.is_err(), "static 字段应被拒绝");
+    }
+
+    #[test]
+    fn test_plain_field_no_modifier_ok() {
+        // 普通字段（无修饰符）应正常解析
+        let source = "class Config { int count; }";
+        assert!(parse_source(source).is_ok());
     }
 
     #[test]

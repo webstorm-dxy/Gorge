@@ -24,6 +24,8 @@ pub struct ClassDeclaration {
     pub constructor_start_id: usize,
     pub interface_method_impl_id: HashMap<String, Vec<usize>>,
     pub method_override_id: HashMap<usize, usize>,
+    /// 注入器构造方法实现映射（G3）：注入器构造方法本地ID → 全局构造方法ID
+    pub injector_constructor_impl_id: Vec<usize>,
 }
 
 impl ClassDeclaration {
@@ -41,6 +43,7 @@ impl ClassDeclaration {
             method_start_id: 0, constructor_start_id: 0,
             interface_method_impl_id: HashMap::new(),
             method_override_id: HashMap::new(),
+            injector_constructor_impl_id: vec![],
         }
     }
 }
@@ -160,6 +163,7 @@ mod tests {
             constructor_start_id: 0,
             interface_method_impl_id: HashMap::new(),
             method_override_id: HashMap::new(),
+            injector_constructor_impl_id: vec![],
         };
         assert_eq!(decl.class_type.full_name(), "Test");
     }

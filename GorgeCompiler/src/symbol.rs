@@ -135,6 +135,33 @@ pub struct ClassInfo {
     pub field_type_count_total: crate::symbol::FrozenTypeCount,
     /// 接口方法实现映射：接口全名 → [接口方法本地ID → 类实现方法全局ID]（F1）
     pub interface_method_impl_id: std::collections::HashMap<String, Vec<usize>>,
+    /// 声明冻结（K2）：成员声明完成，不允许再添加新成员
+    pub declaration_frozen: bool,
+    /// 继承冻结（K2）：继承链已固定
+    pub inheritance_frozen: bool,
+    /// 泛型参数名列表 `class Foo<T, U>`（J1）
+    pub generic_params: Vec<String>,
+}
+
+impl ClassInfo {
+    /// 确保声明尚未冻结（调用前检查，对齐 C# `EnsureDeclarationNotFreeze`）。
+    /// 若已冻结则返回错误信息，否则返回 Ok。
+    pub fn check_declaration_not_frozen(&self) -> Result<(), String> {
+        if self.declaration_frozen {
+            Err(format!("类 `{}` 的声明已冻结，不允许再添加成员", self.name))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 确保继承尚未冻结（修改继承关系前检查，对齐 C# `EnsureInheritanceNotFreeze`）。
+    pub fn check_inheritance_not_frozen(&self) -> Result<(), String> {
+        if self.inheritance_frozen {
+            Err(format!("类 `{}` 的继承关系已冻结，不允许修改", self.name))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// 按值类型分组的计数（编译器内部用，避免依赖 gorge_core）
@@ -643,6 +670,9 @@ impl SymbolTable {
             field_start_type_count: FrozenTypeCount::default(),
             field_type_count_total: FrozenTypeCount::default(),
             interface_method_impl_id: std::collections::HashMap::new(),
+            declaration_frozen: false,
+            inheritance_frozen: false,
+            generic_params: Vec::new(),
         }));
 
         // 回填 class_id 到 Scope 中

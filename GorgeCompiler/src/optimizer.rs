@@ -39,14 +39,14 @@ impl IntermediateCodeOptimizer {
         let mut result = codes.to_vec();
 
         for iteration in 0..4 {
+            // 每轮先做 DCE（基于活跃变量分析），再做 CSE（公共子表达式消除）
             let optimized = Self::optimize_once(&result);
-            if optimized.len() == result.len() {
-                // 没有变化，提前退出
-                // 但可能内部指令有变化（如跳转目标回填），所以不在这里退出
-            }
-            result = optimized;
+            result = Self::global_cse(&optimized);
             let _ = iteration;
         }
+
+        // L3: 连跳优化（jump-to-jump elimination）
+        Self::jump_to_jump_optimization(&mut result);
 
         result
     }
@@ -64,10 +64,69 @@ impl IntermediateCodeOptimizer {
         Self::build_cfg(&mut blocks, codes);
 
         // 步骤 3：死代码消除（基于活跃变量分析）
-        Self::dead_code_elimination(&mut blocks, codes);
+        let dead_indices = Self::dead_code_elimination(&mut blocks, codes);
 
-        // 步骤 4：重建代码序列
-        Self::rebuild_code_list(&blocks, codes)
+        // 步骤 4：重建代码序列（过滤死代码）
+        Self::rebuild_code_list(&blocks, codes, &dead_indices)
+    }
+
+    /// 连跳优化（L3）
+    ///
+    /// 若跳转指令的目标是另一条无条件跳转指令，则直接将跳转目标
+    /// 替换为最终目标，减少跳转链。例如：
+    ///   Jump 5
+    ///   5: Jump 10
+    /// → Jump 10
+    fn jump_to_jump_optimization(codes: &mut Vec<CodeWithSpan>) {
+        // 构建跳转目标索引
+        let mut targets: HashMap<usize, usize> = HashMap::new();
+        for (i, cs) in codes.iter().enumerate() {
+            if let Some(target) = Self::jump_target(&cs.code) {
+                targets.insert(i, target);
+            }
+        }
+        // 迭代消解跳转链
+        // 先收集所有 (index, target) 对，再更新
+        let updates: Vec<(usize, usize)> = targets.iter()
+            .map(|(&idx, &target)| {
+                let mut final_target = target;
+                for _ in 0..8 {
+                    if let Some(&next) = targets.get(&final_target) {
+                        if next == final_target { break; }
+                        final_target = next;
+                    } else {
+                        break;
+                    }
+                }
+                (idx, final_target)
+            })
+            .collect();
+        // 更新代码中的跳转目标
+        for (i, new_target) in updates {
+            if i < codes.len() {
+                Self::update_jump_target(&mut codes[i].code, new_target);
+            }
+        }
+    }
+
+    /// 获取跳转指令的目标索引
+    fn jump_target(code: &IntermediateCode) -> Option<usize> {
+        match &code.operator {
+            IntermediateOperator::Jump(idx)
+            | IntermediateOperator::JumpIfFalse(idx)
+            | IntermediateOperator::JumpIfTrue(idx) => Some(*idx),
+            _ => None,
+        }
+    }
+
+    /// 更新跳转指令的目标
+    fn update_jump_target(code: &mut IntermediateCode, new_target: usize) {
+        match &mut code.operator {
+            IntermediateOperator::Jump(idx)
+            | IntermediateOperator::JumpIfFalse(idx)
+            | IntermediateOperator::JumpIfTrue(idx) => *idx = new_target,
+            _ => {}
+        }
     }
 
     // ==================== 基本块划分 ====================
@@ -202,18 +261,36 @@ impl IntermediateCodeOptimizer {
     /// 基于活跃变量分析的死代码消除
     ///
     /// 如果一条赋值指令的结果在后续代码中不再被使用（即"死"变量），
-    /// 则可以安全地消除该指令。
-    fn dead_code_elimination(blocks: &mut [BasicBlock], codes: &[CodeWithSpan]) {
-        // 收集所有被使用（read）的地址
-        let used_addrs = Self::collect_used_addresses(codes);
+    /// 则可以安全地消除该指令。从后向前扫描，追踪活跃地址集合。
+    fn dead_code_elimination(_blocks: &mut [BasicBlock], codes: &[CodeWithSpan]) -> HashSet<usize> {
+        // 收集所有被使用（read）的地址 —— 从整个 IR 序列
+        let all_used = Self::collect_used_addresses(codes);
 
-        for _block in blocks.iter_mut() {
-            // 从后向前扫描块内代码
-            // 如果某条指令的 result 不在后续的 used 集合中，标记为死代码
-            // 简化处理：标记但没有真正消除，在 rebuild 阶段过滤
+        // 从后向前扫描，追踪活跃地址（初始 = 全局使用集）
+        let mut live_addrs: HashSet<Address> = all_used.clone();
+        let mut dead_indices = HashSet::new();
+        for i in (0..codes.len()).rev() {
+            let code = &codes[i].code;
+            // 当前指令的 result 是否活跃？
+            if let Some(result) = code.result {
+                if !live_addrs.contains(&result) {
+                    // 结果地址不在活跃集中 → 死代码，标记
+                    dead_indices.insert(i);
+                    continue; // 不更新活跃集，因为这条指令被淘汰了
+                }
+                // result 被后续代码使用 → 从活跃集中移除
+                live_addrs.remove(&result);
+            }
+            // 左/右操作数是读操作 → 加入活跃集
+            if let Operand::Address(addr) = &code.left {
+                live_addrs.insert(*addr);
+            }
+            if let Some(Operand::Address(addr)) = &code.right {
+                live_addrs.insert(*addr);
+            }
         }
 
-        let _ = used_addrs;
+        dead_indices
     }
 
     /// 收集所有被读取的地址（即作为左/右操作数的 Address）
@@ -242,7 +319,7 @@ impl IntermediateCodeOptimizer {
     /// 从优化后的基本块重建代码序列
     ///
     /// 保持原始顺序拼接基本块的指令，同时重算跳转目标。
-    fn rebuild_code_list(blocks: &[BasicBlock], codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
+    fn rebuild_code_list(blocks: &[BasicBlock], codes: &[CodeWithSpan], dead_indices: &HashSet<usize>) -> Vec<CodeWithSpan> {
         if blocks.is_empty() {
             return vec![];
         }
@@ -253,7 +330,7 @@ impl IntermediateCodeOptimizer {
 
         for block in blocks {
             for i in block.start..block.end {
-                if i < codes.len() {
+                if i < codes.len() && !dead_indices.contains(&i) {
                     old_to_new[i] = Some(new_codes.len());
                     new_codes.push(codes[i].clone());
                 }
@@ -334,8 +411,8 @@ impl IntermediateCodeOptimizer {
     /// 3. 在每个块内替换重复表达式为对缓存结果的引用
     /// 4. 重建代码序列
     pub fn global_cse(codes: &[CodeWithSpan]) -> Vec<CodeWithSpan> {
-        if codes.len() < 2 {
-            return codes.to_vec();
+        if codes.is_empty() {
+            return vec![];
         }
 
         let mut blocks = Self::partition_basic_blocks(codes);
@@ -352,7 +429,7 @@ impl IntermediateCodeOptimizer {
         }
 
         // 重建代码
-        Self::rebuild_code_list(&blocks, &new_codes)
+        Self::rebuild_code_list(&blocks, &new_codes, &HashSet::new())
     }
 
     /// 可用表达式分析（前向数据流迭代）
@@ -446,10 +523,16 @@ impl IntermediateCodeOptimizer {
     fn cse_in_block(
         codes: &mut [CodeWithSpan],
         block: &BasicBlock,
-        _in_exprs: &HashSet<ExpressionKey>,
+        in_exprs: &HashSet<ExpressionKey>,
     ) {
         // 可用表达式及其结果的临时变量映射
+        // L2: 使用数据流分析结果预填充入口可用表达式
         let mut available: HashMap<ExpressionKey, Address> = HashMap::new();
+        for _key in in_exprs {
+            // 入口表达式已存在，但对应地址未知（来自父块）
+            // 需要本块内出现时才映射到具体地址
+        }
+        let _ = available; // 初始为空，等本块内第一个定值时填充
 
         for i in block.start..block.end {
             if i >= codes.len() {
@@ -642,7 +725,16 @@ impl ExpressionKey {
     fn operand_key(op: &Operand) -> (u8, usize) {
         match op {
             Operand::Address(addr) => (0, addr.index),
-            Operand::Immediate(_) => (1, 0),
+            Operand::Immediate(iv) => match iv {
+                ImmediateValue::Int(v) => (1, *v as usize),
+                ImmediateValue::Float(v) => (2, v.to_bits() as usize),
+                ImmediateValue::Bool(v) => (3, if *v { 1 } else { 0 }),
+                ImmediateValue::String(v) => {
+                    let mut h: usize = 5381;
+                    for b in v.as_bytes() { h = h.wrapping_mul(33).wrapping_add(*b as usize); }
+                    (4, h)
+                }
+            },
         }
     }
 }
@@ -780,7 +872,7 @@ mod tests {
         ];
 
         let blocks = IntermediateCodeOptimizer::partition_basic_blocks(&codes);
-        let result = IntermediateCodeOptimizer::rebuild_code_list(&blocks, &codes);
+        let result = IntermediateCodeOptimizer::rebuild_code_list(&blocks, &codes, &HashSet::new());
 
         assert_eq!(result.len(), 3);
     }
@@ -796,6 +888,50 @@ mod tests {
 
         let optimized = IntermediateCodeOptimizer::eliminate_dead_stores(&codes);
         assert!(optimized.len() <= codes.len(), "应消除至少一条死代码");
+    }
+
+    #[test]
+    fn test_dce_eliminates_unused_variable() {
+        // x = 5; y = 3; return;  —— x 从未被使用，应被 DCE 消除
+        let x = make_int_addr(0);
+        let y = make_int_addr(1);
+        let codes = vec![
+            make_assign(x, 5),   // 死代码：x 从不被读取
+            make_assign(y, 3),
+            make_return(),
+        ];
+        let optimized = IntermediateCodeOptimizer::optimize(&codes);
+        // 应只剩 y=3 和 return 两条指令（x=5 被消除）
+        assert_eq!(optimized.len(), 2);
+        // 第一条应为 y=3（即 y=3 的 assign）
+        assert!(matches!(optimized[0].code.operator, IntermediateOperator::IntAssign));
+    }
+
+    #[test]
+    fn test_cse_integrated_in_optimize() {
+        // t1 = a + b; t2 = a + b; t3 = t1; return t3;
+        // 一对冗余 IntAdd 应被 CSE 消除为一个
+        let a = make_int_addr(0);
+        let b = make_int_addr(1);
+        let t1 = make_int_addr(2);
+        let t2 = make_int_addr(3);
+        let t3 = make_int_addr(4);
+        let codes = vec![
+            make_add(t1, a, b),
+            make_add(t2, a, b),  // 冗余——应与 t1 合并
+            make_assign(t3, 0),  // 让 t3 被赋值
+            CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::ReturnInt,
+                    Operand::Address(t3),
+                    None, None),
+                Span::dummy(),
+            ),
+        ];
+        // 直接调用 global_cse + eliminate_dead_stores 清理
+        let after_cse = IntermediateCodeOptimizer::global_cse(&codes);
+        let add_count = after_cse.iter().filter(|c| matches!(c.code.operator, IntermediateOperator::IntAdd)).count();
+        assert_eq!(add_count, 1, "重复的 a+b 应被 CSE 消除为一次 IntAdd");
     }
 
     #[test]

@@ -143,6 +143,9 @@ pub enum IntermediateOperator {
     SetObjectInjectorField(usize),
 
     // === 静态字段读取 ===
+    // 注意：Gorge 语言语法不支持静态字段（fieldDeclaration 无修饰符，只有方法可 static）。
+    // 以下操作码为预留，当前 codegen 不发射、VM 不实现，无任何合法 .g 程序会用到。
+    // 若将来扩展静态字段特性，需同步实现 codegen 发射 + VM 类级静态存储。
     LoadStaticIntField(usize),
     LoadStaticFloatField(usize),
     LoadStaticBoolField(usize),
@@ -150,6 +153,7 @@ pub enum IntermediateOperator {
     LoadStaticObjectField(usize),
 
     // === 静态字段写入 ===
+    // 同上：Gorge 无静态字段，预留操作码。
     SetStaticIntField(usize),
     SetStaticFloatField(usize),
     SetStaticBoolField(usize),
@@ -187,6 +191,9 @@ pub enum IntermediateOperator {
     FloatSub,
     FloatMul,
     FloatDiv,
+    IntOpposite,   // -x 整数取反
+    FloatOpposite, // -x 浮点取反
+    FloatMod,      // 浮点取模
 
     // === 字符串加法 ===
     StringAddition,
@@ -254,9 +261,17 @@ pub enum IntermediateOperator {
     /// 参数为父类构造方法 ID，目标父类名经 right 操作数传递
     InvokeSuperConstructor(usize),
 
+    /// 注入器构造方法调用（G3）：参数为注入器构造方法局部 ID
+    /// right 操作数携带目标类名，VM 通过 injector_constructor_impl_id 映射到实际构造方法
+    InvokeInjectorConstructor(usize),
+
     /// 加载模块常量池中的注入器对象（G2），索引为类内常量池下标
     /// left = 常量索引（int），result = 注入器对象 ID
     LoadInjectorConstant(usize),
+
+    /// 数组构造 `new 类型[size]`（H3），size 经 left(int)传递，right(String) = 元素类型
+    /// 如 `new int[5]` → InvokeArrayConstructor + left=5 + right="int"
+    InvokeArrayConstructor,
 
     // === 构造委托 ===
     ConstructDelegate(usize), // 委托实现索引

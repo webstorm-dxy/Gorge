@@ -102,13 +102,15 @@ fn main() {
     let mut classes: Vec<CompiledClass> = Vec::new();
     collect_classes(&compiler.symbol_table, compiler.symbol_table.global_scope, &mut classes, &methods, &method_meta);
 
-    // 将注入器字段附加到对应类
-    if !compiler.injector_fields.is_empty() {
-        let bytecode_fields: Vec<gorge_core::bytecode::InjectorFieldDef> = compiler
-            .injector_fields.iter().map(|f| gorge_core::bytecode::InjectorFieldDef {
+    // 将注入器字段按类名分发给对应的 CompiledClass
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(fields) = compiler.injector_fields.get(key) {
+            class.injector_fields = fields.iter().map(|f| gorge_core::bytecode::InjectorFieldDef {
                 name: f.name.clone(), value_type: f.value_type, has_default: f.has_default,
+                default_value: f.default_value.clone(),
             }).collect();
-        for class in &mut classes { class.injector_fields = bytecode_fields.clone(); }
+        }
     }
 
     // 附加注入器常量池（G2）
@@ -119,7 +121,29 @@ fn main() {
         }
     }
 
-    for class in &mut classes { class.delegate_impls = compiler.delegate_impls.clone(); }
+    // I-D: 按类分发委托实现
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(&(start, end)) = compiler.class_delegate_ranges.get(key) {
+            class.delegate_impls = compiler.delegate_impls[start..end].to_vec();
+        }
+    }
+
+    // Phase P: 按类分发字段初始化器
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(initials) = compiler.field_initializers.get(key) {
+            class.field_initializers = initials.clone();
+        }
+    }
+
+    // Phase Q3: 按类分发注解
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(anns) = compiler.class_annotations.get(key) {
+            class.annotations = anns.clone();
+        }
+    }
 
     if classes.is_empty() {
         // 如果没有类声明，创建一个默认类包装所有方法
@@ -140,7 +164,10 @@ fn main() {
             field_start_counts: [0; 5],
             interface_method_impl_id: vec![],
             injector_constants: vec![],
-        });
+                    injector_constructor_impl_id: vec![],
+                    field_initializers: vec![],
+                    annotations: vec![],
+                });
     }
 
     let module = CompiledModule { version: 2, classes };
@@ -236,6 +263,9 @@ fn collect_classes(
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                     injector_constants: vec![],
+                    injector_constructor_impl_id: vec![],
+                    field_initializers: vec![],
+                    annotations: vec![],
                 });
 
                 let class_scope = info.scope_id;

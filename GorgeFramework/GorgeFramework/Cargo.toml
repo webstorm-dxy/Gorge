@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 gorge_core = { path = "../../GorgeCore" }
 gorge_macros = { path = "../GorgeMacros" }
+rand = "0.8"
+glam = "0.27"

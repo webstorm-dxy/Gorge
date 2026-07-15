@@ -122,6 +122,9 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         ctx.register_object(obj)
                     }
                 };
+                // 先应用注入器字段覆写（对齐 C# 构造方法先 FieldInitialize(injector)），
+                // 再执行用户构造体（显式参数可覆盖注入器值）。
+                <#self_ty>::gorge_field_initialize(ctx, this);
                 match ctor_id {
                     #(#ctor_arms)*
                     _ => {}

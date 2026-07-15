@@ -76,6 +76,7 @@ struct Fixture {
     pool: InvokeParameterPool,
     objects: HashMap<usize, RuntimeObject>,
     next_id: usize,
+    native_payloads: HashMap<usize, Box<dyn std::any::Any>>,
 }
 
 impl Fixture {
@@ -84,11 +85,12 @@ impl Fixture {
             pool: InvokeParameterPool::new(),
             objects: HashMap::new(),
             next_id: 1,
+            native_payloads: HashMap::new(),
         }
     }
 
     fn ctx(&mut self) -> NativeContext<'_> {
-        NativeContext::new(&self.pool, &mut self.objects, &mut self.next_id)
+        NativeContext::new(&self.pool, &mut self.objects, &mut self.next_id, &mut self.native_payloads)
     }
 }
 
@@ -191,3 +193,58 @@ fn test_vector2_static_distance() {
     }
     assert_eq!(fx.pool.get_float_return() as f32, 5.0);
 }
+
+#[test]
+fn test_vector2_field_initialize_applies_injector_override() {
+    // 验证 native 构造时注入器字段覆写生效（对齐 C# FieldInitialize）。
+    use gorge_core::injector::{RuntimeInjector, Injector};
+    use gorge_core::declaration::ClassDeclaration;
+    use gorge_core::object::GorgeObject;
+    use gorge_core::types::{GorgeType, TypeCount};
+    use std::sync::Arc;
+
+    // 构造一个含 2 个 float 注入器字段的注入器，x 显式设为 7.0，y 保持默认
+    let decl = Arc::new(ClassDeclaration {
+        class_type: GorgeType::class("GorgeFramework.Vector2", None),
+        is_native: true, annotations: vec![], fields: vec![],
+        methods: vec![], static_methods: vec![], constructors: vec![],
+        injector_fields: vec![], super_class: None, super_interfaces: vec![],
+        field_type_count: TypeCount::zero(),
+        method_count: 0, static_method_count: 0, constructor_count: 0,
+        injector_field_type_count: TypeCount { float_count: 2, ..TypeCount::zero() },
+        injector_field_default_value_type_count: TypeCount::zero(),
+        method_start_id: 0, constructor_start_id: 0,
+        interface_method_impl_id: HashMap::new(),
+        method_override_id: HashMap::new(),
+        injector_constructor_impl_id: vec![],
+    });
+    let mut inj = RuntimeInjector::new(decl);
+    inj.set_injector_float(Vector2::INJECTOR_INDEX_x, 7.0); // x 显式覆写
+    // y 保持默认（default_value 标记为 true）
+
+    let mut injectors: HashMap<usize, RuntimeInjector> = HashMap::new();
+    injectors.insert(100, inj);
+
+    let mut objects: HashMap<usize, RuntimeObject> = HashMap::new();
+    let mut next_id = 1usize;
+    let mut payloads: HashMap<usize, Box<dyn std::any::Any>> = HashMap::new();
+    let pool = InvokeParameterPool::new();
+
+    // 直接调用 gorge_field_initialize：在新对象上应用注入器覆写
+    let obj = RuntimeObject::new_simple(
+        Vector2::GORGE_FULL_NAME.to_string(),
+        &Vector2::gorge_field_type_count(),
+    );
+    let obj_id;
+    {
+        let mut ctx = NativeContext::with_injector(
+            &pool, &mut objects, &mut next_id, &mut payloads, &injectors, 100,
+        );
+        obj_id = ctx.register_object(obj);
+        Vector2::gorge_field_initialize(&mut ctx, obj_id);
+    }
+    // x 被注入器覆写为 7.0；y 用默认值 0.0
+    assert_eq!(objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_x) as f32, 7.0);
+    assert_eq!(objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_y) as f32, 0.0);
+}
+

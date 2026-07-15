@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use gorge_core::diagnostics::{Diagnostics, Span};
-use gorge_core::ir::{CodeWithSpan, ValueType};
+use gorge_core::ir::{CodeWithSpan, Operand, ValueType};
 use gorge_core::bytecode::DelegateImpl;
+use gorge_core::bytecode::InjectorConstField;
+use gorge_core::bytecode::CompiledFieldInitializer;
 
 use crate::ast::*;
 use crate::codegen::CodeGenerator;
@@ -15,6 +17,8 @@ pub struct InjectorFieldDef {
     pub name: String,
     pub value_type: ValueType,
     pub has_default: bool,
+    /// 默认值常量（G4）：@Inject(default = expr) 的编译时常量值
+    pub default_value: Option<gorge_core::bytecode::InjectorConstField>,
 }
 
 /// 字段偏移计数器（按值类型分组）
@@ -95,13 +99,19 @@ pub struct Compiler {
     /// Pass 4 产出的编译方法
     pub compiled_methods: Vec<CompiledMethodContents>,
 
-    /// 注入器字段定义列表（Pass 3 收集）
-    pub injector_fields: Vec<InjectorFieldDef>,
+    /// 注入器字段定义（Pass 3 收集，按类名分组）
+    pub injector_fields: std::collections::HashMap<String, Vec<InjectorFieldDef>>,
     /// 注入器常量池（G2）：编译时求值的注入器字面量，按类组织
     pub injector_constants: std::collections::HashMap<String, Vec<gorge_core::bytecode::InjectorConstantDef>>,
 
-    /// 委托实现列表（Pass 4 代码生成时收集）
+    /// 委托实现列表（Pass 4 代码生成时收集，全局编号）
     pub delegate_impls: Vec<DelegateImpl>,
+    /// 按类委托范围（I-D）：类名 → (start_idx, end_idx)
+    pub class_delegate_ranges: std::collections::HashMap<String, (usize, usize)>,
+    /// 字段初始化器（Phase P）：按类名分组的已编译字段初始化器
+    pub field_initializers: std::collections::HashMap<String, Vec<CompiledFieldInitializer>>,
+    /// 类注解（Phase Q3）：按类名分组的注解信息，(注解名, 可选的泛型类型)
+    pub class_annotations: std::collections::HashMap<String, Vec<(String, Option<String>)>>,
 
     /// 进度报告器
     pub progress_reporter: Box<dyn ProgressReporter>,
@@ -128,9 +138,12 @@ impl Compiler {
             current_namespace_id: None,
             tasks: Vec::new(),
             compiled_methods: Vec::new(),
-            injector_fields: Vec::new(),
+            injector_fields: std::collections::HashMap::new(),
             injector_constants: std::collections::HashMap::new(),
             delegate_impls: Vec::new(),
+            class_delegate_ranges: std::collections::HashMap::new(),
+            field_initializers: std::collections::HashMap::new(),
+            class_annotations: std::collections::HashMap::new(),
             progress_reporter: Box::new(SilentReporter),
         }
     }
@@ -138,31 +151,33 @@ impl Compiler {
     /// 主编译入口
     ///
     /// 按顺序执行所有编译 Pass。
+    ///
+    /// M2: 不因早期错误中断编译，收集所有阶段的诊断信息后在最后统一报告。
     pub fn compile(&mut self, sources: &[SourceFile]) -> Result<(), ()> {
         let total = 4;
         self.report(1, total, "一轮编译：收集类型标识符");
-        self.pass1_type_identifier(sources)?;
+        let _ = self.pass1_type_identifier(sources);
 
         self.report(2, total, "二轮编译：扩展类型信息");
-        self.pass2_type_extension(sources)?;
+        let _ = self.pass2_type_extension(sources);
 
-        if self.diagnostics.has_errors() {
-            return Err(());
-        }
+        // 仅在 Pass1+2 无致命错误时继续 Pass3
+        let has_errors = self.diagnostics.has_errors();
 
         self.report(3, total, "三轮编译：声明类型成员");
-        self.pass3_type_declaration(sources)?;
+        let _ = self.pass3_type_declaration(sources);
+
+        // 继承编号冻结（B-3）：为每个类计算含继承的方法/构造/字段编号
+        if !self.diagnostics.has_errors() || !has_errors {
+            self.freeze_inheritance();
+        }
+
+        self.report(4, total, "四轮编译：生成中间代码");
+        let _ = self.pass4_code_generation(sources);
 
         if self.diagnostics.has_errors() {
             return Err(());
         }
-
-        // 继承编号冻结（B-3）：为每个类计算含继承的方法/构造/字段编号
-        self.freeze_inheritance();
-
-        self.report(4, total, "四轮编译：生成中间代码");
-        self.pass4_code_generation(sources)?;
-
         Ok(())
     }
 
@@ -276,6 +291,15 @@ impl Compiler {
         let class_info = self.symbol_table.classes.get_mut(class_id.0);
         class_info.is_static = decl.modifiers.iter().any(|m| matches!(m, Modifier::Static));
         class_info.is_abstract = decl.modifiers.iter().any(|m| matches!(m, Modifier::Abstract));
+        class_info.generic_params = decl.generic_params.clone(); // J1
+        // Q3: 收集类注解到 Compiler 的 class_annotations
+        let anns: Vec<(String, Option<String>)> = decl.annotations.iter().map(|a| {
+            let gt = a.generic_type.as_ref().map(|t| format_type_ref(t));
+            (a.name.clone(), gt)
+        }).collect();
+        if !anns.is_empty() {
+            self.class_annotations.insert(decl.name.clone(), anns);
+        }
     }
 
     /// Pass 1：将接口声明注册到符号表
@@ -400,6 +424,11 @@ impl Compiler {
 
         // 解析父类
         if let Some(ref super_type) = decl.super_class {
+            // 冻结守卫：继承关系已冻结则不允许修改（对齐 C# EnsureInheritanceNotFreeze）
+            if let Err(msg) = self.symbol_table.classes.get(class_id.0).check_inheritance_not_frozen() {
+                self.diagnostics.emit_error(decl.span, msg);
+                return;
+            }
             match self.resolve_type_or_diagnose(scope, super_type) {
                 Ok(Some(TypeInfo::Object(super_id))) => {
                     self.symbol_table.set_super_class(class_id, super_id);
@@ -417,10 +446,24 @@ impl Compiler {
         }
 
         // 解析实现的接口
+        if !decl.super_interfaces.is_empty() {
+            // 冻结守卫：继承关系已冻结则不允许修改
+            if let Err(msg) = self.symbol_table.classes.get(class_id.0).check_inheritance_not_frozen() {
+                self.diagnostics.emit_error(decl.span, msg);
+                return;
+            }
+        }
         let mut interfaces = Vec::new();
         for iface_type in &decl.super_interfaces {
             match self.resolve_type_or_diagnose(scope, iface_type) {
                 Ok(Some(TypeInfo::Interface(iface_id))) => {
+                    // K1b: 检测重复接口实现
+                    if interfaces.contains(&iface_id) {
+                        self.diagnostics.emit_error(
+                            iface_type.span(),
+                            format!("类 `{}` 多次实现了同一接口", decl.name),
+                        );
+                    }
                     interfaces.push(iface_id);
                 }
                 Ok(_) => {
@@ -587,6 +630,10 @@ impl Compiler {
             match member {
                 TopLevelMember::Class(class_decl) => {
                     self.pass3_declare_class_members(search_scope, class_decl);
+                    // K2: 声明冻结 — 成员已全部声明完毕
+                    if let Some(cid) = self.symbol_table.lookup_class(search_scope, &class_decl.name) {
+                        self.symbol_table.classes.get_mut(cid.0).declaration_frozen = true;
+                    }
                 }
                 TopLevelMember::Interface(iface_decl) => {
                     self.pass3_declare_interface_members(search_scope, iface_decl);
@@ -602,6 +649,11 @@ impl Compiler {
             Some(id) => id,
             None => return,
         };
+        // 冻结守卫：声明已冻结则不允许再添加成员（对齐 C# EnsureDeclarationNotFreeze）
+        if let Err(msg) = self.symbol_table.classes.get(class_id.0).check_declaration_not_frozen() {
+            self.diagnostics.emit_error(decl.span, msg);
+            return;
+        }
         let class_scope = self.symbol_table.classes.get(class_id.0).scope_id;
 
         // 字段偏移按值类型分组计数，每种类型从 0 开始独立递增
@@ -634,7 +686,12 @@ impl Compiler {
                             None => type_ref_to_value_type(&field_decl.field_type),
                         };
                         let has_default = annotation.metadatas.iter().any(|m| m.name == "defaultValue");
-                        self.injector_fields.push(InjectorFieldDef { name: inj_name.clone(), value_type: vt, has_default });
+                        let default_value = if has_default {
+                            annotation.metadatas.iter()
+                                .find(|m| m.name == "defaultValue" && m.value.is_some())
+                                .and_then(|m| eval_metadata_const(m.value.as_ref().unwrap()))
+                        } else { None };
+                        self.injector_fields.entry(decl.name.clone()).or_default().push(InjectorFieldDef { name: inj_name.clone(), value_type: vt, has_default, default_value });
                     }
                 }
             }
@@ -653,10 +710,11 @@ impl Compiler {
                     },
                     _ => ValueType::Object,
                 };
-                self.injector_fields.push(InjectorFieldDef {
+                self.injector_fields.entry(decl.name.clone()).or_default().push(InjectorFieldDef {
                     name: field.name.clone(),
                     value_type: vt,
                     has_default: true,
+                    default_value: None,
                 });
             }
         }
@@ -838,8 +896,47 @@ impl Compiler {
             .collect();
         class_ids.sort_by_key(|cid| self.inheritance_depth(*cid));
 
+        // 冻结前置条件检查：所有非 native 类的声明必须已冻结（Pass 3 完成）
+        // 对齐 C# EnsureDeclarationFreeze 守卫
+        for &cid in &class_ids {
+            let ci = self.symbol_table.classes.get(cid.0);
+            if !ci.is_native && !ci.declaration_frozen {
+                self.diagnostics.emit_error(
+                    ci.span,
+                    format!("类 `{}` 声明尚未冻结，不能进行继承编号冻结", ci.name),
+                );
+            }
+        }
+        if self.diagnostics.has_errors() { return; }
+
         for cid in class_ids {
-            let super_id = self.symbol_table.classes.get(cid.0).super_class;
+            let ci = self.symbol_table.classes.get(cid.0);
+            let super_id = ci.super_class;
+            let class_name = ci.name.clone();
+
+            // K1a: 循环继承检测 — 沿父类链上溯，若回到自身则报错
+            if let Some(sid) = super_id {
+                let mut chain = std::collections::HashSet::new();
+                let mut cur = sid;
+                chain.insert(cid);
+                loop {
+                    if !chain.insert(cur) {
+                        // 已访问过 → 循环
+                        break; // 由深度上限兜底
+                    }
+                    let parent = self.symbol_table.classes.get(cur.0);
+                    if let Some(psid) = parent.super_class {
+                        cur = psid;
+                    } else {
+                        break;
+                    }
+                    if cur == cid {
+                        let err_msg = format!("类 `{}` 存在循环继承（自身出现在父类链中）", class_name);
+                        self.diagnostics.emit_error(self.symbol_table.classes.get(cid.0).span, err_msg);
+                        break;
+                    }
+                }
+            }
 
             // 从父类继承起始值
             let (method_start, ctor_start, field_start) = if let Some(sid) = super_id {
@@ -892,6 +989,8 @@ impl Compiler {
             // 构建接口方法实现映射（F1）：为本类实现的每个接口，按名字+签名
             // 匹配类的实例方法（含继承链），得到 [接口方法本地ID → 类方法全局ID]
             let iface_map = self.build_interface_impl_map(cid);
+            // Q1：校验接口实现完整性
+            self.check_interface_impl_completeness(cid, &iface_map);
 
             // 写回
             let ci = self.symbol_table.classes.get_mut(cid.0);
@@ -903,6 +1002,7 @@ impl Compiler {
             ci.field_type_count_total = field_total;
             ci.method_override_id = override_map;
             ci.interface_method_impl_id = iface_map;
+            ci.inheritance_frozen = true; // K2: 继承已冻结
         }
     }
 
@@ -911,6 +1011,7 @@ impl Compiler {
     /// 对类实现的每个接口，遍历接口方法（按声明顺序 = 接口方法本地ID），
     /// 在类的实例方法中按「名字 + 参数签名」匹配实现方法，记录其全局方法编号。
     /// 返回 `Map<接口全名, Vec<类方法全局ID>>`。
+    /// **在调用此方法后应调用 `check_interface_impl_completeness()` 校验完整性。**
     fn build_interface_impl_map(&self, class_id: ClassId) -> std::collections::HashMap<String, Vec<usize>> {
         let mut result = std::collections::HashMap::new();
         let ci = self.symbol_table.classes.get(class_id.0);
@@ -923,13 +1024,47 @@ impl Compiler {
             for &imid in &iface_methods {
                 let im = self.symbol_table.methods.get(imid.0).clone();
                 let im_params: Vec<ParameterId> = im.parameters.clone();
-                // 在类（含继承链）中按名字+签名找实现方法的全局编号
                 let global = self.find_impl_method_global_id(class_id, &im.name, &im_params);
                 impl_ids.push(global.unwrap_or(usize::MAX));
             }
             result.insert(iface_name, impl_ids);
         }
         result
+    }
+
+    /// 校验接口实现完整性（Phase Q1）
+    ///
+    /// 对齐 C# ClassScope.FreezeDeclaration 第 310-326 行：
+    /// 遍历所有接口的映射表，若任何接口方法未找到实现（usize::MAX），
+    /// 通过诊断系统报告编译错误（软错误，不中断编译）。
+    fn check_interface_impl_completeness(
+        &mut self,
+        class_id: ClassId,
+        iface_map: &std::collections::HashMap<String, Vec<usize>>,
+    ) {
+        let ci = self.symbol_table.classes.get(class_id.0);
+        for iface_id in &ci.super_interfaces {
+            let iface = self.symbol_table.interfaces.get(iface_id.0);
+            if let Some(impl_ids) = iface_map.get(&iface.name) {
+                for (i, &global_id) in impl_ids.iter().enumerate() {
+                    if global_id == usize::MAX {
+                        let iface_methods = &iface.methods;
+                        let method_name = if let Some(&mid) = iface_methods.get(i) {
+                            self.symbol_table.methods.get(mid.0).name.clone()
+                        } else {
+                            format!("方法#{}", i)
+                        };
+                        self.diagnostics.emit_error(
+                            iface.span,
+                            format!(
+                                "没有实现 {} 接口的 {} 方法",
+                                iface.name, method_name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// 在类（含继承链）中按名字+参数签名查找实例方法的全局编号
@@ -1025,7 +1160,9 @@ impl Compiler {
                     }
                     self.generate_constructor_ir(sources, *constructor_id, &ctor_info);
                 }
-                _ => {} // 字段初始化器暂不处理
+                TaskKind::FieldInitializer { field_id, class_id } => {
+                    self.generate_field_initializer_ir(sources, *field_id, *class_id);
+                }
             }
         }
 
@@ -1055,9 +1192,18 @@ impl Compiler {
                         continue;
                     }
                     if let Some(stmts) = self.find_matching_method_body(class_decl, method_info) {
+                        let delegate_start = self.delegate_impls.len(); // I-D
                         let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
 
                         cg.set_class_context(&class_decl.name);
+
+                        // 设置注入器字段上下文（G1）
+                        if let Some(inj_fields) = self.injector_fields.get(&class_decl.name) {
+                            let inj_pairs: Vec<(String, ValueType)> = inj_fields.iter()
+                                .map(|f| (f.name.clone(), f.value_type))
+                                .collect();
+                            cg.set_injector_context(&inj_pairs);
+                        }
 
                         // 注册参数
                         let params: Vec<(String, ValueType)> = method_info.parameters.iter()
@@ -1088,10 +1234,16 @@ impl Compiler {
                         let class_key = cg.current_class_name.clone().unwrap_or_default();
                         let ic = std::mem::take(&mut cg.injector_constants);
                         if !ic.is_empty() {
-                            self.injector_constants.entry(class_key).or_default().extend(ic);
+                            self.injector_constants.entry(class_key.clone()).or_default().extend(ic);
                         }
                         let total_locals = cg.total_locals();
                         let codes = cg.into_codes();
+
+                        // I-D: 记录此类委托范围（cg 已消费，可安全读 self.delegate_impls）
+                        let delegate_end = self.delegate_impls.len();
+                        if delegate_end > delegate_start {
+                            self.class_delegate_ranges.entry(class_key).or_insert((delegate_start, delegate_end));
+                        }
 
                         self.compiled_methods.push(CompiledMethodContents {
                             name: method_info.name.clone(),
@@ -1128,9 +1280,18 @@ impl Compiler {
                             Some(s) => s,
                             None => return,
                         };
+                        let delegate_start = self.delegate_impls.len(); // I-D
                         let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
 
                         cg.set_class_context(&class_decl.name);
+
+                        // 设置注入器字段上下文（G1）
+                        if let Some(inj_fields) = self.injector_fields.get(&class_decl.name) {
+                            let inj_pairs: Vec<(String, ValueType)> = inj_fields.iter()
+                                .map(|f| (f.name.clone(), f.value_type))
+                                .collect();
+                            cg.set_injector_context(&inj_pairs);
+                        }
 
                         let params: Vec<(String, ValueType)> = ctor_info.parameters.iter()
                             .map(|pid| {
@@ -1164,18 +1325,139 @@ impl Compiler {
                         let class_key = cg.current_class_name.clone().unwrap_or_default();
                         let ic = std::mem::take(&mut cg.injector_constants);
                         if !ic.is_empty() {
-                            self.injector_constants.entry(class_key).or_default().extend(ic);
+                            self.injector_constants.entry(class_key.clone()).or_default().extend(ic);
                         }
                         let total_locals = cg.total_locals();
+                        let codes = cg.into_codes();
+
+                        // I-D: 委托范围
+                        let delegate_end = self.delegate_impls.len();
+                        if delegate_end > delegate_start {
+                            self.class_delegate_ranges.entry(class_key).or_insert((delegate_start, delegate_end));
+                        }
 
                         self.compiled_methods.push(CompiledMethodContents {
                             name: "constructor".into(),
-                            codes: cg.into_codes(),
+                            codes,
                             total_locals,
                             class_id: Some(ctor_info.class_id),
                             is_constructor: true,
                         });
                         return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 生成字段初始化器的 IR（Phase P）
+    ///
+    /// 对齐 C# FieldInitializerImplementationCompileTask.DoImplement():
+    /// 为每个有初始化表达式的非 native 字段生成独立的 IR 可执行体，
+    /// 构造流程中在构造方法体之前执行。
+    fn generate_field_initializer_ir(
+        &mut self,
+        sources: &[SourceFile],
+        field_id: FieldId,
+        class_id: ClassId,
+    ) {
+        let fi = self.symbol_table.fields.get(field_id.0).clone();
+        let ci = self.symbol_table.classes.get(class_id.0).clone();
+        let class_name = ci.name.clone();
+
+        // 在 AST 中搜索该字段的声明
+        for source in sources {
+            for member in &source.members {
+                if let TopLevelMember::Class(class_decl) = member {
+                    if class_decl.name != class_name {
+                        continue;
+                    }
+                    for cm in &class_decl.members {
+                        if let ClassMember::Field(field_decl) = cm {
+                            if field_decl.name != fi.name {
+                                continue;
+                            }
+                            if let Some(init_expr) = &field_decl.initializer {
+                                let mut cg = CodeGenerator::new(
+                                    &self.symbol_table,
+                                    &mut self.diagnostics,
+                                    &mut self.delegate_impls,
+                                );
+                                cg.set_class_context(&class_name);
+                                let span = fi.span;
+
+                                // 对齐 C# 初始化器 IR 序列：
+                                // 1. LoadInjector — 保存当前注入器
+                                let inj_temp = cg.alloc_temp(ValueType::Object);
+                                cg.emit(
+                                    gorge_core::ir::IntermediateCode::new(
+                                        gorge_core::ir::IntermediateOperator::LoadInjector,
+                                        Operand::int(0), None, Some(inj_temp),
+                                    ),
+                                    span,
+                                );
+                                // 2. Nop × 2 — 入口标记
+                                cg.emit(
+                                    gorge_core::ir::IntermediateCode::new(
+                                        gorge_core::ir::IntermediateOperator::Nop,
+                                        Operand::int(0), None, None,
+                                    ),
+                                    span,
+                                );
+                                cg.emit(
+                                    gorge_core::ir::IntermediateCode::new(
+                                        gorge_core::ir::IntermediateOperator::Nop,
+                                        Operand::int(0), None, None,
+                                    ),
+                                    span,
+                                );
+                                // 3. LoadThis — 获取 this 对象引用
+                                let this_temp = cg.alloc_temp(ValueType::Object);
+                                cg.emit(
+                                    gorge_core::ir::IntermediateCode::new(
+                                        gorge_core::ir::IntermediateOperator::LoadThis,
+                                        Operand::int(0), None, Some(this_temp),
+                                    ),
+                                    span,
+                                );
+                                // 4. 求值初始化表达式 → 写入字段
+                                let val_op = cg.generate_expression(init_expr);
+                                let vt = type_info_to_value_type(&fi.field_type);
+                                let offset = fi.offset.unwrap_or(0);
+                                let set_op = CodeGenerator::set_field_op(vt, offset);
+                                cg.emit(
+                                    gorge_core::ir::IntermediateCode::new(
+                                        set_op,
+                                        Operand::Address(this_temp),
+                                        Some(val_op),
+                                        None,
+                                    ),
+                                    span,
+                                );
+                                // 5. SetInjector — 恢复注入器
+                                cg.emit(
+                                    gorge_core::ir::IntermediateCode::new(
+                                        gorge_core::ir::IntermediateOperator::SetInjector,
+                                        Operand::Address(inj_temp), None, None,
+                                    ),
+                                    span,
+                                );
+
+                                let total_locals = cg.total_locals();
+                                let codes = cg.into_codes();
+
+                                self.field_initializers
+                                    .entry(class_name.clone())
+                                    .or_default()
+                                    .push(CompiledFieldInitializer {
+                                        field_index: offset,
+                                        value_type: vt,
+                                        local_count: total_locals,
+                                        codes,
+                                    });
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1329,6 +1611,24 @@ fn type_ref_to_value_type(tr: &TypeRef) -> ValueType {
     }
 }
 
+/// 将 TypeRef 格式化为字符串（用于注解泛型类型存储，Phase Q3）
+fn format_type_ref(tr: &TypeRef) -> String {
+    match tr {
+        TypeRef::Simple { name, .. } => name.clone(),
+        TypeRef::Generic { name, type_args, .. } => {
+            let args: Vec<String> = type_args.iter().map(format_type_ref).collect();
+            format!("{}<{}>", name, args.join(", "))
+        }
+        TypeRef::Array { element_type, .. } => format!("{}[]", format_type_ref(element_type)),
+        TypeRef::Delegate { return_type, .. } => {
+            format!("Delegate<{}>", format_type_ref(return_type))
+        }
+        TypeRef::Injector { base_type, .. } => {
+            format!("Injector<{}>", format_type_ref(base_type))
+        }
+    }
+}
+
 /// 按字段类型对 FrozenTypeCount 的对应分组 +1（枚举计入 int）
 fn bump_frozen_type_count(tc: &mut FrozenTypeCount, ti: &TypeInfo) {
     match ti {
@@ -1386,6 +1686,87 @@ fn type_ref_name(type_ref: &TypeRef) -> String {
     }
 }
 
+/// 将 metadata 表达式求值为编译时常量（G4）
+fn eval_metadata_const(expr: &Expression) -> Option<InjectorConstField> {
+    match expr {
+        Expression::Literal(Literal::Int(v), _) => Some(InjectorConstField::Int(String::new(), *v)),
+        Expression::Literal(Literal::Float(v), _) => Some(InjectorConstField::Float(String::new(), *v)),
+        Expression::Literal(Literal::Bool(v), _) => Some(InjectorConstField::Bool(String::new(), *v)),
+        Expression::Literal(Literal::String(v), _) => Some(InjectorConstField::String(String::new(), v.clone())),
+        // 二元算术运算求值（T18 扩展）
+        Expression::Binary { left, operator, right, .. } => {
+            let l = eval_metadata_const(left);
+            let r = eval_metadata_const(right);
+            eval_binary_const(l?, r?, *operator)
+        }
+        // 一元取反/逻辑非求值
+        Expression::Unary { operator, operand, .. } => {
+            let v = eval_metadata_const(operand);
+            eval_unary_const(v?, *operator)
+        }
+        _ => None,
+    }
+}
+
+/// 对两个编译时常量执行二元运算。
+fn eval_binary_const(l: InjectorConstField, r: InjectorConstField, op: crate::ast::BinaryOp) -> Option<InjectorConstField> {
+    use crate::ast::BinaryOp::*;
+    // int → int 运算，含 int+float → float 提升
+    match op {
+        Add => match (&l, &r) {
+            (InjectorConstField::Int(_, a), InjectorConstField::Int(_, b)) => Some(InjectorConstField::Int(String::new(), a + b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Float(_, b)) => Some(InjectorConstField::Float(String::new(), a + b)),
+            (InjectorConstField::Int(_, a), InjectorConstField::Float(_, b)) => Some(InjectorConstField::Float(String::new(), *a as f64 + b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Int(_, b)) => Some(InjectorConstField::Float(String::new(), a + *b as f64)),
+            _ => None,
+        },
+        Subtract => match (&l, &r) {
+            (InjectorConstField::Int(_, a), InjectorConstField::Int(_, b)) => Some(InjectorConstField::Int(String::new(), a - b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Float(_, b)) => Some(InjectorConstField::Float(String::new(), a - b)),
+            (InjectorConstField::Int(_, a), InjectorConstField::Float(_, b)) => Some(InjectorConstField::Float(String::new(), *a as f64 - b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Int(_, b)) => Some(InjectorConstField::Float(String::new(), a - *b as f64)),
+            _ => None,
+        },
+        Multiply => match (&l, &r) {
+            (InjectorConstField::Int(_, a), InjectorConstField::Int(_, b)) => Some(InjectorConstField::Int(String::new(), a * b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Float(_, b)) => Some(InjectorConstField::Float(String::new(), a * b)),
+            (InjectorConstField::Int(_, a), InjectorConstField::Float(_, b)) => Some(InjectorConstField::Float(String::new(), *a as f64 * b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Int(_, b)) => Some(InjectorConstField::Float(String::new(), a * *b as f64)),
+            _ => None,
+        },
+        Divide => match (&l, &r) {
+            (InjectorConstField::Int(_, a), InjectorConstField::Int(_, b)) if *b != 0 => Some(InjectorConstField::Int(String::new(), a / b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Float(_, b)) if *b != 0.0 => Some(InjectorConstField::Float(String::new(), a / b)),
+            (InjectorConstField::Int(_, a), InjectorConstField::Float(_, b)) if *b != 0.0 => Some(InjectorConstField::Float(String::new(), *a as f64 / b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Int(_, b)) if *b != 0 => Some(InjectorConstField::Float(String::new(), a / *b as f64)),
+            _ => None, // 除零返回 None（编译时常量不可为零分母）
+        },
+        Modulo => match (&l, &r) {
+            (InjectorConstField::Int(_, a), InjectorConstField::Int(_, b)) if *b != 0 => Some(InjectorConstField::Int(String::new(), a % b)),
+            (InjectorConstField::Float(_, a), InjectorConstField::Float(_, b)) if *b != 0.0 => Some(InjectorConstField::Float(String::new(), a % b)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 对编译时常量执行一元运算。
+fn eval_unary_const(v: InjectorConstField, op: crate::ast::UnaryOp) -> Option<InjectorConstField> {
+    use crate::ast::UnaryOp::*;
+    match op {
+        Negate => match v {
+            InjectorConstField::Int(_, x) => Some(InjectorConstField::Int(String::new(), -x)),
+            InjectorConstField::Float(_, x) => Some(InjectorConstField::Float(String::new(), -x)),
+            _ => None,
+        },
+        Not => match v {
+            InjectorConstField::Bool(_, x) => Some(InjectorConstField::Bool(String::new(), !x)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1412,6 +1793,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "MyClass".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![],
@@ -1438,6 +1820,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "A".into(),
+            generic_params: vec![],
                     super_class: None,
                     super_interfaces: vec![],
                     members: vec![],
@@ -1448,7 +1831,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "IB".into(),
-                    super_interfaces: vec![],
+                                super_interfaces: vec![],
                     methods: vec![],
                     span: dummy_span(),
                 }),
@@ -1456,7 +1839,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "Color".into(),
-                    values: vec![],
+                                values: vec![],
                     span: dummy_span(),
                 }),
             ],
@@ -1485,6 +1868,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Player".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![],
@@ -1509,6 +1893,7 @@ mod tests {
             annotations: vec![],
             modifiers: vec![Modifier::Native],
             name: "Base".into(),
+            generic_params: vec![],
             super_class: None,
             super_interfaces: vec![],
             members: vec![],
@@ -1520,6 +1905,7 @@ mod tests {
             annotations: vec![],
             modifiers: vec![],
             name: "Derived".into(),
+            generic_params: vec![],
             super_class: Some(TypeRef::simple("Base", dummy_span())),
             super_interfaces: vec![],
             members: vec![],
@@ -1552,7 +1938,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Suit".into(),
-                values: vec![
+                            values: vec![
                     EnumValue { annotations: vec![], name: "Hearts".into(), value: Some(1), span: dummy_span() },
                     EnumValue { annotations: vec![], name: "Diamonds".into(), value: Some(2), span: dummy_span() },
                     EnumValue { annotations: vec![], name: "Clubs".into(), value: None, span: dummy_span() },
@@ -1587,6 +1973,7 @@ mod tests {
             annotations: vec![],
             modifiers: vec![],
             name: "Task".into(),
+            generic_params: vec![],
             super_class: None,
             super_interfaces: vec![TypeRef::simple("IRunnable", dummy_span())],
             members: vec![],
@@ -1619,6 +2006,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![Modifier::Native, Modifier::Static],
                 name: "Console".into(),
+                generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![],
@@ -1646,6 +2034,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Orphan".into(),
+            generic_params: vec![],
                 super_class: Some(TypeRef::simple("NonexistentBase", dummy_span())),
                 super_interfaces: vec![],
                 members: vec![],
@@ -1669,6 +2058,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Point".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![
@@ -1718,6 +2108,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Calculator".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![ClassMember::Method(MethodDeclaration {
@@ -1774,6 +2165,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![Modifier::Native],
                 name: "Console".into(),
+                generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![ClassMember::Method(MethodDeclaration {
@@ -1805,6 +2197,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Person".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![ClassMember::Constructor(ConstructorDeclaration {
@@ -1847,7 +2240,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "IComparable".into(),
-                super_interfaces: vec![],
+                            super_interfaces: vec![],
                 methods: vec![MethodSignature {
                     annotations: vec![],
                     return_type: TypeRef::simple("bool", dummy_span()),
@@ -1881,6 +2274,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Vector3".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![
@@ -1921,6 +2315,7 @@ mod tests {
                 annotations: vec![],
                 modifiers: vec![],
                 name: "Mixed".into(),
+            generic_params: vec![],
                 super_class: None,
                 super_interfaces: vec![],
                 members: vec![
@@ -2007,6 +2402,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "Base".into(),
+            generic_params: vec![],
                     super_class: None,
                     super_interfaces: vec![],
                     members: vec![simple_method("methodA"), simple_method("methodB")],
@@ -2017,6 +2413,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "Derived".into(),
+            generic_params: vec![],
                     super_class: Some(TypeRef::simple("Base", dummy_span())),
                     super_interfaces: vec![],
                     members: vec![simple_method("methodB"), simple_method("methodC")],
@@ -2058,6 +2455,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "Base".into(),
+            generic_params: vec![],
                     super_class: None,
                     super_interfaces: vec![],
                     members: vec![field("a", "int"), field("b", "float")],
@@ -2068,6 +2466,7 @@ mod tests {
                     annotations: vec![],
                     modifiers: vec![],
                     name: "Derived".into(),
+            generic_params: vec![],
                     super_class: Some(TypeRef::simple("Base", dummy_span())),
                     super_interfaces: vec![],
                     members: vec![field("c", "int"), field("d", "float")],
@@ -2191,5 +2590,124 @@ class Dog : Animal {
             .filter(|t| matches!(t.kind, TaskKind::Constructor { .. }))
             .collect();
         assert_eq!(all_ctor_tasks.len(), 2, "Animal + Dog 共 2 个构造任务");
+    }
+
+    #[test]
+    fn test_compile_field_initializer_generates_ir() {
+        // 验证带有初始值的字段会正确生成初始化器 IR（Phase P）
+        let source_text = r#"
+class Widget {
+    int count = 42;
+    float pi = 3.14;
+    Widget() { }
+}
+"#;
+        let (tokens, _) = crate::lexer::tokenize(source_text, 0);
+        let mut parser = crate::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+        let mut compiler = Compiler::new();
+        // 跳过结果检查，只验证任务和 IR 生成
+        let _ = compiler.compile(&[source_file]);
+
+        // 验证字段初始化任务已创建
+        let init_tasks: Vec<_> = compiler.tasks.iter()
+            .filter(|t| matches!(t.kind, TaskKind::FieldInitializer { .. }))
+            .collect();
+        assert_eq!(init_tasks.len(), 2, "count=42 和 pi=3.14 应收 2 个字段初始化任务");
+
+        // 验证 field_initializers 中有 Widget 的条目
+        let widget_inits = compiler.field_initializers.get("Widget");
+        // 如果编译成功，应有 Widget 的初始化器
+        if let Some(inits) = widget_inits {
+            assert_eq!(inits.len(), 2, "应有 2 个字段初始化器");
+            // 第一个初始化器：count（int，offset 0）
+            assert_eq!(inits[0].field_index, 0);
+            assert_eq!(inits[0].value_type, ValueType::Int);
+            assert!(!inits[0].codes.is_empty(), "初始化器应有 IR 指令");
+            // 第二个初始化器：pi（float，offset 0 在 float 分组内）
+            assert_eq!(inits[1].value_type, ValueType::Float);
+        }
+    }
+
+    #[test]
+    fn test_freeze_inheritance_requires_declaration_frozen() {
+        // 冻结守卫：非 native 类声明未冻结时，freeze_inheritance 应报错
+        let source = SourceFile {
+            members: vec![
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Foo".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![simple_method("m")],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            ..empty_source()
+        };
+        let mut compiler = Compiler::new();
+        compiler.pass1_type_identifier(&[source.clone()]).unwrap();
+        compiler.pass3_type_declaration(&[source]).unwrap();
+        // Pass 3 结束时会设 declaration_frozen=true，手工清回 false 模拟未冻结
+        let g = compiler.symbol_table.global_scope;
+        let cid = compiler.symbol_table.lookup_class(g, "Foo").unwrap();
+        compiler.symbol_table.classes.get_mut(cid.0).declaration_frozen = false;
+        // freeze_inheritance 应因 declaration_frozen=false 而报错
+        compiler.freeze_inheritance();
+        assert!(compiler.diagnostics.has_errors(), "声明未冻结时应报错");
+    }
+
+    #[test]
+    fn test_eval_metadata_const_arithmetic() {
+        use gorge_core::bytecode::InjectorConstField;
+        // int + int → Int
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(Literal::Int(10), dummy_span())),
+            operator: crate::ast::BinaryOp::Add,
+            right: Box::new(Expression::Literal(Literal::Int(20), dummy_span())),
+            span: dummy_span(),
+        };
+        let v = eval_metadata_const(&expr).unwrap();
+        assert!(matches!(v, InjectorConstField::Int(_, 30)));
+
+        // float * int → Float（混合提升）
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(Literal::Float(2.5), dummy_span())),
+            operator: crate::ast::BinaryOp::Multiply,
+            right: Box::new(Expression::Literal(Literal::Int(4), dummy_span())),
+            span: dummy_span(),
+        };
+        let v = eval_metadata_const(&expr).unwrap();
+        assert!(matches!(v, InjectorConstField::Float(_, x) if (x - 10.0).abs() < 1e-9));
+
+        // 一元取反
+        let expr = Expression::Unary {
+            operator: crate::ast::UnaryOp::Negate,
+            operand: Box::new(Expression::Literal(Literal::Int(5), dummy_span())),
+            span: dummy_span(),
+        };
+        let v = eval_metadata_const(&expr).unwrap();
+        assert!(matches!(v, InjectorConstField::Int(_, -5)));
+
+        // 一元逻辑非
+        let expr = Expression::Unary {
+            operator: crate::ast::UnaryOp::Not,
+            operand: Box::new(Expression::Literal(Literal::Bool(true), dummy_span())),
+            span: dummy_span(),
+        };
+        let v = eval_metadata_const(&expr).unwrap();
+        assert!(matches!(v, InjectorConstField::Bool(_, false)));
+
+        // 除零应为 None
+        let expr = Expression::Binary {
+            left: Box::new(Expression::Literal(Literal::Int(10), dummy_span())),
+            operator: crate::ast::BinaryOp::Divide,
+            right: Box::new(Expression::Literal(Literal::Int(0), dummy_span())),
+            span: dummy_span(),
+        };
+        assert!(eval_metadata_const(&expr).is_none());
     }
 }

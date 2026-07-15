@@ -189,6 +189,7 @@ mod tests {
                 constructor_start_id: 0,
                 interface_method_impl_id: HashMap::new(),
                 method_override_id: HashMap::new(),
+                injector_constructor_impl_id: vec![],
             },
             None,
         )

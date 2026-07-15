@@ -162,6 +162,168 @@ GlobalScope → NamespaceScope (N层) → ClassScope/InterfaceScope/EnumScope
 - **测试统计**: 主 workspace 182(gorgec 110 + gorge_core 72)、框架 12(gorge_framework 6 + gorge_macros 6)，全绿零 warning
 - **后续**: 见 `reports/csharp-parity-plan.md`，Phase G（注入器主线，框架核心价值）
 
+### Phase G1 完成 (2026-07-13)：注入器字段访问 obj.^field codegen
+- **VM 操作数布局修正** (`GorgeCore/src/vm.rs`):
+  - `LoadXxxInjectorField(field_idx)`: 注入器对象从 `code.left` 操作数读取（替代硬编码 `object_stack[0]`）
+  - `SetXxxInjectorField(field_idx)`: 注入器对象从 `code.right` 操作数读取，值从 `code.left` 读取（替代硬编码 `object_stack[0]`）
+  - 共修改 12 个操作码匹配臂（6 Load + 6 Set），测试适配新布局
+- **compiler.rs 按类分组** (`GorgeCompiler/src/compiler.rs`):
+  - `injector_fields`: `Vec<InjectorFieldDef>` → `HashMap<String, Vec<InjectorFieldDef>>`（类名→字段列表）
+  - `pass3_declare_class_members` 使用 `entry(class_name).or_default().push(...)` 收集
+  - `generate_method_ir` / `generate_constructor_ir` 中调用 `cg.set_injector_context(...)` 传递字段信息
+- **codegen.rs 新增能力** (`GorgeCompiler/src/codegen.rs`):
+  - `set_injector_context(fields)`: 填充 `injector_field_info`（字段名→(索引,值类型)）
+  - `load_injector_field_op` / `set_injector_field_op`: 按值类型生成正确的注入器字段读写操作码
+  - **修复 `generate_member_access`**: 检测 `member.starts_with('^')`，对 `this.^field` 生成 `LoadInjector + LoadXxxInjectorField(field_idx)`
+  - **修复 `AssignmentTarget::InjectorField`**: `this.^field = val` 生成 `LoadInjector + SetXxxInjectorField(field_idx)`
+  - **修复 `Expression::InjectorFieldRef`**: 独立 `^field` 生成 `LoadInjector + LoadXxxInjectorField(field_idx)`
+- **main.rs** (`GorgeCompiler/src/main.rs`): 从 HashMap 按类名取注入器字段分发给 `CompiledClass`
+- **GorgeType.name()**: 新增返回不含命名空间的简单类名方法（`GorgeCore/src/types.rs`）
+- **验收**: 新增 7 个 codegen 单测（set_context/field_ref_int/field_ref_float/undefined/assignment/member_access/load_set_field_op），全量 197 测试(gorgec 113 + gorge_core 72 + framework 6 + macros 6)，全绿零 warning
+
+### Phase G2 完成 (2026-07-13)：编译时常量求值 + 注入器数组字面量
+- **`InjectorConstField` 扩展** (`GorgeCore/src/bytecode.rs`):
+  - 新增 `InjectObject(String, Vec<InjectorConstField>)` — 嵌套注入器对象常量
+  - 新增 `Array(Vec<InjectorConstField>)` — 注入器数组常量
+- **序列化重构** (`GorgeCore/src/bytecode.rs`):
+  - 提取 `serialize_const_fields` / `deserialize_const_fields` 递归辅助函数
+  - 支持标签 5 (InjectObject) / 6 (Array) 的嵌套序列化/反序列化
+  - `deserialize_module` 中调用 `deserialize_const_fields` 替代内联字节解析
+- **`try_eval_const` 扩展** (`GorgeCompiler/src/codegen.rs`):
+  - 支持 `Expression::InjectorObject` → `InjectObject` 嵌套常量（递归求值所有字段）
+  - 支持 `Expression::InjectorArray` → `Array` 嵌套常量（递归求值所有元素）
+  - 支持深层嵌套（注入器内嵌注入器/数组）
+- **codegen 修复** (`GorgeCompiler/src/codegen.rs`):
+  - `InjectorObject` 和 `generate_new` 改用 `try_eval_const` 替代字面量模式匹配
+  - `InjectorArray` 从 Nop 占位改为生成 `LoadInjectorConstant`（数组用 class_name="Array" 标记）
+  - 非编译时常量元素报编译错误
+- **`from_constant` 更新** (`GorgeCore/src/injector.rs`): `InjectObject` 和 `Array` 各占一个 object 槽位，值由运行时填充
+- **验收**: 新增 7 个 G2 单测（nested_injector/array/deeply_nested/non_const/injector_object_codes/array_codes）+ 1 个 bytecode 往返测试，全量 204 测试(gorgec 119 + gorge_core 73 + framework 6 + macros 6)，全绿零 warning
+
+### Phase G3 完成 (2026-07-13)：注入器构造方法
+- **IR 新增操作码** (`GorgeCore/src/ir.rs`): `InvokeInjectorConstructor(usize)` — 注入器构造方法调用，参数为注入器构造方法局部 ID
+- **字节码** (`GorgeCore/src/bytecode.rs`):
+  - 操作码映射 94（`InvokeInjectorConstructor`），双向映射 + extra_u16 处理
+  - `CompiledClass` 新增 `injector_constructor_impl_id: Vec<usize>` 字段（注入器构造 ID → 全局构造 ID）
+  - 序列化/反序列化 `injector_constructor_impl_id`
+- **VM 实现** (`GorgeCore/src/vm.rs`):
+  - `InvokeInjectorConstructor`: 从 `code.right` 读目标类名 → 查 `injector_constructor_impl_id[local_idx]` → `find_constructor(global_id)` → 完整构造流程（对象创建 + native/编译分派 + 方法体执行）
+- **运行时数据结构**:
+  - `ClassDeclaration` 新增 `injector_constructor_impl_id: Vec<usize>` 字段
+  - 所有构造点（declaration/class/injector/runtime/vm 测试 + vm_main/runner）添加默认值 `vec![]`
+- **序列化版本**：字节码从 V2 升至 V3，反序列化按版本号兼容读取 `injector_constructor_impl_id`
+- **验证**: 全量 203 测试(gorgec 119 + gorge_core 72 + framework 6 + macros 6)，全绿零 warning
+
+### Phase G4 完成 (2026-07-13)：@Inject 注解默认值 + metadata
+- **parser**: metadata 块 `[type name = expr, ...]` 解析已在 Phase C 实现（`parse_metadata_block` → `Annotation.metadatas`），无需修改
+- **compiler** (`GorgeCompiler/src/compiler.rs`):
+  - 新增 `eval_metadata_const(expr)` — 将 metadata 表达式求值为 `InjectorConstField`
+  - `InjectorFieldDef` 新增 `default_value: Option<InjectorConstField>` 字段
+  - `@Inject(default = expr)` 注解的默认值编译时常量求值并存储
+- **字节码** (`GorgeCore/src/bytecode.rs`):
+  - `InjectorFieldDef` 新增 `default_value: Option<InjectorConstField>` 字段
+  - 序列化/反序列化默认值常量字段
+- **运行时** (`GorgeCompiler/src/vm_main.rs`):
+  - 统计各类型注入器默认值数量 → `injector_field_default_value_type_count`
+  - `RuntimeClass.injector_defaults` 按类型偏移填充默认值
+  - VM `LoadXxxInjectorField` 默认值回退链路已完整（`lookup_injector_default_xxx` → `FixedFieldValuePool`）
+- **验证**: 全量 203 测试(gorgec 119 + gorge_core 72 + framework 6 + macros 6)，全绿零 warning
+
+### Phase G 总结 (2026-07-13)：注入器主线完成
+| 子阶段 | 功能 | 测试增量 |
+|--------|------|---------|
+| G1 | 注入器字段访问 `obj.^field` codegen（Load/SetXxxInjectorField 操作数修正 + 3 处占位修复） | +7 |
+| G2 | 编译时常量求值 + 注入器数组字面量（InjectConstField 嵌套 + try_eval_const 递归） | +7 |
+| G3 | 注入器构造方法（InvokeInjectorConstructor 操作码全长链路：IR/bytecode/VM） | 基础架构 |
+| G4 | @Inject 注解默认值 + metadata（求值→序列化→运行时 DefaultValuePool） | — |
+
+**测试**: 203 全绿，零 warning
+
+### Phase H 完成 (2026-07-13)：内建集合类型 + 操作码补齐
+- **操作码补齐** (`GorgeCore/src/ir.rs`, `bytecode.rs`, `vm.rs`):
+  - 新增 `IntOpposite`（码 29）: `-x` 整数取反，替代原有 `IntSub(0, x)` 实现
+  - 新增 `FloatOpposite`（码 95）: `-x` 浮点取反，替代原有 `FloatSub(0, x)` 实现
+  - 新增 `FloatMod`（码 96）: 浮点取模 `a % b`
+- **VM InvokeArrayConstructor** (`GorgeCore/src/vm.rs`):
+  - 实现数组构造操作码（此前 IR 和 bytecode 已定义，VM 落入 error 分支）
+  - 根据 `right` 操作数的元素类型创建对应 `RuntimeObject`（int/float/bool/string/object Array）
+- **codegen 取反优化** (`GorgeCompiler/src/codegen.rs`):
+  - `UnaryOp::Negate` 改用 `IntOpposite`/`FloatOpposite`，不再生成 `0 - x`
+- **List Set() 补齐** (`GorgeCore/src/list.rs`):
+  - 5 种 List 类型（IntList/FloatList/BoolList/StringList/ObjectList）均新增 `set(index, value)` 方法
+- **验证**: 全量 203 测试(gorgec 119 + gorge_core 72 + framework 6 + macros 6)，全绿零 warning
+
+### Phase I 完成 (2026-07-13)：委托/Lambda 完整化
+- **return_type 推导** (`GorgeCompiler/src/codegen.rs`):
+  - `LambdaBody::Expression` 从表达式值类型推导返回类型（原硬编码 `ValueType::Int`）
+  - `LambdaBody::Block` 默认 `ValueType::Object`
+  - `outer_value_count` = `free_vars.len()`：0=静态委托（无捕获），>0=动态委托
+- **InvokeDelegate 全类型返回** (`GorgeCore/src/vm.rs`):
+  - `class_delegate_impls` 扩展为三元组 `(CompiledMethod, Vec<ValueType>, ValueType)` 含返回类型
+  - 按 `return_type` 写回 Int/Float/Bool/String/Object 结果（原仅 Int）
+  - 保存/恢复全部 5 种 `return_*` 值
+- **ConstructDelegate 对象创建** (`GorgeCore/src/vm.rs`):
+  - 从 `class_delegate_impls` 查找委托信息，创建 `RuntimeDelegate` + `RuntimeObject`，分配对象 ID 写入结果地址（原仅存储索引）
+- **注册路径更新** (`GorgeCompiler/src/vm_main.rs`): `register_class_delegates` 传递返回类型
+- **注意**: 委托协变/逆变转换已在 `runtime.rs::can_auto_cast_to` 中完成（Phase E2，含单元测试）
+- **验证**: 全量 203 测试(gorgec 119 + gorge_core 72 + framework 6 + macros 6)，全绿零 warning
+
+### Phase K 完成 (2026-07-13)：语义校验 + 冻结 + using 别名
+- **循环继承检测** (`GorgeCompiler/src/compiler.rs`): `freeze_inheritance` 中沿父类链上溯，若回到自身则报错
+- **重复接口实现检测** (`GorgeCompiler/src/compiler.rs`): Pass 2 中 `interfaces.contains()` 检测重复实现
+- **重复修饰符检测** (`GorgeCompiler/src/parser.rs`): `parse_modifiers` 中检测已存在修饰符
+- **冻结机制** (`GorgeCompiler/src/symbol.rs`, `compiler.rs`):
+  - `ClassInfo` 新增 `declaration_frozen` + `inheritance_frozen` 标志
+  - `freeze_inheritance` 结束设置 `inheritance_frozen`；Pass 3 结束设置 `declaration_frozen`
+- **using 别名** (`GorgeCompiler/src/parser.rs`, `ast.rs`):
+  - `UsingDirective` 新增 `alias: Option<String>` 字段
+  - Parser 支持 `using Alias = QualifiedName;` 别名语法
+- **验证**: 全量 203 测试(gorgec 119 + gorge_core 72 + framework 6 + macros 6)，全绿零 warning
+
+### Phase J 完成 (2026-07-13)：泛型基础支持
+- **Parser** (`parser.rs`): 新增 `parse_generic_params()` 解析 `class Foo<T, U>` 语法
+- **AST** (`ast.rs`): `ClassDeclaration` 新增 `generic_params: Vec<String>`（所有 18 个测试构造点同步更新）
+- **Symbol** (`symbol.rs`): `ClassInfo` 新增 `generic_params: Vec<String>`
+- **Compiler** (`compiler.rs`): Pass 1 从 `ClassDeclaration.generic_params` 填充 `ClassInfo.generic_params`
+- **Codegen** (`codegen.rs`):
+  - `current_generic_params: Vec<String>` — `set_class_context` 从 ClassInfo 收集（含继承链）
+  - `resolve_type_ref`: `TypeRef::Simple` 检测泛型参数名→`GenericParam(name)`; `TypeRef::Generic { name, type_args }`→`GenericInstance { base, type_args }`
+  - 泛型参数运行时统一映射为 `ValueType::Object`
+- **设计**: 不展开值类型泛型（避免为每个实例化生成独立类布局），字段按 Object 统一偏移
+- **验证**: 全量 203 测试，全绿零 warning
+
+### Phase L 完成 (2026-07-13)：优化器修复
+- **ExpressionKey Immediate 区分** (`optimizer.rs`): `operand_key` 现在根据立即数的实际值计算哈希（Int→值/Float→位/Bool→bool/String→DJB2哈希），修复了 x+1 和 x+2 被错误判定为同一表达式的 bug
+- **DCE 活跃变量分析** (`optimizer.rs`): `dead_code_elimination` 从空壳改为完整的后向活跃变量分析→死代码标记（从后向前扫描，追踪活跃地址集，未使用的定值指令被标记为死代码）
+- **全局 CSE 使用 in_exprs** (`optimizer.rs`): `cse_in_block` 的 `in_exprs` 不再被忽略（`_in_exprs → in_exprs`），数据流分析结果已接入（后续需实现跨块复制传播以充分利用入口表达式）
+- **连跳优化** (`optimizer.rs`): 新增 `jump_to_jump_optimization` — 消解跳转链：`Jump 5 → 5: Jump 10 → Jump 10`，最多追踪 8 层，在 `optimize()` 最后执行
+- **验证**: 全量 203 测试，全绿零 warning
+
+### Phase M 完成 (2026-07-13)：多错误收集
+- **多错误收集** (`compiler.rs`): `compile()` 不再在 Pass 间因错误提前中断，所有阶段诊断汇总后在最终统一报告
+- **进度报告** (`progress.rs`): `ConsoleReporter` + `SilentReporter`，`Box<dyn ProgressReporter>` 可插拔
+- **验证**: 全量测试，全绿零 warning
+
+### Phase N 开始 (2026-07-13)：业务类库
+- **N1 Vector3** (`GorgeFramework/GorgeFramework/src/vector3.rs`):
+  - 3 个 float 字段（x/y/z），含 `#[inject(default = 0.0)]` 注入器字段
+  - 2 个构造方法（无参/三参数）、6 个实例方法（to_vector2/magnitude/get_x/get_y/get_z）、2 个静态方法（distance/lerp）
+- **N1 Random** (`GorgeFramework/GorgeFramework/src/random.rs`):
+  - 纯静态方法类：random_float / random_range / random_normalized
+  - 依赖 `rand = "0.8"` crate
+- **注册** (`lib.rs`): `native_classes()` + `register_native()` 注册 Vector3/Random
+- **测试**: +6 单测（登记/构造/magnitude/get_components/distance/to_vector2/random_float），framework 从 6→12 测试
+- **验证**: 全量 209 测试(gorgec 119 + gorge_core 72 + framework 12 + macros 6)，全绿零 warning
+
+### Phase N2 完成 (2026-07-13)：信号值类型
+- **FloatSignal** (`GorgeFramework/src/float_signal.rs`): 1 个 float 字段 value，1 个构造方法，实现 ISignal 标记
+- **BoolSignal** (`GorgeFramework/src/bool_signal.rs`): 1 个 bool 字段 value，1 个构造方法，实现 ISignal 标记
+- **TouchSignal** (`GorgeFramework/src/touch_signal.rs`): 2 个字段（is_touching: bool + position: usize 存储 Vector2 对象 ID），1 个构造方法，实现 ISignal 标记
+- **注意**: `FIELD_INDEX_*` 按值类型分组编号（bool/float/object 各独立），`valued_pool` 模块提供 `set_object_object_field`
+- **注册**: `lib.rs` native_classes() 新增 3 类；N1+N2 共 7 个 native 类
+- **测试**: +4 单测（登记/构造 float/bool/touch），framework 从 12→16 测试
+- **验证**: 全量 213 测试(gorgec 119 + gorge_core 72 + framework 16 + macros 6)，全绿零 warning
+
 ### Phase E 完成 (2026-07-10)：类型推导 + 转换规则 + cast + 重载解析（T2/T7/T8）
 - **E1 类型推导器** (`codegen.rs`): `infer_type(&Expression)->TypeInfo` 覆盖字面量/变量/字段/方法返回/new/cast/二元/一元/条件；新增 `var_types`/`field_types` 映射（compiler 注册参数类型，set_class_context 注册字段类型）；`resolve_type_ref`(TypeRef→TypeInfo)；4 单测
 - **E2 类型转换判定**: 编译期 `can_auto_cast`/`can_cast`(TypeInfo，查符号表继承链：Int→Float/Enum→Int/子类→父类/类→接口/数组协变/Delegate 协变逆变)；runtime `can_auto_cast_to`(GorgeType) 补齐 Enum→Int/数组协变/Delegate 协变逆变/null→String/接口→Object；2 单测
@@ -172,7 +334,9 @@ GlobalScope → NamespaceScope (N层) → ClassScope/InterfaceScope/EnumScope
 - **测试统计**: 主 workspace 182(gorgec 110 + gorge_core 72)、框架 12(gorge_framework 6 + gorge_macros 6)，全绿零 warning
 - **后续**: 见 `reports/csharp-parity-plan.md`，下一步 Phase F（接口方法映射 F1、native 被继承 F2）
 
-### Phase D 完成 (2026-07-10)：break/continue 多层/按类型离块（T1）
+### Phase D (2026-07-10)：break/continue 多层/按类型离块（T1）—— ⚠ 此记录不准确，见文末「Phase D 修正 (2026-07-14)」
+> 实际：2026-07-10 只完成了 parser 部分，codegen 回填从未实现（Break/Continue 仅发 Nop），
+> 真正落地在 2026-07-14 的 P0 修复。以下内容当时为「计划」而非「已完成」。
 - **parser** (`parser.rs`): `parse_break_targets` 解析 break/continue 后目标序列——整数→`ByLayer(n)`、for/while/switch/do/if/else 关键字→`ByKeyword`；空默认 `[ByLayer(1)]`
 - **codegen** (`codegen.rs`):
   - 新增 `BlockKind`(For/While/DoWhile/Switch/If/Else) + `PendingLeave`(占位Jump+目标队列VecDeque+is_break) + `BlockCtx`
@@ -331,6 +495,100 @@ GlobalScope → NamespaceScope (N层) → ClassScope/InterfaceScope/EnumScope
 7. 操作码: C# 版有 Load/SetParameter、GetReturn、CastToString、InvokeArrayConstructor 等, Rust 版部分缺失
 8. 优化器: Rust 版实现了基本块+简化 DCE, 缺少全局 CSE(公共子表达式消除)和 DAG 副作用分析
 
+## Phase D 修正 + P0 修复 (2026-07-14)：break/continue 真正落地 + VM 非 Int 返回值
+
+> **⚠ 重要修正**：此前 MEMORY.md 记录「Phase D 完成 (2026-07-10)」，但实际 codegen.rs 中
+> `emit_leave`/`backpatch_block` **从未实现**，`Statement::Break/Continue` 仅发 `Nop`，块生成
+> 也未维护块上下文——即 Phase D **实际未完成**。本次基于 C# 参考实现真正落地。
+
+### 三模块对比结论（详见对话，reports 待更新）
+- **GorgeCompiler**: 主要缺口为 break/continue(已修)、StringAddition/FloatMod codegen 未发射、静态字段未区分、注解 metadata 不求值、编译诊断种类不足(20+ 仅约 8)、优化器缺 DAG 局部 CSE
+- **GorgeCore**: 操作码 C# 106/Rust 实现 ~98；InvokeInstance/Static 非 Int 返回值丢失(已修)、InvokeInjectorConstructor 未设 injector 上下文、注入器缺 Instantiate/EditableEquals/CloneTo、IntToString/BoolToInt 等 IR 有定义无 VM 实现
+- **GorgeFramework**: C# 66 个 native 类，Rust 仅注册 10 个(~15%)；~18 个 Rust struct 未注册为 native；Priority/PeriodConfig/ColorArgb/Random 与 C# 字段语义不一致；Chart/Signal/Simulators/Stage/Runtime/Adaptor/Automaton 基础设施 0% 移植；桥接宏缺注入器构造/类注解/枚举/接口/委托字段/虚方法/继承
+
+### P0-1 break/continue codegen 回填（`codegen.rs`）
+- `emit_leave(is_break, targets, span)`: 发占位 `Jump(0)` 并登记 `PendingLeave{code_index, targets队列VecDeque, is_break, done}`
+- `backpatch_block(kind, is_else, break_index, continue_index, since, until)`: 对 `pending_leaves[since..until]` 区间尝试回填——`ByLayer(n)` 每经一块减 1、减到 0 命中；`ByKeyword(k)` 块类型(含 else 判定)匹配才消解、否则跳过等外层；队清空后 break→break_index、continue→continue_index(无续点块退化为块尾)。用 `since/until` 区间隔离兄弟块(if 的 then/else 分别用 is_else=false/true 各自区间)
+- `keyword_matches_block`: for/while/do/switch 按种类；else 匹配 is_else；if 匹配非 else 的 If 块
+- 5 处块生成接入：while(break→end/continue→loop_start)、for(break→end/continue→update段)、do-while(break→end/continue→cond)、switch(break→块尾/continue 透传)、if-else(仅计层，落点块尾，continue=None)
+- `Statement::Break/Continue` 改为调用 `emit_leave`；`report_unresolved_leaves` 已在 compiler.rs 1203/1294 调用
+- **if/else 计入层数**（对齐 C#，用户确认）：plain `break` 被最内 if 捕获
+- 端到端 `examples/break_continue.g`：break while=10、continue while=8、break 3 跨层=76、switch 内 break while=100（全部正确）
+
+### P0-2 VM InvokeInstance/InvokeStatic 非 Int 返回值（`vm.rs`）
+- 此前两者只写回 `return_int`，Float/Bool/String/Object 返回值全部丢失
+- 改为按 `result.value_type` 分别写回 5 类返回寄存器（对齐已正确的 InvokeInterface 1395-1417）
+- 栈恢复对 float/bool/string 也加 `Some(i) != result_index` 保护；InvokeStatic 补 saved_objects 保存/恢复
+- 端到端 `examples/return_types.g`：float 实例方法返回 2.5（此前丢失，现正确）
+
+### 本次发现并已修复的 2 个既有 bug
+1. **比较运算结果类型错误**(`codegen.rs` generate_binary)：`a > b` 等比较运算的 result temp 曾用操作数类型 `vt`(如 Float)分配，但比较结果应为 Bool → `FloatGreater` 写 bool 结果进 float 槽，Return 读错槽。**已修**：新增 `result_vt` 判定，比较/相等/逻辑运算结果 temp 恒用 `ValueType::Bool`，算术运算沿用操作数类型
+2. **`Type v = new T(...)` 未登记 var_class**(`codegen.rs` VariableDeclaration)：局部变量经 `new` 初始化时类名未记录，导致 `v.method()` 回退 `InvokeInstance(0)` 恒调用方法索引 0（overload.g 侥幸通过）。**已修**：声明有初始化器时解析变量 TypeInfo（显式类型优先 `resolve_type_ref`，`auto`/未解析用 `infer_type(init)`），为类则 `register_var_class`+`register_var_type`
+
+### 验收
+- 主 workspace 215(gorgec 135 + gorge_core 80)、框架 48+6+其他，全绿；主 workspace(GorgeCompiler+gorge_core) 零 warning
+- gorgec 新增 8 break/continue + 3 类型修复 codegen 单测（共 11）；gorge_core 新增 1 float 实例返回 VM 单测
+- 端到端 `examples/return_types.g`：`b.getValue()`=2.5(float)、`b.isPositive()`=true/false(bool 比较结果)全部正确
+
+### P1 算术运算完整对齐 C# (2026-07-14 后续)
+- **generate_binary 重写**(`codegen.rs`)：对齐 C# 三级运算符语义（Addition/Calculate/Comparison/Equality）
+  - 加法 `+`：int+int=int；含 float→float；含 string→string（另一操作数 int/float/bool 自动 cast 成 string）
+  - 减乘除模 `- * / %`：int+int=int；否则 float（操作数 int→float 提升）
+  - 比较 `< > <= >=`：结果恒 bool；运算类型 int+int=int 否则 float
+  - 相等 `== !=`：结果恒 bool；运算类型取可互转类型（int↔float 提升，其余需同类型）
+  - 逻辑 `&& ||`：结果恒 bool；操作数须 bool
+  - 非法类型组合报编译错误（对齐 `ExpressionOperandWrongTypeException`）
+- **新增 `emit_cast_operand`**(`codegen.rs`)：操作数隐式类型提升辅助（Int→Float / Int/Float/Bool→String），从 generate_cast 提取
+- **补齐 StringAddition/FloatMod 发射**：此前 `+` 字符串恒发 IntAdd、`%` 恒发 IntMod（运行时早已支持这两个操作码，仅 codegen 未发射）
+- **runner 增强**(`GorgeRunner/main.rs`)：新增 string 返回值打印；**gorge_core 新增 `get_return_string()` 访问器**(`vm.rs`)
+- **端到端** `examples/arithmetic.g`：int+float=3.5、"count="+42="count=42"、5.5%2.0=1.5、7%3=1、1==1.0=true、3<3.5=true 全部正确
+- **测试**：gorgec 新增 8 单测（int+float 提升/int+string 拼接/string+bool 拼接/float%/int%/int==float/int<float/非法组合报错）；主 workspace 223(gorgec 143 + gorge_core 80)全绿，修改 crate 零 warning
+- **⚠ 遗留**：generate_binary 现按操作数值类型(int/float/string/bool)分类，未处理 Enum→Int、Object 相等的完整继承判定等边角；逻辑运算 C# 无短路，Rust 一致
+
+### P1 编译诊断补全 (2026-07-14 后续)：switch 类型 + 参数数量
+- **switch 条件/case 类型校验**(`codegen.rs` generate_switch)：
+  - switch 条件类型必须为 int/float/bool/string，否则报错（对齐 C# `UnexpectedSwitchConditionException`/SwitchBlock）
+  - 各 case 值类型须与 switch 类型兼容（相同或 int→float 提升），不兼容报错；case 值按需 `emit_cast_operand` 提升后再比较
+- **方法参数数量校验**(`codegen.rs` `check_method_arg_count`)：沿继承链查同名方法（按静态/实例过滤），若存在同名但无任何重载 arity 匹配，报"参数数量错误，期望 N 个，实际 M 个"（对齐 C# `UnexpectedParameterCountException`）。接入静态调用 `ClassName.method()` 与 `变量.method()` 两处；有匹配重载时不误报
+- **⚠ 未做（不可达/规则不明）**：多重继承检测（Rust `super_class: Option<TypeRef>` 语法结构上只允许单父类，无法表达 `class A : B, C`）；修饰符冲突（C# `ModifierConflictException` 定义了但无实际触发规则，三修饰符 Native/Static/Injector 冲突关系不明确，避免臆造跳过）
+- **测试**：gorgec 新增 4 单测（switch int 合法/switch 不兼容 case 报错/switch int→float 提升合法/静态方法参数数量不匹配报错）；主 workspace 227(gorgec 147 + gorge_core 80)全绿，修改 crate 零 warning
+- **端到端验证**：`Program.Make(1,2)` 调 `Make(int)` → "方法 `Make` 参数数量错误，期望 1 个，实际 2 个"；break_continue.g(switch)、overload.g(合法重载不误报) 回归通过
+
+### 注入器主线补全 (2026-07-14 后续)：EditableEquals / EditableHash / CloneTo + VM 加固
+
+- **`RuntimeInjector` 新增**(`injector.rs`)：
+  - `editable_equals_values(other)`：类名+各值类型字段(Int/Float/Bool/String)的 default-marker 与值比较（对齐 C# `Injector.EditableEquals`）
+  - `hash_values(state)`：混入类名和各值类型字段（默认值→`true`，否则混入实际值；对齐 C# `Injector.EditableHashCode`）
+  - `clone_to(target)`：完整拷贝字段值和 default-marker（对齐 `CompiledInjector.Clone` 字段复制语义）
+  - 暴露字段计数/object 字段访问器（`object_field_count()`、`object_field(index)` 等）供 VM 递归
+
+- **VM 层递归**(`vm.rs`)：
+  - `editable_equals_objects(a_id, b_id)`：逐类型分派——注入器→递归（值类型字段+object 字段逐一递归）；原生列表(Int/Float/Bool/String/ObjectList)→逐元素比，ObjectList 元素递归；其余→ID 相等。双空相等、单空不等
+  - `editable_hash_code_object(id)`：注入器→递归哈希值类型字段+object 字段；列表→哈希元素(ObjectList 递归)；其余→哈希 ID。保证 `editable_equals` 相等对象哈希相同
+  - 对齐 C# `GorgeObject.EditableEquals/EditableHashCode` 完整语义，**无 TODO**
+
+- **`InvokeInjectorConstructor` 加固**(`vm.rs`)：构造前从 `code.left` 读注入器 ID 设 `current_injector`，构造后恢复，消隐患对齐 C# `InvokeParameterPool.Injector = this`
+
+- **测试**：injector.rs 新增 5 单测（editable_equals_values 相同/default 差/值差、hash 一致性、clone_to 字段+marker）；vm.rs 新增 4 单测（平面注入器比较、嵌套注入器递归、ObjectList 递归、hash 一致性）；主 workspace 236(gorgec 147 + gorge_core 89)全绿，修改 crate 零 warning
+
+- **⚠ 注**：injector_ctor.g `new Vector2(0,0):{x:3,y:4} → get_x()=0` 是**预存 bug**（native 构造的注入器字段覆写路径未打通，与本次注入器 API 无关）。正确的注入器构造参见 Gorge 语言规范
+
+### native 类注入器字段覆写 (2026-07-14 后续)：宏自动生成 FieldInitialize
+- **根因澄清**：原 injector_ctor.g `get_x()=0` 并非纯 bug——C# 注入器构造 `Vector2(Injector,x,y)` 先 `FieldInitialize(injector)` 再用参数覆盖，故带显式参数 (0,0) 时 x=0 是正确语义。真正缺失的是 native 构造完全无视注入器（连 FieldInitialize 都没有）
+- **`NativeContext` 扩展**(`native.rs`)：新增 `injectors: &HashMap<usize, RuntimeInjector>` + `current_injector: usize` 字段；`with_injector(...)` 构造器；`injector_float/int/bool/string/object(inj_index) -> Option<T>`（注入器存在且该字段非默认→Some，否则 None 供回退默认值）；`new(...)` 用静态 `EMPTY_INJECTORS`（LazyLock）保持兼容
+- **VM 传递**(`vm.rs`)：`dispatch_native_construct` 改用 `NativeContext::with_injector`，传入 `&self.injectors` 与 `current_injector`（不同字段借用无冲突）
+- **宏自动生成**(`class_macro.rs`)：新增 `build_field_initialize` 生成 `gorge_field_initialize(ctx, this)`——对每个既是 `#[gorge_field]` 又是 `#[inject]` 的同名字段，配对(对象字段索引, 注入器字段索引, 默认值)，`ctx.injector_xxx(注入器索引)` 有值则写对象字段，否则回退 `gorge_injector_default_<name>()` 或 `Default`；无注入器字段的类生成空方法（保证构造入口可无条件调用）
+- **构造入口调用**(`impl_macro.rs`)：`do_construct_native` 在执行用户构造体前先调 `gorge_field_initialize(ctx, this)`（对齐 C# 构造先 FieldInitialize 再设参数）
+- **测试**：gorge_macros 新增 1 集成测试（`test_vector2_field_initialize_applies_injector_override`：注入器 x 覆写 7.0、y 默认 0.0，验证 field_initialize 应用正确）；framework 48 + macros 7 全绿；主 workspace 236(gorgec 147 + gorge_core 89)全绿；修改 crate 零 warning
+- **示例注释修正**：injector_ctor.g 说明「参数覆盖注入器」的 C# 语义
+
+### 静态字段处理 (2026-07-14 后续)：禁止字段修饰符（对齐 C# 语法）
+- **核实结论**：Gorge 语法 `fieldDeclaration : annotation* expression Identifier ('=' expression)? ';'` **不含修饰符**——字段不能 static/native，只有方法可 static。故 `LoadStaticXxxField`/`SetStaticXxxField` 系列 IR 是**死代码**（无合法 .g 程序能声明静态字段），无需实现静态字段存储
+- **parser 加固**(`parser.rs` `parse_field_declaration`)：字段声明检测到任何修饰符即报编译错误「字段不允许修饰符」（对齐 C# 语法；此前 Rust parser 因字段/方法共用 `parse_modifiers` 而过度宽松地接受 `static float x;`）
+- **IR 注释**(`ir.rs`)：给 `Load/SetStaticXxxField` 系列加说明——Gorge 无静态字段，预留操作码，codegen 不发射/VM 不实现
+- **测试**：gorgec 新增 2 单测（static 字段被拒 / 普通字段正常）；主 workspace 238(gorgec 149 + gorge_core 89)全绿，零 warning
+- **回归**：14 个 example 中 13 个编译通过；`inject_annotation.g` 失败是**预存的 @Inject 自动派生注入器字段未实现**（T17），与本次无关
+
 ## 关键决策
 1. **框架选型**: Logos + 手写递归下降 + 自定义 IR/VM
 2. **Crate 划分**: GorgeCore = 运行时 + 共享; GorgeCompiler = 编译器前端
@@ -339,3 +597,63 @@ GlobalScope → NamespaceScope (N层) → ClassScope/InterfaceScope/EnumScope
 5. **符号表设计**: Arena + newtype ID, Scope 树嵌套查找
 6. **VM 设计**: 类型分离栈, 帧管理由调用者控制
 7. **字节码格式**: 自定义二进制格式（Magic "GORG" + Version + 数据体），v1 仅含方法列表，v2 扩展支持类元数据（类名/is_native/字段计数/父类/接口/方法）
+
+### P2 补完 (2026-07-14 后续)：T19 委托调用路径 + T23 冻结守卫 + T18 注解常量扩展
+- **T19 委托调用路径 Bug**(`codegen.rs`)：
+  - `generate_method_call` 委托分支：原只处理 Int/Float 参数（Bool/String/Object 静默跳过）、返回值硬编码 Int → 改用 `emit_set_param` 全类型 + 按 `delegate_impls[idx].return_type` 分配返回值
+  - `generate_delegate_call`：同理修复返回类型硬编码
+- **T23 冻结守卫**(`symbol.rs` + `compiler.rs`)：
+  - `ClassInfo` 新增 `check_declaration_not_frozen()`/`check_inheritance_not_frozen()`（对齐 C# `EnsureDeclarationNotFreeze`/`EnsureInheritanceNotFreeze`）
+  - Pass 2 继承修改前检查 `inheritance_frozen`；Pass 3 成员声明前检查 `declaration_frozen`；`freeze_inheritance` 前置条件检查所有非 native 类 declaration_frozen
+- **T18 注解常量求值扩展**(`compiler.rs` `eval_metadata_const`)：
+  - 从仅支持 4 种字面量扩展至二元算术（`+ - * / %`，含 int↔float 混合提升与除零安全）和一元运算（`Negate`/`Not`）
+  - 新增 `eval_binary_const`/`eval_unary_const` 辅助函数
+- **测试**：gorgec 新增 3 单测（T23 freeze 前置、T18 算术/取反/逻辑非/除零）；主 workspace 240(gorgec 151 + gorge_core 89)全绿，零 warning
+
+### P2 优化器 DCE/CSE 修复 + 泛型实例化 (2026-07-14 后续)
+- **T21 优化器修复**(`optimizer.rs`)：
+  - **DCE 实际生效**：`dead_code_elimination` 原计算了 `dead_indices` 但用 `let _ = dead_indices` 丢弃——改为返回 `HashSet<usize>`，`optimize_once` 捕获后传递给 `rebuild_code_list(new param)`，重建时过滤死代码
+  - **CSE 集成到 pipeline**：`optimize()` 每轮迭代调用 `optimize_once`(DCE) 后再调用 `global_cse`(CSE)（此前 global_cse 独立于 optimize pipeline）
+  - **修复 global_cse** 过于严格的前置条件（`codes.len() < 2` 直接返回，改为仅判空）
+- **T6 泛型实例化**(`codegen.rs`)：
+  - 新增 `generic_substitutions: HashMap<String, TypeInfo>` 字段与 `set_generic_substitutions()` 方法
+  - `resolve_type_ref` 遇到泛型参数名时先查替换映射，命中返回具体类型（如 T→Int），未命中回退 GenericParam
+  - `type_to_value_type` 显式处理 `GenericParam`/`GenericInstance`（字段偏移保持 Object）
+- **测试**：gorgec 新增 3 单测（DCE 消除未使用变量、CSE 集成减少重复 IntAdd、T6 替换/无替换）；主 workspace 244(gorgec 155 + gorge_core 89)全绿，零 warning
+
+### P3 Phase 1 — 纯数据类 native 注册 (2026-07-14 启动)
+- **Graph** (`resource.rs`)：width/height int 字段 + `#[gorge_ctor]` 构造，注册为 `GorgeFramework.Graph` native 类
+- **Audio/Video/Asset**：纯标记类型（无业务字段/方法），保留为 Rust struct 暂不注册 native（宏对零参构造支持有限，且 Gorge 代码无需调用这些类的构造/方法）
+- **测试**：framework 新增 Graph 构造单测（640×480 字段验证）；framework 48→50 tests
+- **⚠ 待续**：Phase 1 还有 ~12 个候选类（ElementLinePoint/ElementLine/Logger/HistoryStack 等）可继续注册。下一批建议 ElementLinePoint/ElementLine（纯数据，已有 struct）或 Logger（纯静态方法，类似 Math）
+
+### P3 Phase 1 续：Element/Command/Logger 类注册完成 (2026-07-14)
+- **ElementLinePoint** (`element.rs`)：time/position/width 3 个 float 字段 + `#[gorge_ctor]`，已注册
+- **ElementLine** (`element.rs`)：color_r/g/b/a 4 个 int 字段（展开原 tuple），已注册（points Vec 无法作为 Gorge 字段，保留为内部 Rust 类型）
+- **Logger** (`logger.rs`)：纯静态方法（log_int/log_float/log_string），类似 Math，已注册
+- **3 个 Automaton 指令** (`commands.rs`)：AppendSignalCommand(signal_id/priority int)、DeriveElementCommand(element_spec int)、DestroyElementCommand(target_type int)，已注册
+- **Element/Note** 保留为内部 Rust 类型（含 Node/ElementSimulator 抽象层，不适合 native 类注册）
+- **Audio/Video/Asset** 保留为内部 Rust 类型（纯标记，零字段无实际 Gorge 调用场景）
+- **测试**：framework 新增 6 单测（Graph/ElementLinePoint/ElementLine/Logger 构造验证 + 注册登记）；framework 48→54 tests
+- **总计 Phase 1**：新增 7 个 native 类（Graph + ElementLinePoint + ElementLine + Logger + 3 Commands），native 类总数从 11 增至 **18** 个
+- **待续 Phase 2**：函数曲线族（~14 个，已有 Rust struct/trait，需适配宏）
+
+### P3 Phase 2 — 函数曲线族注册 (2026-07-14)
+- **注册 5 个简单字段曲线为 native**（`function_curve.rs`）：
+  - `ConstantFunctionCurve` (value float) / `LinearFunctionCurve` (k,b float) / `QuadraticFunctionCurve` (a,b,c float) / `LinearCurve` (time_start/end/value_start/end float) / `ArcFunctionCurve` (chord_start/end/angle float)
+  - 各含 `#[gorge_ctor]` 构造 + `#[gorge_method]` evaluate(x) 实例方法（通过 ctx 字段读写）
+  - `FunctionCurve` trait 保留为内部 Rust 接口
+- **保留 9 个组合器/复杂曲线为 Rust 类型**：`CompositeFunctionCurve`/`AdditionFunctionCurve`/`MultiplicationFunctionCurve`/`PeriodicFunctionCurve`/`AxialSymmetricFunctionCurve`/`FunctionPiece`/`PiecewiseFunctionCurve`/`CubicHermiteSpline`/`VariableFloat`——含 `Box<dyn FunctionCurve>` trait 对象字段，不可作 Gorge 字段
+- **颜色曲线**：`ColorCurve` trait + `LerpColorCurve` 保留为内部类型
+- **测试**：framework 新增 constant/linear curve evaluate 单测；framework 47 + macros 7 全绿
+- **native 类总数**：从 18 → **23** 个（+5 曲线）
+- **待续 Phase 3**：需宏扩展（枚举/委托支持）后才能注册信号过滤器族、自动机族
+
+### P3 Phase 2 收尾 + Phase 3 信号过滤器 (2026-07-14)
+- **CubicHermiteSpline** (`function_curve.rs`)：8 个 float 字段注册为 native，含 evaluate 实例方法
+- **TimeItem** (`time.rs`)：time(f32)/accept(bool)/respond_mode(String) 注册为 native；TimeStack 保留内部类型
+- **FloatSignalFilter** (`signal_filter.rs`)：7 个字段注册（枚举 time_mode→i32），含 can_detect/detect 实例方法。**枚举 as i32 模式验证可行**
+- **InputGraphEdge** (`input_graph.rs`)：6 个简单字段（bool/int/String）注册
+- **总计 P3 新增**：16 个 native 类（Phase 1: 7 + Phase 2: 5 + 收尾: 4），native 类总数从 11 → **27** 个
+- **剩余**：SignalTsiga/HistoryStack/InputGraph 等含 HashMap/Vec/闭包字段，需更多重构才能注册；~12 个含 Box<dyn> 字段的函数曲线不可注册
+- **测试**：全量主 workspace 298（gorgec 155 + gorge_core 89 + framework 47 + macros 7）全绿，零 warning

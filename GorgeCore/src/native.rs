@@ -6,6 +6,10 @@ use crate::object::{GorgeObject, RuntimeObject};
 use crate::param_pool::InvokeParameterPool;
 use crate::types::TypeCount;
 
+/// 空注入器表，供无注入器上下文的 `NativeContext::new` 借用（避免 Option 分支）。
+static EMPTY_INJECTORS: std::sync::LazyLock<HashMap<usize, crate::injector::RuntimeInjector>> =
+    std::sync::LazyLock::new(HashMap::new);
+
 /// Native 方法执行上下文
 ///
 /// 对应 C# 中 native 桥接层通过全局静态 `InvokeParameterPool` 与虚拟机通信的机制。
@@ -27,6 +31,12 @@ pub struct NativeContext<'a> {
     pub objects: &'a mut HashMap<usize, RuntimeObject>,
     /// 对象 ID 分配器（下一个可用 ID）
     pub next_object_id: &'a mut usize,
+    /// 原生集合对象载荷表（Phase H）：对象 ID → 类型的 Rust 数据
+    pub native_payloads: &'a mut HashMap<usize, Box<dyn std::any::Any>>,
+    /// 注入器对象表：注入器 ID → RuntimeInjector（供 native 构造读取注入器字段）
+    pub injectors: &'a HashMap<usize, crate::injector::RuntimeInjector>,
+    /// 当前注入器对象 ID（0 表示无，对应 C# `InvokeParameterPool.Injector`）
+    pub current_injector: usize,
 }
 
 impl<'a> NativeContext<'a> {
@@ -35,11 +45,34 @@ impl<'a> NativeContext<'a> {
         param_pool: &'a InvokeParameterPool,
         objects: &'a mut HashMap<usize, RuntimeObject>,
         next_object_id: &'a mut usize,
+        native_payloads: &'a mut HashMap<usize, Box<dyn std::any::Any>>,
     ) -> Self {
         Self {
             param_pool,
             objects,
             next_object_id,
+            native_payloads,
+            injectors: &EMPTY_INJECTORS,
+            current_injector: 0,
+        }
+    }
+
+    /// 创建带注入器上下文的上下文（用于 native 构造读取注入器字段覆写）
+    pub fn with_injector(
+        param_pool: &'a InvokeParameterPool,
+        objects: &'a mut HashMap<usize, RuntimeObject>,
+        next_object_id: &'a mut usize,
+        native_payloads: &'a mut HashMap<usize, Box<dyn std::any::Any>>,
+        injectors: &'a HashMap<usize, crate::injector::RuntimeInjector>,
+        current_injector: usize,
+    ) -> Self {
+        Self {
+            param_pool,
+            objects,
+            next_object_id,
+            native_payloads,
+            injectors,
+            current_injector,
         }
     }
 
@@ -73,6 +106,67 @@ impl<'a> NativeContext<'a> {
     /// 读取注入器专用位（注入器对象 ID，0 表示无）
     pub fn get_injector(&self) -> usize {
         self.param_pool.get_injector()
+    }
+
+    // ==================== 注入器字段读取（native 构造用） ====================
+    //
+    // 用于 native 类构造时应用注入器字段覆写（对齐 C# `FieldInitialize(injector)`）。
+    // 每个方法返回 `Some(值)` 当且仅当：存在当前注入器，且该注入器对应类型字段
+    // 未使用默认值标记（即被显式赋值）；否则返回 `None`，调用方应回退到字段默认值。
+
+    /// 读取当前注入器的 float 字段值（`inj_index` 为该字段在 float 分组内的索引）。
+    pub fn injector_float(&self, inj_index: usize) -> Option<f64> {
+        use crate::injector::Injector;
+        let inj = self.injectors.get(&self.current_injector)?;
+        if inj_index >= inj.float_field_count() || inj.get_injector_float_default_value(inj_index) {
+            None
+        } else {
+            Some(inj.get_injector_float(inj_index))
+        }
+    }
+
+    /// 读取当前注入器的 int 字段值。
+    pub fn injector_int(&self, inj_index: usize) -> Option<i64> {
+        use crate::injector::Injector;
+        let inj = self.injectors.get(&self.current_injector)?;
+        if inj_index >= inj.int_field_count() || inj.get_injector_int_default_value(inj_index) {
+            None
+        } else {
+            Some(inj.get_injector_int(inj_index))
+        }
+    }
+
+    /// 读取当前注入器的 bool 字段值。
+    pub fn injector_bool(&self, inj_index: usize) -> Option<bool> {
+        use crate::injector::Injector;
+        let inj = self.injectors.get(&self.current_injector)?;
+        if inj_index >= inj.bool_field_count() || inj.get_injector_bool_default_value(inj_index) {
+            None
+        } else {
+            Some(inj.get_injector_bool(inj_index))
+        }
+    }
+
+    /// 读取当前注入器的 string 字段值。
+    pub fn injector_string(&self, inj_index: usize) -> Option<String> {
+        use crate::injector::Injector;
+        let inj = self.injectors.get(&self.current_injector)?;
+        if inj_index >= inj.string_field_count() || inj.get_injector_string_default_value(inj_index) {
+            None
+        } else {
+            Some(inj.get_injector_string(inj_index))
+        }
+    }
+
+    /// 读取当前注入器的 object 字段值（对象 ID）。
+    pub fn injector_object(&self, inj_index: usize) -> Option<usize> {
+        use crate::injector::Injector;
+        let inj = self.injectors.get(&self.current_injector)?;
+        if inj_index >= inj.object_field_count() || inj.get_injector_object_default_value(inj_index) {
+            None
+        } else {
+            Some(inj.get_injector_object(inj_index))
+        }
     }
 
     // ==================== 返回值写入 ====================
@@ -304,7 +398,8 @@ mod tests {
         };
 
         {
-            let mut ctx = NativeContext::new(&pool, &mut objects, &mut next_id);
+            let mut native_payloads: HashMap<usize, Box<dyn std::any::Any>> = HashMap::new();
+            let mut ctx = NativeContext::new(&pool, &mut objects, &mut next_id, &mut native_payloads);
             cls.invoke_native_static(&mut ctx, 0);
         }
 
@@ -323,7 +418,8 @@ mod tests {
         };
 
         let obj_id = {
-            let mut ctx = NativeContext::new(&pool, &mut objects, &mut next_id);
+            let mut native_payloads: HashMap<usize, Box<dyn std::any::Any>> = HashMap::new();
+            let mut ctx = NativeContext::new(&pool, &mut objects, &mut next_id, &mut native_payloads);
             cls.do_construct_native(&mut ctx, None, 0)
         };
 
