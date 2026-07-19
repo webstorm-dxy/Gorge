@@ -8,3 +8,6 @@ gorge_core = { path = "../../GorgeCore" }
 gorge_macros = { path = "../GorgeMacros" }
 rand = "0.8"
 glam = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = "2"

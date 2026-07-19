@@ -1,34 +1,43 @@
-mod ast;
-mod codegen;
+mod compile_context;
 mod compiler;
-mod highlight;
-mod lexer;
+mod frontend;
+mod highlighting;
 mod optimizer;
-mod parser;
-mod progress;
-mod symbol;
+mod progress_merger;
+mod visitors;
 
 use std::env;
 use std::fs;
 use std::path::Path;
 
 use compiler::Compiler;
-use crate::symbol::{SymbolTable, ScopeId, SymbolEntry};
-use gorge_core::bytecode::{CompiledModule, CompiledClass};
-use gorge_core::types::{GorgeType, TypeCount};
+use crate::compile_context::symbol::{SymbolTable, ScopeId, SymbolEntry};
+use crate::progress_merger::progress::ConsolePercentageReporter;
+use gorge_core::objective::bytecode::{CompiledModule, CompiledClass};
+use gorge_core::objective::types::{GorgeType, TypeCount};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("用法: gorgec <输入文件.g> [-o <输出文件.gorge>]");
+        eprintln!("用法: gorgec <输入文件.g> [-o <输出文件.gorge>] [--progress]");
         eprintln!("示例: gorgec program.g -o program.gorge");
+        eprintln!("选项: --progress  显示编译进度百分比");
         std::process::exit(1);
     }
 
-    let input_path = &args[1];
-    let output_path = if args.len() >= 4 && args[2] == "-o" {
-        args[3].clone()
+    // 解析 --progress 标志（位置无关）
+    let show_progress = args.iter().any(|a| a == "--progress");
+    let filtered_args: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--progress").collect();
+
+    if filtered_args.is_empty() {
+        eprintln!("错误：需要输入文件");
+        std::process::exit(1);
+    }
+
+    let input_path = filtered_args[0];
+    let output_path = if filtered_args.len() >= 3 && filtered_args[1] == "-o" {
+        filtered_args[2].clone()
     } else {
         // 默认输出：替换 .g 为 .gorge
         Path::new(input_path)
@@ -46,7 +55,7 @@ fn main() {
     };
 
     // 词法分析
-    let (tokens, lexer_diags) = lexer::tokenize(&source, 0);
+    let (tokens, lexer_diags) = crate::frontend::lexer::tokenize(&source, 0);
     if !lexer_diags.is_empty() {
         eprintln!("词法错误:");
         let mut d = gorge_core::diagnostics::Diagnostics::new();
@@ -59,7 +68,7 @@ fn main() {
     }
 
     // 语法分析
-    let mut parser = parser::Parser::new(tokens);
+    let mut parser = crate::frontend::parser::Parser::new(tokens);
     let source_file = match parser.parse_source_file() {
         Ok(ast) => ast,
         Err(diags) => {
@@ -72,6 +81,9 @@ fn main() {
 
     // 编译
     let mut compiler = Compiler::new();
+    if show_progress {
+        compiler.progress_reporter = Box::new(ConsolePercentageReporter);
+    }
     if compiler.compile(&[source_file]).is_err() {
         eprintln!("编译错误:");
         let sources: Vec<&str> = vec![&source];
@@ -80,17 +92,17 @@ fn main() {
     }
 
     // 优化 + 收集编译方法（保留所属类 ID 与是否构造，供精确归属）
-    let mut methods: Vec<gorge_core::ir::CompiledMethod> = Vec::new();
-    let mut method_meta: Vec<(Option<crate::symbol::ClassId>, bool)> = Vec::new();
+    let mut methods: Vec<gorge_core::virtual_machine::ir::CompiledMethod> = Vec::new();
+    let mut method_meta: Vec<(Option<crate::compile_context::symbol::ClassId>, bool)> = Vec::new();
     for compiled in &compiler.compiled_methods {
-        let optimized = optimizer::IntermediateCodeOptimizer::optimize(&compiled.codes);
+        let optimized = crate::optimizer::optimizer::IntermediateCodeOptimizer::optimize(&compiled.codes);
         if std::env::var("GORGE_DUMP_IR").is_ok() {
             eprintln!("=== {} ===", compiled.name);
             for (i, c) in optimized.iter().enumerate() {
                 eprintln!("  {:3}: {:?} L={:?} R={:?} => {:?}", i, c.code.operator, c.code.left, c.code.right, c.code.result);
             }
         }
-        methods.push(gorge_core::ir::CompiledMethod {
+        methods.push(gorge_core::virtual_machine::ir::CompiledMethod {
             name: compiled.name.clone(),
             codes: optimized,
             local_count: compiled.total_locals,
@@ -106,7 +118,7 @@ fn main() {
     for class in &mut classes {
         let key = &class.class_type.name();
         if let Some(fields) = compiler.injector_fields.get(key) {
-            class.injector_fields = fields.iter().map(|f| gorge_core::bytecode::InjectorFieldDef {
+            class.injector_fields = fields.iter().map(|f| gorge_core::objective::bytecode::InjectorFieldDef {
                 name: f.name.clone(), value_type: f.value_type, has_default: f.has_default,
                 default_value: f.default_value.clone(),
             }).collect();
@@ -121,11 +133,42 @@ fn main() {
         }
     }
 
+    // B-5: 按类分发注入器构造方法实现映射
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(impl_ids) = compiler.injector_constructor_impl_id.get(key) {
+            class.injector_constructor_impl_id = impl_ids.clone();
+        }
+    }
+
     // I-D: 按类分发委托实现
     for class in &mut classes {
         let key = &class.class_type.name();
         if let Some(&(start, end)) = compiler.class_delegate_ranges.get(key) {
             class.delegate_impls = compiler.delegate_impls[start..end].to_vec();
+        }
+    }
+
+    // S3b: 将隐藏方法按全局 ID 插入每个类的 methods 列表
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(hidden) = compiler.hidden_methods.get(key) {
+            let mut sorted: Vec<&(usize, compiler::CompiledMethodContents)> = hidden.iter().collect();
+            sorted.sort_by_key(|(gid, _)| *gid);
+            for (gid, contents) in &sorted {
+                let optimized = crate::optimizer::optimizer::IntermediateCodeOptimizer::optimize(&contents.codes);
+                // 确保 methods 容量足够容纳隐藏方法（按全局 ID 定位可能需要扩充）
+                while class.methods.len() <= *gid - class.method_start_id {
+                    class.methods.push(gorge_core::virtual_machine::ir::CompiledMethod {
+                        name: String::new(), codes: vec![], local_count: 0,
+                    });
+                }
+                class.methods.push(gorge_core::virtual_machine::ir::CompiledMethod {
+                    name: contents.name.clone(),
+                    codes: optimized,
+                    local_count: contents.total_locals,
+                });
+            }
         }
     }
 
@@ -142,6 +185,17 @@ fn main() {
         let key = &class.class_type.name();
         if let Some(anns) = compiler.class_annotations.get(key) {
             class.annotations = anns.clone();
+        }
+    }
+
+    // S3: 按类分发方法注解和构造方法注解
+    for class in &mut classes {
+        let key = &class.class_type.name();
+        if let Some(anns) = compiler.method_annotations.get(key) {
+            class.method_annotations = anns.clone();
+        }
+        if let Some(anns) = compiler.constructor_annotations.get(key) {
+            class.constructor_annotations = anns.clone();
         }
     }
 
@@ -164,14 +218,16 @@ fn main() {
             field_start_counts: [0; 5],
             interface_method_impl_id: vec![],
             injector_constants: vec![],
-                    injector_constructor_impl_id: vec![],
-                    field_initializers: vec![],
-                    annotations: vec![],
-                });
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations: std::collections::HashMap::new(),
+            constructor_annotations: std::collections::HashMap::new(),
+        });
     }
 
-    let module = CompiledModule { version: 2, classes };
-    let bytecode = match gorge_core::bytecode::serialize_module(&module) {
+    let module = CompiledModule { version: 5, classes };
+    let bytecode = match gorge_core::objective::bytecode::serialize_module(&module) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("序列化错误: {}", e);
@@ -193,8 +249,8 @@ fn collect_classes(
     st: &SymbolTable,
     scope_id: ScopeId,
     classes: &mut Vec<CompiledClass>,
-    all_methods: &[gorge_core::ir::CompiledMethod],
-    method_meta: &[(Option<crate::symbol::ClassId>, bool)],
+    all_methods: &[gorge_core::virtual_machine::ir::CompiledMethod],
+    method_meta: &[(Option<crate::compile_context::symbol::ClassId>, bool)],
 ) {
     let scope = &st.scopes.get(scope_id.0);
 
@@ -205,7 +261,7 @@ fn collect_classes(
                 // 按声明顺序收集本类的编译方法实现。
                 // all_methods 中属于本类的非构造方法按生成顺序（= 声明顺序）排列，
                 // 与 info.methods 的声明顺序一致，故按顺序一一对应（正确处理同名重载）。
-                let class_methods: Vec<gorge_core::ir::CompiledMethod> = all_methods
+                let class_methods: Vec<gorge_core::virtual_machine::ir::CompiledMethod> = all_methods
                     .iter()
                     .zip(method_meta.iter())
                     .filter(|(_m, (cid, is_ctor))| !*is_ctor && *cid == Some(*class_id))
@@ -213,7 +269,7 @@ fn collect_classes(
                     .collect();
 
                 // 匹配构造方法（按 class_id 精确归属）
-                let class_ctors: Vec<gorge_core::ir::CompiledMethod> = all_methods
+                let class_ctors: Vec<gorge_core::virtual_machine::ir::CompiledMethod> = all_methods
                     .iter()
                     .zip(method_meta.iter())
                     .filter(|(_m, (cid, is_ctor))| *is_ctor && *cid == Some(*class_id))
@@ -224,10 +280,10 @@ fn collect_classes(
                 for fid in &info.fields {
                     let fi = st.fields.get(fid.0);
                     match &fi.field_type {
-                        crate::symbol::TypeInfo::Int => field_counts.int_count += 1,
-                        crate::symbol::TypeInfo::Float => field_counts.float_count += 1,
-                        crate::symbol::TypeInfo::Bool => field_counts.bool_count += 1,
-                        crate::symbol::TypeInfo::String => field_counts.string_count += 1,
+                        crate::compile_context::symbol::TypeInfo::Int => field_counts.int_count += 1,
+                        crate::compile_context::symbol::TypeInfo::Float => field_counts.float_count += 1,
+                        crate::compile_context::symbol::TypeInfo::Bool => field_counts.bool_count += 1,
+                        crate::compile_context::symbol::TypeInfo::String => field_counts.string_count += 1,
                         _ => field_counts.object_count += 1,
                     }
                 }
@@ -266,6 +322,8 @@ fn collect_classes(
                     injector_constructor_impl_id: vec![],
                     field_initializers: vec![],
                     annotations: vec![],
+                    method_annotations: std::collections::HashMap::new(),
+                    constructor_annotations: std::collections::HashMap::new(),
                 });
 
                 let class_scope = info.scope_id;

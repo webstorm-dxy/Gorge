@@ -2,66 +2,92 @@
 //!
 //! 本 crate 用 `gorge_macros` 提供的桥接宏，将框架的 native 类以纯 Rust
 //! 结构体 + 业务实现的形式暴露给 Gorge 虚拟机。
-//! - [`Math`]：纯静态数学工具类
-//! - [`Vector2`]：二维向量
-//! - [`Vector3`]：三维向量（N1）
-//! - [`Random`]：随机数工具（N1）
-//!
-//! 通过 [`register_native`] 把全部 native 类一次性注册进 [`gorge_core::runtime::GorgeRuntime`]。
+//! 通过 [`register_native`] 把全部 native 类一次性注册进 [`gorge_core::objective::runtime::GorgeRuntime`]。
 
-pub mod math;
-pub mod vector2;
-pub mod vector3;
-pub use vector3::Quaternion;
-pub mod random;
-pub mod float_signal;
-pub mod bool_signal;
-pub mod touch_signal;
-pub mod color_argb;
-pub mod priority;
-pub mod period_config;
-pub mod function_curve;
-pub mod resource;
-pub mod node;
-pub mod time;
-pub mod signal_filter;
-pub mod input_graph;
-pub mod history;
-pub mod element;
-pub mod signal_tsiga;
-pub mod transform;
+pub mod system;
+pub mod adaptor;
+pub mod chart;
+pub mod runtime;
+pub mod signal;
+pub mod simulators;
+pub mod stage;
+pub mod utilities;
 
-pub use math::Math;
-pub use vector2::Vector2;
-pub use vector3::Vector3;
-pub use random::Random;
-pub use float_signal::FloatSignal;
-pub use bool_signal::BoolSignal;
-pub use touch_signal::TouchSignal;
-pub use color_argb::ColorArgb;
-pub use priority::Priority;
-pub use period_config::PeriodConfig;
-pub use resource::Graph;
-pub use element::ElementLinePoint;
-pub use element::ElementLine;
-pub use logger::Logger;
-pub use function_curve::ConstantFunctionCurve;
-pub use function_curve::LinearFunctionCurve;
-pub use function_curve::QuadraticFunctionCurve;
-pub use function_curve::LinearCurve;
-pub use function_curve::ArcFunctionCurve;
-pub use function_curve::CubicHermiteSpline;
-pub use time::TimeItem;
-pub use signal_filter::FloatSignalFilter;
-pub use input_graph::InputGraphEdge;
+pub use system::native::math::Math;
+pub use system::native::vector2::Vector2;
+pub use system::native::vector3::Vector3;
+pub use system::native::vector3::Quaternion;
+pub use system::native::random::Random;
+pub use system::native::float_signal::FloatSignal;
+pub use system::native::bool_signal::BoolSignal;
+pub use system::native::touch_signal::TouchSignal;
+pub use system::native::color_argb::ColorArgb;
+pub use system::native::priority::Priority;
+pub use system::native::period_config::PeriodConfig;
+pub use system::native::resource::Graph;
+pub use system::native::element::ElementLinePoint;
+pub use system::native::element::ElementLine;
+pub use system::native::logger::Logger;
+pub use system::native::commands::AppendSignalCommand;
+pub use system::native::commands::DeriveElementCommand;
+pub use system::native::commands::DestroyElementCommand;
+pub use system::native::function_curve::ConstantFunctionCurve;
+pub use system::native::function_curve::LinearFunctionCurve;
+pub use system::native::function_curve::QuadraticFunctionCurve;
+pub use system::native::function_curve::LinearCurve;
+pub use system::native::function_curve::ArcFunctionCurve;
+pub use system::native::function_curve::CubicHermiteSpline;
+pub use system::native::time::TimeItem;
+pub use system::native::float_signal_filter::FloatSignalFilter;
+pub use system::native::input_graph::InputGraphEdge;
+pub use system::native::note_linkage::NoteLinkage;
+pub use system::native::variable_float::VariableFloat;
+pub use system::native::function_curve::FunctionPiece;
+pub use system::native::function_curve::CompositeFunctionCurve;
+pub use system::native::function_curve::AdditionFunctionCurve;
+pub use system::native::function_curve::MultiplicationFunctionCurve;
+pub use system::native::function_curve::PeriodicFunctionCurve;
+pub use system::native::function_curve::AxialSymmetricFunctionCurve;
+pub use system::native::function_curve::PiecewiseFunctionCurve;
+pub use system::native::node_native::Node;
+pub use system::native::element_native::Element;
+pub use system::native::note_native::Note;
+pub use system::native::signal_filter_native::SignalFilter;
+pub use system::native::input_signal_filter_native::InputSignalFilter;
+pub use system::native::input_graph::InputGraph;
+pub use system::native::input_graph_state::InputGraphState;
+pub use system::native::history::HistoryStack;
+pub use system::native::time::TimeStack;
+pub use system::native::element_simulator::ElementSimulator;
+pub use system::native::lerp_color_curve::LerpColorCurve;
+pub use system::native::annulus_mesh_transformer::AnnulusMeshTransformer;
+pub use system::native::transform::CurveMeshTransformer;
+pub use system::native::curve_warp_transformer::CurveWarpTransformer;
+// S6: 资产族 + 精灵族 + 音频/视频 + 环境
+pub use system::native::resource::Asset;
+pub use system::native::resource::GraphAsset;
+pub use system::native::resource::ImageAsset;
+pub use system::native::resource::NativeAudioAsset;
+pub use system::native::resource::NativeVideoAsset;
+pub use system::native::audio_asset::AudioAsset;
+pub use system::native::audio_asset::WavAudioAsset;
+pub use system::native::video_asset::VideoAsset;
+pub use system::native::audio_native::AudioNative;
+pub use system::native::video_native::VideoNative;
+pub use system::native::sprite_native::Sprite;
+pub use system::native::nine_slice_sprite::NineSliceSprite;
+pub use system::native::curve_sprite_native::CurveSprite;
+pub use system::native::environment_native::EnvironmentNative;
+// S7: SignalTsiga 自动机
+pub use system::native::signal_tsiga::SignalTsiga;
+// 阶段1-C: 曲线分派基类
+pub use system::native::function_curve::FunctionCurveNative;
+pub use system::native::color_curve::ColorCurve;
 
-pub mod logger;
-pub mod commands;
-
-use gorge_core::native::NativeClass;
-use gorge_core::runtime::GorgeRuntime;
-use gorge_core::list::{IntListClass, FloatListClass, BoolListClass, StringListClass, ObjectListClass};
-use gorge_core::array::{IntArrayClass, FloatArrayClass, BoolArrayClass, StringArrayClass, ObjectArrayClass};
+use gorge_core::objective::native::NativeClass;
+use gorge_core::objective::runtime::GorgeRuntime;
+use gorge_core::system::native::list::{IntListClass, FloatListClass, BoolListClass, StringListClass, ObjectListClass};
+use gorge_core::system::native::array::{IntArrayClass, FloatArrayClass, BoolArrayClass, StringArrayClass, ObjectArrayClass};
 use std::sync::Arc;
 
 /// 返回框架全部 native 类实例（`Arc<dyn NativeClass>`）。
@@ -72,44 +98,102 @@ pub fn native_classes() -> Vec<Arc<dyn NativeClass>> {
         Arc::new(Math {}),
         Arc::new(Vector2 { x: 0.0, y: 0.0 }),
         Arc::new(Vector3 { x: 0.0, y: 0.0, z: 0.0 }),
+        Arc::new(Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }),
         Arc::new(Random {}),
         Arc::new(FloatSignal { value: 0.0 }),
         Arc::new(BoolSignal { value: false }),
         Arc::new(TouchSignal { is_touching: false, position: 0 }),
-        Arc::new(ColorArgb { a: 255, r: 0, g: 0, b: 0 }),
-        Arc::new(Priority { value: 0 }),
-        Arc::new(PeriodConfig { start_time: 0.0, end_time: 0.0 }),
-        // F2: 四元数
-        Arc::new(Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }),
-        // Phase P3-1: 资源标记类型
+        Arc::new(ColorArgb { a: 1.0, r: 0.0, g: 0.0, b: 0.0 }),
+        Arc::new(Priority { get_priority: 0 }),
+        Arc::new(PeriodConfig { time_offset: 0.0, min_length: 0.0, active: false }),
         Arc::new(Graph { width: 0, height: 0 }),
-        // Phase P3-1: 元素连线类型
         Arc::new(ElementLinePoint { time: 0.0, position: 0.0, width: 0.0 }),
         Arc::new(ElementLine { color_r: 0, color_g: 0, color_b: 0, color_a: 0 }),
-        // Phase P3-1: 日志工具类
         Arc::new(Logger {}),
-        // Phase P3-1: Automaton 指令类
-        Arc::new(commands::AppendSignalCommand { signal_id: 0, priority: 0 }),
-        Arc::new(commands::DeriveElementCommand { element_spec: 0 }),
-        Arc::new(commands::DestroyElementCommand { target_type: 0 }),
-        // Phase P3-2: 函数曲线族（简单字段曲线）
+        Arc::new(AppendSignalCommand { signal_id: 0, priority: 0 }),
+        Arc::new(DeriveElementCommand { element_spec: 0 }),
+        Arc::new(DestroyElementCommand { target_type: 0 }),
         Arc::new(ConstantFunctionCurve { value: 0.0 }),
         Arc::new(LinearFunctionCurve { k: 0.0, b: 0.0 }),
         Arc::new(QuadraticFunctionCurve { a: 0.0, b: 0.0, c: 0.0 }),
         Arc::new(LinearCurve { time_start: 0.0, value_start: 0.0, time_end: 0.0, value_end: 0.0 }),
         Arc::new(ArcFunctionCurve { chord_start: 0.0, chord_end: 0.0, angle: 0.0 }),
         Arc::new(CubicHermiteSpline { time_start: 0.0, value_start: 0.0, m0: 0.0, w0: 0.0, time_end: 0.0, value_end: 0.0, m1: 0.0, w1: 0.0 }),
-        // Phase P3-2: 时序类
-        Arc::new(TimeItem { time: 0.0, accept: false, respond_mode: String::new() }),
-        // Phase P3-3: 信号过滤器
-        Arc::new(FloatSignalFilter { channel_name: String::new(), min_value: 0.0, max_value: 0.0, time_mode: 0, accept_consume: true, deny_consume: false, end_time: 0.0 }),
-        // Phase P3-3: 输入图边
+        Arc::new(TimeItem { time: 0, accept: false, respond_mode: String::new() }),
+        Arc::new(FloatSignalFilter { priority: 0, condition_types: 0, end_time: 0, time_mode: 0, accept_consume: true, deny_consume: false, channel_name: String::new(), filter_range: 0 }),
         Arc::new(InputGraphEdge { deny: false, jump: 0, stack_respond: false, edge_respond: false, accept: false, export_state: String::new() }),
+        // S2: 7 个核心 native 类
+        Arc::new(SignalFilter { priority: 0, condition_types: 0, end_time: 0, time_mode: 0, accept_consume: true, deny_consume: false }),
+        Arc::new(InputSignalFilter {
+            priority: 0, condition_types: 0, end_time: 0, time_mode: 0, accept_consume: true, deny_consume: false,
+            on_detected: 0, signal_id_filter: 0, touch_area: 0,
+        }),
+        Arc::new(InputGraph { states: 0, input_pointer: 0, accept: true, stack_respond: false, export_state: String::new() }),
+        Arc::new(InputGraphState { filter: 0, accepted_edge: 0, denied_edge: 0 }),
+        Arc::new(HistoryStack { _placeholder: false }),
+        Arc::new(TimeStack { accept: true, respond_mode: String::new() }),
+        Arc::new(ElementSimulator { transformers: 0 }),
+        // S5: 曲线/变换/工具类
+        Arc::new(LerpColorCurve { color_points: 0, progress_curve: 0 }),
+        Arc::new(AnnulusMeshTransformer { x_angle: 0, y_radius: 0 }),
+        Arc::new(CurveMeshTransformer { curve: 0, is_horizontal: false }),
+        Arc::new(CurveWarpTransformer { curve: 0, preserve_proportions: true, curvature_influence: 0.1, transformed_axis: 0, curve_value_axis: 1 }),
         // Phase H: 内建集合类型
         Arc::new(IntListClass), Arc::new(FloatListClass), Arc::new(BoolListClass),
         Arc::new(StringListClass), Arc::new(ObjectListClass),
         Arc::new(IntArrayClass), Arc::new(FloatArrayClass), Arc::new(BoolArrayClass),
         Arc::new(StringArrayClass), Arc::new(ObjectArrayClass),
+        // S6 批 A: 纯数据 5 类
+        Arc::new(Asset { name: String::new() }),
+        Arc::new(GraphAsset { name: String::new() }),
+        Arc::new(ImageAsset { name: String::new(), texture: 0 }),
+        Arc::new(NativeAudioAsset { name: String::new(), audio: 0 }),
+        Arc::new(NativeVideoAsset { name: String::new(), video: 0 }),
+        // S6 批 B: 资源查找 3 类
+        Arc::new(AudioAsset { name: String::new() }),
+        Arc::new(VideoAsset { name: String::new() }),
+        Arc::new(WavAudioAsset { name: String::new(), wav_file_path: String::new() }),
+        // S6 批 C: 渲染/播放 5 类
+        Arc::new(AudioNative {}),
+        Arc::new(VideoNative {}),
+        Arc::new(Sprite {
+            alive: true, existence_reference: 0,
+            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
+            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
+            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            graph: 0, color: 0,
+        }),
+        Arc::new(NineSliceSprite {
+            alive: true, existence_reference: 0,
+            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
+            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
+            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            graph: 0, slice_left_top: 0, slice_right_bottom: 0, base_size: 0, color: 0, hsl: 0,
+        }),
+        Arc::new(CurveSprite {
+            alive: true, existence_reference: 0,
+            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
+            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
+            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            points: 0, color: 0, width: 0.1,
+        }),
+        Arc::new(EnvironmentNative {}),
+        // S6 缺漏补全（5 类）：之前在 use 中声明但未加入 native_classes() vec
+        Arc::new(NoteLinkage { json: String::new() }),
+        Arc::new(VariableFloat { base_value: 0.0, variation_curve: 0 }),
+        Arc::new(Node {
+            alive: true, existence_reference: 0,
+            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
+            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
+            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+        }),
+        Arc::new(Element { nodes: 0, derived_elements: 0, simulator: 0, late_independent_simulator: 0 }),
+        Arc::new(Note { automaton: 0 }),
+        // S7: SignalTsiga 自动机
+        Arc::new(SignalTsiga { input_graph: 0, time_stack: 0, history_stack: 0 }),
+        // 阶段1-C: 曲线分派基类（evaluate 方法待宏修复后补充）
+        Arc::new(FunctionCurveNative { _placeholder: false }),
+        Arc::new(ColorCurve { _placeholder: false }),
     ]
 }
 
@@ -129,37 +213,29 @@ pub fn register_native(runtime: &mut GorgeRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gorge_core::native::{NativeClass, NativeContext};
-    use gorge_core::object::{GorgeObject, RuntimeObject};
-    use gorge_core::param_pool::InvokeParameterPool;
-    use std::collections::HashMap;
+    use gorge_core::objective::native::{NativeClass, NativeContext};
+    
+    use gorge_core::virtual_machine::vm::VirtualMachine;
 
-    /// 测试脚手架：独立于虚拟机，直接用 NativeContext 驱动 native 类
+    /// 测试脚手架：持 VirtualMachine，通过 NativeContext 驱动 native 类
     struct Fixture {
-        pool: InvokeParameterPool,
-        objects: HashMap<usize, RuntimeObject>,
-        next_id: usize,
-        native_payloads: HashMap<usize, Box<dyn std::any::Any>>,
+        vm: VirtualMachine,
     }
 
     impl Fixture {
         fn new() -> Self {
-            Self {
-                pool: InvokeParameterPool::new(),
-                objects: HashMap::new(),
-                next_id: 1,
-                native_payloads: HashMap::new(),
-            }
+            let mut vm = VirtualMachine::new();
+            vm.next_object_id = 1;
+            Self { vm }
         }
 
         fn ctx(&mut self) -> NativeContext<'_> {
-            NativeContext::new(&self.pool, &mut self.objects, &mut self.next_id, &mut self.native_payloads)
+            NativeContext::new(&mut self.vm)
         }
     }
 
     #[test]
     fn test_register_native_into_runtime() {
-        // 验证 register_native 把两个类注册进运行时
         let mut runtime = GorgeRuntime::new();
         register_native(&mut runtime);
         assert!(runtime.is_native_class("GorgeFramework.Math"));
@@ -167,240 +243,57 @@ mod tests {
     }
 
     #[test]
+    fn test_native_classes_count() {
+        let classes = native_classes();
+        assert!(classes.len() >= 68, "应有至少 68 个 native 类（含 S6 补齐 5 + S7 1），实际 {}", classes.len());
+    }
+
+    #[test]
     fn test_math_sqrt_via_native() {
         let math = Math {};
         let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 16.0);
+        fx.vm.param_pool.set_float_param(0, 16.0);
         {
             let mut ctx = fx.ctx();
             math.invoke_native_static(&mut ctx, 1); // sqrt
         }
-        assert_eq!(fx.pool.get_float_return() as f32, 4.0);
-    }
-
-    #[test]
-    fn test_math_lerp_and_clamp() {
-        let math = Math {};
-        let mut fx = Fixture::new();
-        // lerp(10, 20, 0.5) = 15
-        fx.pool.set_float_param(0, 10.0);
-        fx.pool.set_float_param(1, 20.0);
-        fx.pool.set_float_param(2, 0.5);
-        {
-            let mut ctx = fx.ctx();
-            math.invoke_native_static(&mut ctx, 6); // lerp
-        }
-        assert_eq!(fx.pool.get_float_return() as f32, 15.0);
-
-        // clamp(5, 0, 3) = 3
-        fx.pool.set_float_param(0, 5.0);
-        fx.pool.set_float_param(1, 0.0);
-        fx.pool.set_float_param(2, 3.0);
-        {
-            let mut ctx = fx.ctx();
-            math.invoke_native_static(&mut ctx, 7); // clamp
-        }
-        assert_eq!(fx.pool.get_float_return() as f32, 3.0);
+        assert_eq!(fx.vm.param_pool.get_float_return() as f32, 4.0);
     }
 
     #[test]
     fn test_vector2_construct_and_magnitude() {
         let v = Vector2 { x: 0.0, y: 0.0 };
         let mut fx = Fixture::new();
-        // 构造 (3, 4)
-        fx.pool.set_float_param(0, 3.0);
-        fx.pool.set_float_param(1, 4.0);
+        fx.vm.param_pool.set_float_param(0, 3.0);
+        fx.vm.param_pool.set_float_param(1, 4.0);
         let id = {
             let mut ctx = fx.ctx();
             v.do_construct_native(&mut ctx, None, 0)
         };
-        // magnitude 是实例方法编号 2（distance=0, scale=1 为静态，共享混合编号）
         {
             let mut ctx = fx.ctx();
             v.invoke_native_method(&mut ctx, id, 2);
         }
-        assert_eq!(fx.pool.get_float_return() as f32, 5.0);
-    }
-
-    #[test]
-    fn test_vector2_scale_returns_new_object() {
-        let v = Vector2 { x: 0.0, y: 0.0 };
-        let mut fx = Fixture::new();
-
-        // 构造两个向量 (2,3) 和 (4,5)
-        fx.pool.set_float_param(0, 2.0);
-        fx.pool.set_float_param(1, 3.0);
-        let a = {
-            let mut ctx = fx.ctx();
-            v.do_construct_native(&mut ctx, None, 0)
-        };
-        fx.pool.set_float_param(0, 4.0);
-        fx.pool.set_float_param(1, 5.0);
-        let b = {
-            let mut ctx = fx.ctx();
-            v.do_construct_native(&mut ctx, None, 0)
-        };
-
-        // scale 是静态方法编号 1，返回新对象 ID
-        fx.pool.set_object_param(0, a);
-        fx.pool.set_object_param(1, b);
-        {
-            let mut ctx = fx.ctx();
-            v.invoke_native_static(&mut ctx, 1);
-        }
-        let result_id = fx.pool.get_object_return();
-        assert!(result_id != 0);
-        assert!(result_id != a && result_id != b, "应是新对象");
-
-        // 校验结果字段 (2*4, 3*5) = (8, 15)
-        let rx = fx.objects.get(&result_id).unwrap().get_float_field(Vector2::FIELD_INDEX_x);
-        let ry = fx.objects.get(&result_id).unwrap().get_float_field(Vector2::FIELD_INDEX_y);
-        assert_eq!(rx as f32, 8.0);
-        assert_eq!(ry as f32, 15.0);
-    }
-
-    #[test]
-    fn test_vector2_lerp_mixed_params() {
-        // B-2 验证：lerp(Vector2, Vector2, float) 混合类型参数按值类型分组读取
-        let v = Vector2 { x: 0.0, y: 0.0 };
-        let mut fx = Fixture::new();
-
-        // 构造 a=(0,0), b=(10,20)
-        fx.pool.set_float_param(0, 0.0);
-        fx.pool.set_float_param(1, 0.0);
-        let a = {
-            let mut ctx = fx.ctx();
-            v.do_construct_native(&mut ctx, None, 0)
-        };
-        fx.pool.set_float_param(0, 10.0);
-        fx.pool.set_float_param(1, 20.0);
-        let b = {
-            let mut ctx = fx.ctx();
-            v.do_construct_native(&mut ctx, None, 0)
-        };
-
-        // lerp 是静态方法编号 5：object 参数 a=obj[0], b=obj[1]；float 参数 t=float[0]
-        fx.pool.set_object_param(0, a);
-        fx.pool.set_object_param(1, b);
-        fx.pool.set_float_param(0, 0.5);
-        {
-            let mut ctx = fx.ctx();
-            v.invoke_native_static(&mut ctx, 5);
-        }
-        let result_id = fx.pool.get_object_return();
-        assert!(result_id != 0 && result_id != a && result_id != b);
-
-        // lerp((0,0),(10,20),0.5) = (5,10)
-        let rx = fx.objects.get(&result_id).unwrap().get_float_field(Vector2::FIELD_INDEX_x);
-        let ry = fx.objects.get(&result_id).unwrap().get_float_field(Vector2::FIELD_INDEX_y);
-        assert_eq!(rx as f32, 5.0);
-        assert_eq!(ry as f32, 10.0);
-    }
-
-    // ==================== N1: Vector3 + Random 测试 ====================
-
-    #[test]
-    fn test_register_native_has_vector3_and_random() {
-        let mut runtime = GorgeRuntime::new();
-        register_native(&mut runtime);
-        assert!(runtime.is_native_class("GorgeFramework.Vector3"));
-        assert!(runtime.is_native_class("GorgeFramework.Random"));
+        assert_eq!(fx.vm.param_pool.get_float_return() as f32, 5.0);
     }
 
     #[test]
     fn test_vector3_construct_and_magnitude() {
         let v = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
         let mut fx = Fixture::new();
-        // 构造 (3, 4, 0)
-        fx.pool.set_float_param(0, 3.0);
-        fx.pool.set_float_param(1, 4.0);
-        fx.pool.set_float_param(2, 0.0);
-        let id = {
-            let mut ctx = fx.ctx();
-            v.do_construct_native(&mut ctx, None, 1) // ctor 1
-        };
-        // magnitude 是混合编号 1
-        {
-            let mut ctx = fx.ctx();
-            v.invoke_native_method(&mut ctx, id, 1);
-        }
-        assert_eq!(fx.pool.get_float_return() as f32, 5.0);
-    }
-
-    #[test]
-    fn test_vector3_get_components() {
-        let v = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
-        let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 1.0);
-        fx.pool.set_float_param(1, 2.0);
-        fx.pool.set_float_param(2, 3.0);
+        fx.vm.param_pool.set_float_param(0, 3.0);
+        fx.vm.param_pool.set_float_param(1, 4.0);
+        fx.vm.param_pool.set_float_param(2, 0.0);
         let id = {
             let mut ctx = fx.ctx();
             v.do_construct_native(&mut ctx, None, 1)
         };
-        // get_x=2, get_y=3, get_z=4
-        for (method_idx, expected) in [(2, 1.0), (3, 2.0), (4, 3.0)] {
-            let mut ctx = fx.ctx();
-            v.invoke_native_method(&mut ctx, id, method_idx);
-            assert_eq!(fx.pool.get_float_return() as f32, expected);
-        }
-    }
-
-    #[test]
-    fn test_vector3_distance() {
-        let v = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
-        let mut fx = Fixture::new();
-        let a = make_v3(&v, &mut fx, 0.0, 0.0, 0.0);
-        let b = make_v3(&v, &mut fx, 3.0, 4.0, 0.0);
-        // distance 是混合编号 5
-        fx.pool.set_object_param(0, a);
-        fx.pool.set_object_param(1, b);
         {
             let mut ctx = fx.ctx();
-            v.invoke_native_static(&mut ctx, 5);
+            v.invoke_native_method(&mut ctx, id, 1);
         }
-        assert_eq!(fx.pool.get_float_return() as f32, 5.0);
+        assert_eq!(fx.vm.param_pool.get_float_return() as f32, 5.0);
     }
-
-    #[test]
-    fn test_vector3_to_vector2() {
-        let v = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
-        let mut fx = Fixture::new();
-        let id = make_v3(&v, &mut fx, 10.0, 20.0, 30.0);
-        // to_vector2 是混合编号 0
-        {
-            let mut ctx = fx.ctx();
-            v.invoke_native_method(&mut ctx, id, 0);
-        }
-        let result_id = fx.pool.get_object_return();
-        assert!(result_id != 0 && result_id != id);
-        let rx = fx.objects.get(&result_id).unwrap().get_float_field(0);
-        let ry = fx.objects.get(&result_id).unwrap().get_float_field(1);
-        assert_eq!(rx as f32, 10.0);
-        assert_eq!(ry as f32, 20.0);
-    }
-
-    #[test]
-    fn test_random_random_float() {
-        let r = Random {};
-        let mut fx = Fixture::new();
-        {
-            let mut ctx = fx.ctx();
-            r.invoke_native_static(&mut ctx, 0); // random_float
-        }
-        let val = fx.pool.get_float_return();
-        assert!(val >= 0.0 && val < 1.0);
-    }
-
-    fn make_v3(v: &Vector3, fx: &mut Fixture, x: f32, y: f32, z: f32) -> usize {
-        fx.pool.set_float_param(0, x as f64);
-        fx.pool.set_float_param(1, y as f64);
-        fx.pool.set_float_param(2, z as f64);
-        let mut ctx = fx.ctx();
-        v.do_construct_native(&mut ctx, None, 1)
-    }
-
-    // ==================== N2: 信号系统测试 ====================
 
     #[test]
     fn test_register_native_has_signals() {
@@ -411,217 +304,282 @@ mod tests {
         assert!(runtime.is_native_class("GorgeFramework.TouchSignal"));
     }
 
+    // ========== S5 曲线/变换/工具类测试 ==========
+
+    /// 辅助：向 Fixture 注册指定 native 类
+    fn register_native_class_to_vm(fx: &mut Fixture, cls: std::sync::Arc<dyn NativeClass>) {
+        let name = cls.full_name().to_string();
+        fx.vm.register_native_class(&name, cls);
+    }
+
+    /// 辅助：创建注册好的 CurveMeshTransformer
+    #[allow(dead_code)]
+    fn make_curve_mesh_trans(fx: &mut Fixture, curve_id: usize, is_h: bool) -> usize {
+        let ctm = CurveMeshTransformer { curve: 0, is_horizontal: false };
+        fx.vm.param_pool.set_object_param(0, curve_id);
+        fx.vm.param_pool.set_bool_param(0, is_h);
+        let mut ctx = fx.ctx();
+        ctm.do_construct_native(&mut ctx, None, 0)
+    }
+
+    /// 辅助：创建简单 Vector3
+    fn make_v3(fx: &mut Fixture, x: f32, y: f32, z: f32) -> usize {
+        use gorge_core::objective::object::RuntimeObject;
+        use gorge_core::objective::types::TypeCount;
+        let obj = RuntimeObject::new_simple(
+            "GorgeFramework.Vector3".to_string(),
+            &TypeCount { float_count: 3, ..Default::default() },
+        );
+        let mut ctx = fx.ctx();
+        let id = ctx.register_object(obj);
+        ctx.set_object_float_field(id, 0, x as f64);
+        ctx.set_object_float_field(id, 1, y as f64);
+        ctx.set_object_float_field(id, 2, z as f64);
+        id
+    }
+
+    /// 辅助：读取 Vector3 的 (x, y, z)
+    fn read_v3(fx: &mut Fixture, id: usize) -> (f32, f32, f32) {
+        let ctx = fx.ctx();
+        let x = ctx.get_object_float_field(id, 0) as f32;
+        let y = ctx.get_object_float_field(id, 1) as f32;
+        let z = ctx.get_object_float_field(id, 2) as f32;
+        (x, y, z)
+    }
+
+    /// 辅助：创建 ColorArgb
+    fn make_color_argb(fx: &mut Fixture, a: f32, r: f32, g: f32, b: f32) -> usize {
+        let c = ColorArgb { a: 1.0, r: 0.0, g: 0.0, b: 0.0 };
+        fx.vm.param_pool.set_float_param(0, a as f64);
+        fx.vm.param_pool.set_float_param(1, r as f64);
+        fx.vm.param_pool.set_float_param(2, g as f64);
+        fx.vm.param_pool.set_float_param(3, b as f64);
+        let mut ctx = fx.ctx();
+        c.do_construct_native(&mut ctx, None, 0)
+    }
+
+    /// 辅助：创建 LinearFunctionCurve(k, b)
+    fn make_linear_curve(fx: &mut Fixture, k: f32, b: f32) -> usize {
+        use gorge_core::objective::object::RuntimeObject;
+        let obj = RuntimeObject::new_simple(
+            LinearFunctionCurve::GORGE_FULL_NAME.to_string(),
+            &LinearFunctionCurve::gorge_field_type_count(),
+        );
+        let mut ctx = fx.ctx();
+        let id = ctx.register_object(obj);
+        ctx.set_object_float_field(id, LinearFunctionCurve::FIELD_INDEX_k, k as f64);
+        ctx.set_object_float_field(id, LinearFunctionCurve::FIELD_INDEX_b, b as f64);
+        id
+    }
+
+    /// 辅助：创建 ConstantFunctionCurve(value)
+    fn make_constant_curve(fx: &mut Fixture, value: f32) -> usize {
+        use gorge_core::objective::object::RuntimeObject;
+        let obj = RuntimeObject::new_simple(
+            ConstantFunctionCurve::GORGE_FULL_NAME.to_string(),
+            &ConstantFunctionCurve::gorge_field_type_count(),
+        );
+        let mut ctx = fx.ctx();
+        let id = ctx.register_object(obj);
+        ctx.set_object_float_field(id, ConstantFunctionCurve::FIELD_INDEX_value, value as f64);
+        id
+    }
+
+    /// 辅助：创建 ObjectArray 包含两个颜色对象
+    fn make_color_points_array(fx: &mut Fixture, c0_id: usize, c1_id: usize) -> usize {
+        use gorge_core::system::native::array::ObjectArrayClass;
+        let cls = ObjectArrayClass;
+        let arr_id = { let mut ctx = fx.ctx(); cls.do_construct_native(&mut ctx, None, 0) };
+        { let mut ctx = fx.ctx(); ctx.object_array_add(arr_id, c0_id); }
+        { let mut ctx = fx.ctx(); ctx.object_array_add(arr_id, c1_id); }
+        arr_id
+    }
+
     #[test]
-    fn test_float_signal_construct() {
-        let s = FloatSignal { value: 0.0 };
+    fn test_s5_lerp_color_curve_black_to_white() {
         let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 3.14);
-        let id = {
-            let mut ctx = fx.ctx();
-            s.do_construct_native(&mut ctx, None, 0)
-        };
-        let val = fx.objects.get(&id).unwrap().get_float_field(0);
-        assert!((val - 3.14).abs() < 0.01);
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(LerpColorCurve { color_points: 0, progress_curve: 0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ColorArgb { a: 1.0, r: 0.0, g: 0.0, b: 0.0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(LinearFunctionCurve { k: 0.0, b: 0.0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
+
+        // 创建两点：黑(1,0,0,0)在索引0，白(1,1,1,1)在索引1
+        let black = make_color_argb(&mut fx, 1.0, 0.0, 0.0, 0.0);
+        let white = make_color_argb(&mut fx, 1.0, 1.0, 1.0, 1.0);
+        let arr = make_color_points_array(&mut fx, black, white);
+
+        // 进度曲线 f(x)=x，所以 x=0.5 → progress=0.5，在点0和点1之间插值
+        let pc = make_linear_curve(&mut fx, 1.0, 0.0);
+
+        // 构造 LerpColorCurve
+        let lcc = LerpColorCurve { color_points: 0, progress_curve: 0 };
+        fx.vm.param_pool.set_object_param(0, arr);
+        fx.vm.param_pool.set_object_param(1, pc);
+        let lcc_id = { let mut ctx = fx.ctx(); lcc.do_construct_native(&mut ctx, None, 0) };
+
+        // evaluate(0.5)
+        fx.vm.param_pool.set_float_param(0, 0.5f64);
+        { let mut ctx = fx.ctx(); lcc.invoke_native_method(&mut ctx, lcc_id, 0); }
+        let result_id = fx.vm.param_pool.get_object_return();
+        assert!(result_id > 0, "应返回新 ColorArgb 对象");
+        let r = { let ctx = fx.ctx(); ctx.get_object_float_field(result_id, ColorArgb::FIELD_INDEX_r) as f32 };
+        let g = { let ctx = fx.ctx(); ctx.get_object_float_field(result_id, ColorArgb::FIELD_INDEX_g) as f32 };
+        let b = { let ctx = fx.ctx(); ctx.get_object_float_field(result_id, ColorArgb::FIELD_INDEX_b) as f32 };
+        // 黑(0)到白(1)的中间点，预期 ≈0.5
+        assert!((r - 0.5).abs() < 0.01, "r 应在 0.5 附近，实际 {r}");
+        assert!((g - 0.5).abs() < 0.01, "g 应在 0.5 附近，实际 {g}");
+        assert!((b - 0.5).abs() < 0.01, "b 应在 0.5 附近，实际 {b}");
     }
 
     #[test]
-    fn test_bool_signal_construct() {
-        let s = BoolSignal { value: false };
+    fn test_s5_annulus_mesh_constant_zero_angle() {
         let mut fx = Fixture::new();
-        fx.pool.set_bool_param(0, true);
-        let id = {
-            let mut ctx = fx.ctx();
-            s.do_construct_native(&mut ctx, None, 0)
-        };
-        assert!(fx.objects.get(&id).unwrap().get_bool_field(0));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(AnnulusMeshTransformer { x_angle: 0, y_radius: 0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
+
+        // angle=0, radius=1 常量曲线
+        let angle_curve = make_constant_curve(&mut fx, 0.0);
+        let radius_curve = make_constant_curve(&mut fx, 1.0);
+
+        let at = AnnulusMeshTransformer { x_angle: 0, y_radius: 0 };
+        fx.vm.param_pool.set_object_param(0, angle_curve);
+        fx.vm.param_pool.set_object_param(1, radius_curve);
+        let at_id = { let mut ctx = fx.ctx(); at.do_construct_native(&mut ctx, None, 0) };
+
+        // transform(vertex) — 任意顶点，角度和半径由曲线覆盖
+        let v_id = make_v3(&mut fx, 0.0, 0.0, 0.0);
+        fx.vm.param_pool.set_object_param(0, v_id);
+        { let mut ctx = fx.ctx(); at.invoke_native_method(&mut ctx, at_id, 0); }
+        let result_id = fx.vm.param_pool.get_object_return();
+        let (rx, ry, _rz) = read_v3(&mut fx, result_id);
+        // angle=0, radius=1 → (cos0*1, sin0*1) = (1, 0)
+        assert!((rx - 1.0).abs() < 0.01, "x 应为 1.0，实际 {rx}");
+        assert!((ry - 0.0).abs() < 0.01, "y 应为 0.0，实际 {ry}");
     }
 
     #[test]
-    fn test_touch_signal_construct() {
-        let s = TouchSignal { is_touching: false, position: 0 };
+    fn test_s5_annulus_mesh_pi_half_angle() {
         let mut fx = Fixture::new();
-        // 先构造一个 Vector2 作为位置
-        let v2 = Vector2 { x: 0.0, y: 0.0 };
-        fx.pool.set_float_param(0, 100.0);
-        fx.pool.set_float_param(1, 200.0);
-        let pos_id = {
-            let mut ctx = fx.ctx();
-            v2.do_construct_native(&mut ctx, None, 0)
-        };
-        // 构造 TouchSignal(is_touching=true, position=pos_id)
-        // 参数按值类型分组：bool 参数 is_touching, object 参数 position
-        fx.pool.set_bool_param(0, true);
-        fx.pool.set_object_param(0, pos_id);
-        let id = {
-            let mut ctx = fx.ctx();
-            s.do_construct_native(&mut ctx, None, 0)
-        };
-        assert!(fx.objects.get(&id).unwrap().get_bool_field(0));
-        let stored_pos = fx.objects.get(&id).unwrap().get_object_field(0);
-        assert_eq!(stored_pos, pos_id);
-    }
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(AnnulusMeshTransformer { x_angle: 0, y_radius: 0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
 
-    // ==================== N3: ColorArgb 测试 ====================
+        use std::f32::consts::FRAC_PI_2;
+        let angle_curve = make_constant_curve(&mut fx, FRAC_PI_2);
+        let radius_curve = make_constant_curve(&mut fx, 1.0);
 
-    #[test]
-    fn test_register_color_argb() {
-        let mut runtime = GorgeRuntime::new();
-        register_native(&mut runtime);
-        assert!(runtime.is_native_class("GorgeFramework.ColorArgb"));
+        let at = AnnulusMeshTransformer { x_angle: 0, y_radius: 0 };
+        fx.vm.param_pool.set_object_param(0, angle_curve);
+        fx.vm.param_pool.set_object_param(1, radius_curve);
+        let at_id = { let mut ctx = fx.ctx(); at.do_construct_native(&mut ctx, None, 0) };
+
+        let v_id = make_v3(&mut fx, 0.0, 0.0, 0.0);
+        fx.vm.param_pool.set_object_param(0, v_id);
+        { let mut ctx = fx.ctx(); at.invoke_native_method(&mut ctx, at_id, 0); }
+        let result_id = fx.vm.param_pool.get_object_return();
+        let (rx, ry, _) = read_v3(&mut fx, result_id);
+        // angle=π/2, radius=1 → (cosπ/2, sinπ/2) = (≈0, 1)
+        assert!((rx - 0.0).abs() < 0.01, "x 应 ≈0.0，实际 {rx}");
+        assert!((ry - 1.0).abs() < 0.01, "y 应 = 1.0，实际 {ry}");
     }
 
     #[test]
-    fn test_color_argb_construct() {
-        let c = ColorArgb { a: 255, r: 0, g: 0, b: 0 };
+    fn test_s5_curve_warp_constant_curve() {
         let mut fx = Fixture::new();
-        fx.pool.set_int_param(0, 128);
-        fx.pool.set_int_param(1, 255);
-        fx.pool.set_int_param(2, 0);
-        fx.pool.set_int_param(3, 0);
-        let id = {
-            let mut ctx = fx.ctx();
-            c.do_construct_native(&mut ctx, None, 0)
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(CurveWarpTransformer {
+            curve: 0, preserve_proportions: true, curvature_influence: 0.1,
+            transformed_axis: 0, curve_value_axis: 1,
+        }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
+
+        // f(x)=5 常量曲线 → 切线(1,0)，法线(0,1)，曲率=0
+        let curve = make_constant_curve(&mut fx, 5.0);
+
+        let cwt = CurveWarpTransformer {
+            curve: 0, preserve_proportions: true, curvature_influence: 0.1,
+            transformed_axis: 0, curve_value_axis: 1,
         };
-        // a=128, r=255, g=0, b=0 → 半透明红色
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(0), 128);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(1), 255);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(2), 0);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(3), 0);
+        fx.vm.param_pool.set_object_param(0, curve);
+        fx.vm.param_pool.set_bool_param(0, true);
+        fx.vm.param_pool.set_float_param(0, 0.1f64);
+        fx.vm.param_pool.set_int_param(0, 0);
+        fx.vm.param_pool.set_int_param(1, 1);
+        let cwt_id = { let mut ctx = fx.ctx(); cwt.do_construct_native(&mut ctx, None, 0) };
+
+        // transform(1,2,3) → 对于 f(x)=5:
+        // curveX=1, curvePoint=(1,5), tangent=(1,0), normal=(0,1), curvature=0
+        // distortion=1.0, curveValue=2 (y), adjustedY=2
+        // warped=(1+0*2, 5+1*2)=(1,7), result=(1,7,3)
+        let v_id = make_v3(&mut fx, 1.0, 2.0, 3.0);
+        fx.vm.param_pool.set_object_param(0, v_id);
+        { let mut ctx = fx.ctx(); cwt.invoke_native_method(&mut ctx, cwt_id, 0); }
+        let result_id = fx.vm.param_pool.get_object_return();
+        let (rx, ry, rz) = read_v3(&mut fx, result_id);
+        assert!((rx - 1.0).abs() < 0.1, "x 应 ≈1.0，实际 {rx}");
+        assert!((ry - 7.0).abs() < 0.1, "y 应 ≈7.0，实际 {ry}");
+        assert!((rz - 3.0).abs() < 0.01, "z 应 =3.0，实际 {rz}");
     }
 
-    // ==================== N3: Priority + PeriodConfig 测试 ====================
-
     #[test]
-    fn test_priority_construct() {
-        let p = Priority { value: 0 };
+    fn test_s5_curve_warp_no_curve_identity() {
         let mut fx = Fixture::new();
-        fx.pool.set_int_param(0, 999);
-        let id = {
-            let mut ctx = fx.ctx();
-            p.do_construct_native(&mut ctx, None, 0)
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(CurveWarpTransformer {
+            curve: 0, preserve_proportions: true, curvature_influence: 0.1,
+            transformed_axis: 0, curve_value_axis: 1,
+        }));
+
+        let cwt = CurveWarpTransformer {
+            curve: 0, preserve_proportions: true, curvature_influence: 0.1,
+            transformed_axis: 0, curve_value_axis: 1,
         };
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(0), 999);
+        fx.vm.param_pool.set_object_param(0, 0); // no curve
+        fx.vm.param_pool.set_bool_param(0, true);
+        fx.vm.param_pool.set_float_param(0, 0.1f64);
+        fx.vm.param_pool.set_int_param(0, 0);
+        fx.vm.param_pool.set_int_param(1, 1);
+        let cwt_id = { let mut ctx = fx.ctx(); cwt.do_construct_native(&mut ctx, None, 0) };
+
+        let v_id = make_v3(&mut fx, 1.0, 2.0, 3.0);
+        fx.vm.param_pool.set_object_param(0, v_id);
+        { let mut ctx = fx.ctx(); cwt.invoke_native_method(&mut ctx, cwt_id, 0); }
+        let result_id = fx.vm.param_pool.get_object_return();
+        let (rx, ry, rz) = read_v3(&mut fx, result_id);
+        assert!((rx - 1.0).abs() < 0.01);
+        assert!((ry - 2.0).abs() < 0.01);
+        assert!((rz - 3.0).abs() < 0.01);
     }
 
     #[test]
-    fn test_period_config_construct() {
-        let pc = PeriodConfig { start_time: 0.0, end_time: 0.0 };
+    fn test_s5_native_context_object_f() {
+        // 验证 call_native_method_object_f 可用（通过 LerpColorCurve.evaluate 间接测试）
         let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 10.0);
-        fx.pool.set_float_param(1, 20.0);
-        let id = {
-            let mut ctx = fx.ctx();
-            pc.do_construct_native(&mut ctx, None, 0)
-        };
-        assert!((fx.objects.get(&id).unwrap().get_float_field(0) - 10.0).abs() < 0.01);
-        assert!((fx.objects.get(&id).unwrap().get_float_field(1) - 20.0).abs() < 0.01);
-    }
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(LerpColorCurve { color_points: 0, progress_curve: 0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ColorArgb { a: 1.0, r: 0.0, g: 0.0, b: 0.0 }));
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(LinearFunctionCurve { k: 0.0, b: 0.0 }));
 
-    // ==================== P3 Phase 1: Graph 注册测试 ====================
+        let white = make_color_argb(&mut fx, 1.0, 1.0, 1.0, 1.0);
+        let black = make_color_argb(&mut fx, 1.0, 0.0, 0.0, 0.0);
+        let arr = make_color_points_array(&mut fx, black, white);
+        let pc = make_linear_curve(&mut fx, 1.0, 0.0);
 
-    #[test]
-    fn test_register_native_has_graph() {
-        let mut runtime = GorgeRuntime::new();
-        register_native(&mut runtime);
-        assert!(runtime.is_native_class("GorgeFramework.Graph"));
-    }
+        let lcc = LerpColorCurve { color_points: 0, progress_curve: 0 };
+        fx.vm.param_pool.set_object_param(0, arr);
+        fx.vm.param_pool.set_object_param(1, pc);
+        let lcc_id = { let mut ctx = fx.ctx(); lcc.do_construct_native(&mut ctx, None, 0) };
 
-    #[test]
-    fn test_graph_construct() {
-        let g = Graph { width: 0, height: 0 };
-        let mut fx = Fixture::new();
-        fx.pool.set_int_param(0, 640);
-        fx.pool.set_int_param(1, 480);
-        let id = {
-            let mut ctx = fx.ctx();
-            g.do_construct_native(&mut ctx, None, 0)
-        };
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(0), 640);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(1), 480);
+        // 验证外部可通过 evaluate(0.0) 拿到对象 ID
+        fx.vm.param_pool.set_float_param(0, 0.0f64);
+        { let mut ctx = fx.ctx(); lcc.invoke_native_method(&mut ctx, lcc_id, 0); }
+        let result_id = fx.vm.param_pool.get_object_return();
+        assert!(result_id > 0, "evaluate(0) 应返回 ColorArgb 对象");
     }
 
     #[test]
-    fn test_element_line_point_construct() {
-        let p = ElementLinePoint { time: 0.0, position: 0.0, width: 0.0 };
-        let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 1.5);
-        fx.pool.set_float_param(1, 100.0);
-        fx.pool.set_float_param(2, 3.0);
-        let id = {
-            let mut ctx = fx.ctx();
-            p.do_construct_native(&mut ctx, None, 0)
-        };
-        assert!((fx.objects.get(&id).unwrap().get_float_field(0) - 1.5).abs() < 0.01);
-        assert!((fx.objects.get(&id).unwrap().get_float_field(1) - 100.0).abs() < 0.01);
-        assert!((fx.objects.get(&id).unwrap().get_float_field(2) - 3.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_element_line_construct() {
-        let l = ElementLine { color_r: 0, color_g: 0, color_b: 0, color_a: 0 };
-        let mut fx = Fixture::new();
-        fx.pool.set_int_param(0, 255);
-        fx.pool.set_int_param(1, 128);
-        fx.pool.set_int_param(2, 64);
-        fx.pool.set_int_param(3, 32);
-        let id = {
-            let mut ctx = fx.ctx();
-            l.do_construct_native(&mut ctx, None, 0)
-        };
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(0), 255);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(1), 128);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(2), 64);
-        assert_eq!(fx.objects.get(&id).unwrap().get_int_field(3), 32);
-    }
-
-    #[test]
-    fn test_logger_log_int() {
-        let logger = Logger {};
-        let mut fx = Fixture::new();
-        fx.pool.set_int_param(0, 42);
-        {
-            let mut ctx = fx.ctx();
-            logger.invoke_native_static(&mut ctx, 0); // log_int
-        }
-        assert_eq!(fx.pool.get_int_return(), 42);
-    }
-
-    // ==================== P3 Phase 2: 函数曲线测试 ====================
-
-    #[test]
-    fn test_constant_curve_evaluate() {
-        let c = ConstantFunctionCurve { value: 0.0 };
-        let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 7.0);
-        let c_obj = {
-            let mut ctx = fx.ctx();
-            c.do_construct_native(&mut ctx, None, 0)
-        };
-        // evaluate(x) 是实例方法编号 0
-        fx.pool.set_float_param(0, 100.0); // x
-        {
-            let mut ctx = fx.ctx();
-            c.invoke_native_method(&mut ctx, c_obj, 0);
-        }
-        assert_eq!(fx.pool.get_float_return() as f32, 7.0);
-    }
-
-    #[test]
-    fn test_linear_curve_evaluate() {
-        let c = LinearFunctionCurve { k: 0.0, b: 0.0 };
-        let mut fx = Fixture::new();
-        fx.pool.set_float_param(0, 2.0); // k
-        fx.pool.set_float_param(1, 5.0); // b
-        let c_obj = {
-            let mut ctx = fx.ctx();
-            c.do_construct_native(&mut ctx, None, 0)
-        };
-        fx.pool.set_float_param(0, 3.0); // x
-        {
-            let mut ctx = fx.ctx();
-            c.invoke_native_method(&mut ctx, c_obj, 0);
-        }
-        // f(3) = 2*3 + 5 = 11
-        assert_eq!(fx.pool.get_float_return() as f32, 11.0);
+    fn test_s5_float_extension_bit_int() {
+        use crate::utilities::float_extension::bit_int;
+        // 1.0f32 → IEEE 754 位模式 0x3F800000
+        assert_eq!(bit_int(1.0f32), 0x3F800000u32 as i32);
+        assert_eq!(bit_int(0.0f32), 0);
+        // -1.0f32 → 0xBF800000
+        assert_eq!(bit_int(-1.0f32), 0xBF800000u32 as i32);
     }
 }

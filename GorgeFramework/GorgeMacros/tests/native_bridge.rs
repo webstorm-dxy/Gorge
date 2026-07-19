@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use gorge_core::native::{NativeClass, NativeContext};
-use gorge_core::object::RuntimeObject;
-use gorge_core::param_pool::InvokeParameterPool;
+use gorge_core::objective::native::{NativeClass, NativeContext};
+use gorge_core::objective::object::RuntimeObject;
+use gorge_core::virtual_machine::vm::VirtualMachine;
 
 use gorge_macros::{gorge_native_class, gorge_native_impl};
 
@@ -71,26 +71,20 @@ impl Vector2 {
     }
 }
 
-/// 构造上下文的测试脚手架
+/// 构造上下文的测试脚手架（1d 重构后持 VM）
 struct Fixture {
-    pool: InvokeParameterPool,
-    objects: HashMap<usize, RuntimeObject>,
-    next_id: usize,
-    native_payloads: HashMap<usize, Box<dyn std::any::Any>>,
+    vm: VirtualMachine,
 }
 
 impl Fixture {
     fn new() -> Self {
-        Self {
-            pool: InvokeParameterPool::new(),
-            objects: HashMap::new(),
-            next_id: 1,
-            native_payloads: HashMap::new(),
-        }
+        let mut vm = VirtualMachine::new();
+        vm.next_object_id = 1;
+        Self { vm }
     }
 
     fn ctx(&mut self) -> NativeContext<'_> {
-        NativeContext::new(&self.pool, &mut self.objects, &mut self.next_id, &mut self.native_payloads)
+        NativeContext::new(&mut self.vm)
     }
 }
 
@@ -106,24 +100,24 @@ fn test_math_full_name_and_no_fields() {
 fn test_math_static_abs() {
     let math = Math {};
     let mut fx = Fixture::new();
-    fx.pool.set_float_param(0, -3.5);
+    fx.vm.param_pool.set_float_param(0, -3.5);
     {
         let mut ctx = fx.ctx();
         math.invoke_native_static(&mut ctx, 0); // abs
     }
-    assert_eq!(fx.pool.get_float_return() as f32, 3.5);
+    assert_eq!(fx.vm.param_pool.get_float_return() as f32, 3.5);
 }
 
 #[test]
 fn test_math_static_add_one() {
     let math = Math {};
     let mut fx = Fixture::new();
-    fx.pool.set_int_param(0, 41);
+    fx.vm.param_pool.set_int_param(0, 41);
     {
         let mut ctx = fx.ctx();
         math.invoke_native_static(&mut ctx, 1); // add_one
     }
-    assert_eq!(fx.pool.get_int_return(), 42);
+    assert_eq!(fx.vm.param_pool.get_int_return(), 42);
 }
 
 #[test]
@@ -148,21 +142,21 @@ fn test_vector2_construct_and_get() {
     let mut fx = Fixture::new();
 
     // 构造：param float[0]=3.0, float[1]=4.0
-    fx.pool.set_float_param(0, 3.0);
-    fx.pool.set_float_param(1, 4.0);
+    fx.vm.param_pool.set_float_param(0, 3.0);
+    fx.vm.param_pool.set_float_param(1, 4.0);
     let obj_id = {
         let mut ctx = fx.ctx();
         v.do_construct_native(&mut ctx, None, 0)
     };
     assert!(obj_id != 0);
-    assert!(fx.objects.contains_key(&obj_id));
+    assert!(fx.vm.objects.contains_key(&obj_id));
 
     // 实例方法 get_x（编号 1，与 distance 共享混合编号空间）
     {
         let mut ctx = fx.ctx();
         v.invoke_native_method(&mut ctx, obj_id, 1);
     }
-    assert_eq!(fx.pool.get_float_return() as f32, 3.0);
+    assert_eq!(fx.vm.param_pool.get_float_return() as f32, 3.0);
 }
 
 #[test]
@@ -171,36 +165,131 @@ fn test_vector2_static_distance() {
     let mut fx = Fixture::new();
 
     // 构造两个点：(0,0) 和 (3,4)
-    fx.pool.set_float_param(0, 0.0);
-    fx.pool.set_float_param(1, 0.0);
+    fx.vm.param_pool.set_float_param(0, 0.0);
+    fx.vm.param_pool.set_float_param(1, 0.0);
     let p1 = {
         let mut ctx = fx.ctx();
         v.do_construct_native(&mut ctx, None, 0)
     };
-    fx.pool.set_float_param(0, 3.0);
-    fx.pool.set_float_param(1, 4.0);
+    fx.vm.param_pool.set_float_param(0, 3.0);
+    fx.vm.param_pool.set_float_param(1, 4.0);
     let p2 = {
         let mut ctx = fx.ctx();
         v.do_construct_native(&mut ctx, None, 0)
     };
 
     // distance 是静态方法编号 0
-    fx.pool.set_object_param(0, p1);
-    fx.pool.set_object_param(1, p2);
+    fx.vm.param_pool.set_object_param(0, p1);
+    fx.vm.param_pool.set_object_param(1, p2);
     {
         let mut ctx = fx.ctx();
         v.invoke_native_static(&mut ctx, 0);
     }
-    assert_eq!(fx.pool.get_float_return() as f32, 5.0);
+    assert_eq!(fx.vm.param_pool.get_float_return() as f32, 5.0);
+}
+
+// ==================== M-1 回归测试 ====================
+
+/// 单方法 impl（仅 1 个 #[gorge_method]，无 ctor/static）— 回归参数计数 bug
+#[gorge_native_class(namespace = "GorgeFramework")]
+pub struct SingleMethodTest {
+    #[gorge_field]
+    pub _placeholder: bool,
+}
+
+#[gorge_native_impl]
+impl SingleMethodTest {
+    /// 实例方法 0：接收 float 参数，返回 float
+    #[gorge_method]
+    pub fn evaluate(ctx: &mut NativeContext, this: usize, x: f32) -> f32 {
+        let _ = ctx;
+        let _ = this;
+        x * 2.0
+    }
+}
+
+/// 多方法不同参数数测试（2 个 #[gorge_method] 分别 1 个/0 个值参数）
+#[gorge_native_class(namespace = "GorgeFramework")]
+pub struct MultiMethodTest {
+    #[gorge_field]
+    pub _placeholder: bool,
+}
+
+#[gorge_native_impl]
+impl MultiMethodTest {
+    /// 实例方法 0：接收 float 参数，返回 float
+    #[gorge_method]
+    pub fn evaluate(ctx: &mut NativeContext, this: usize, x: f32) -> f32 {
+        let _ = ctx;
+        let _ = this;
+        x * 2.0
+    }
+
+    /// 实例方法 1：无值参数，返回 int
+    #[gorge_method]
+    pub fn get_value(ctx: &mut NativeContext, this: usize) -> i32 {
+        let _ = ctx;
+        let _ = this;
+        42
+    }
+}
+
+#[test]
+fn test_single_method_impl_evaluate() {
+    let obj = SingleMethodTest { _placeholder: false };
+    let mut fx = Fixture::new();
+
+    // 构造
+    fx.vm.param_pool.set_bool_param(0, false);
+    let obj_id = {
+        let mut ctx = fx.ctx();
+        obj.do_construct_native(&mut ctx, None, 0)
+    };
+
+    // 调 evaluate(x=3.0)
+    fx.vm.param_pool.set_float_param(0, 3.0);
+    {
+        let mut ctx = fx.ctx();
+        obj.invoke_native_method(&mut ctx, obj_id, 0);
+    }
+    assert_eq!(fx.vm.param_pool.get_float_return() as f32, 6.0);
+}
+
+#[test]
+fn test_multi_method_different_arity() {
+    let obj = MultiMethodTest { _placeholder: false };
+    let mut fx = Fixture::new();
+
+    // 构造
+    fx.vm.param_pool.set_bool_param(0, false);
+    let obj_id = {
+        let mut ctx = fx.ctx();
+        obj.do_construct_native(&mut ctx, None, 0)
+    };
+
+    // 调 evaluate(x=5.0) — 有值参数
+    fx.vm.param_pool.set_float_param(0, 5.0);
+    {
+        let mut ctx = fx.ctx();
+        obj.invoke_native_method(&mut ctx, obj_id, 0);
+    }
+    assert_eq!(fx.vm.param_pool.get_float_return() as f32, 10.0);
+
+    // 调 get_value() — 无值参数
+    {
+        let mut ctx = fx.ctx();
+        obj.invoke_native_method(&mut ctx, obj_id, 1);
+    }
+    assert_eq!(fx.vm.param_pool.get_int_return(), 42);
 }
 
 #[test]
 fn test_vector2_field_initialize_applies_injector_override() {
     // 验证 native 构造时注入器字段覆写生效（对齐 C# FieldInitialize）。
-    use gorge_core::injector::{RuntimeInjector, Injector};
-    use gorge_core::declaration::ClassDeclaration;
-    use gorge_core::object::GorgeObject;
-    use gorge_core::types::{GorgeType, TypeCount};
+    use gorge_core::system::native::injector::{RuntimeInjector, Injector};
+    use gorge_core::objective::declaration::ClassDeclaration;
+    use gorge_core::objective::object::GorgeObject;
+    use gorge_core::objective::types::{GorgeType, TypeCount};
     use std::sync::Arc;
 
     // 构造一个含 2 个 float 注入器字段的注入器，x 显式设为 7.0，y 保持默认
@@ -217,18 +306,16 @@ fn test_vector2_field_initialize_applies_injector_override() {
         interface_method_impl_id: HashMap::new(),
         method_override_id: HashMap::new(),
         injector_constructor_impl_id: vec![],
+        method_annotations: std::collections::HashMap::new(),
+        constructor_annotations: std::collections::HashMap::new(),
     });
     let mut inj = RuntimeInjector::new(decl);
     inj.set_injector_float(Vector2::INJECTOR_INDEX_x, 7.0); // x 显式覆写
     // y 保持默认（default_value 标记为 true）
 
-    let mut injectors: HashMap<usize, RuntimeInjector> = HashMap::new();
-    injectors.insert(100, inj);
-
-    let mut objects: HashMap<usize, RuntimeObject> = HashMap::new();
-    let mut next_id = 1usize;
-    let mut payloads: HashMap<usize, Box<dyn std::any::Any>> = HashMap::new();
-    let pool = InvokeParameterPool::new();
+    let mut vm = VirtualMachine::new();
+    vm.next_object_id = 1;
+    vm.injectors.insert(100, inj);
 
     // 直接调用 gorge_field_initialize：在新对象上应用注入器覆写
     let obj = RuntimeObject::new_simple(
@@ -237,14 +324,11 @@ fn test_vector2_field_initialize_applies_injector_override() {
     );
     let obj_id;
     {
-        let mut ctx = NativeContext::with_injector(
-            &pool, &mut objects, &mut next_id, &mut payloads, &injectors, 100,
-        );
+        let mut ctx = NativeContext::with_injector(&mut vm, 100);
         obj_id = ctx.register_object(obj);
         Vector2::gorge_field_initialize(&mut ctx, obj_id);
     }
     // x 被注入器覆写为 7.0；y 用默认值 0.0
-    assert_eq!(objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_x) as f32, 7.0);
-    assert_eq!(objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_y) as f32, 0.0);
+    assert_eq!(vm.objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_x) as f32, 7.0);
+    assert_eq!(vm.objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_y) as f32, 0.0);
 }
-

@@ -1,14 +1,14 @@
 use std::env;
 use std::fs;
 
-use gorge_core::ir::ValueType;
-use gorge_core::vm::VirtualMachine;
-use gorge_core::runtime::GorgeRuntime;
-use gorge_core::bytecode::InjectorConstField;
-use gorge_core::ir::CompiledMethod;
-use gorge_core::class::RuntimeClass;
-use gorge_core::declaration::ClassDeclaration;
-use gorge_core::types::TypeCount;
+use gorge_core::virtual_machine::ir::ValueType;
+use gorge_core::virtual_machine::vm::VirtualMachine;
+use gorge_core::objective::runtime::GorgeRuntime;
+use gorge_core::objective::bytecode::InjectorConstField;
+use gorge_core::virtual_machine::ir::CompiledMethod;
+use gorge_core::objective::class::RuntimeClass;
+use gorge_core::objective::declaration::ClassDeclaration;
+use gorge_core::objective::types::TypeCount;
 use std::collections::HashMap;
 
 fn main() {
@@ -32,7 +32,7 @@ fn main() {
     };
 
     // 反序列化为模块
-    let module = match gorge_core::bytecode::deserialize_module(&data) {
+    let module = match gorge_core::objective::bytecode::deserialize_module(&data) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("错误：无效的字节码文件: {}", e);
@@ -84,6 +84,8 @@ fn main() {
             interface_method_impl_id: HashMap::new(),
             method_override_id: HashMap::new(),
             injector_constructor_impl_id: vec![],
+            method_annotations: compiled_class.method_annotations.clone(),
+            constructor_annotations: compiled_class.constructor_annotations.clone(),
         };
 
         let mut cls = RuntimeClass::new(decl, None);
@@ -142,9 +144,11 @@ fn main() {
                 interface_method_impl_id: HashMap::new(),
                 method_override_id: HashMap::new(),
                 injector_constructor_impl_id: vec![],
+                method_annotations: compiled_class.method_annotations.clone(),
+                constructor_annotations: compiled_class.constructor_annotations.clone(),
             };
             let arc_decl = Arc::new(injector_decl);
-            let _injector = gorge_core::injector::RuntimeInjector::from_defs(
+            let _injector = gorge_core::system::native::injector::RuntimeInjector::from_defs(
                 arc_decl,
                 &compiled_class.injector_fields,
             );
@@ -157,7 +161,7 @@ fn main() {
         let class_name = compiled_class.class_type.full_name();
 
         // 注册类静态方法表到 VM（供 InvokeStatic 查找）
-        let mut method_params: Vec<(CompiledMethod, Vec<gorge_core::ir::ValueType>)> = Vec::new();
+        let mut method_params: Vec<(CompiledMethod, Vec<gorge_core::virtual_machine::ir::ValueType>)> = Vec::new();
         for method in &compiled_class.methods {
             method_params.push((method.clone(), vec![]));
         }
@@ -181,14 +185,14 @@ fn main() {
                 vm.register_runtime_class(&class_name, runtime_cls.clone());
             }
 
-            // 注册当前类的委托实现到 VM
-            let mut cls_delegates: Vec<(CompiledMethod, Vec<gorge_core::ir::ValueType>, gorge_core::ir::ValueType)> = Vec::new();
+            // 注册当前类的委托实现到 VM（V5: 含捕获变量类型）
+            let mut cls_delegates: Vec<(CompiledMethod, Vec<gorge_core::virtual_machine::ir::ValueType>, gorge_core::virtual_machine::ir::ValueType, Vec<gorge_core::virtual_machine::ir::ValueType>)> = Vec::new();
             for delegate in &compiled_class.delegate_impls {
                 cls_delegates.push((CompiledMethod {
                     name: "lambda".into(),
                     codes: delegate.body_ir.clone(),
                     local_count: 16,
-                }, delegate.param_types.clone(), delegate.return_type));
+                }, delegate.param_types.clone(), delegate.return_type, delegate.captured_var_types.clone()));
             }
             vm.register_class_delegates(&class_name, cls_delegates);
 

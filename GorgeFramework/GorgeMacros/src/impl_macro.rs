@@ -70,21 +70,21 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #clean_impl
 
-        impl ::gorge_core::native::NativeClass for #self_ty {
+        impl                 ::gorge_core::objective::native::NativeClass for #self_ty {
             fn full_name(&self) -> &str {
                 <#self_ty>::GORGE_FULL_NAME
             }
 
-            fn field_type_count(&self) -> &::gorge_core::types::TypeCount {
+            fn field_type_count(&self) -> &::gorge_core::objective::types::TypeCount {
                 // 返回一次性初始化的字段计数（借用要求返回引用，用 OnceLock 缓存）
-                static COUNT: ::std::sync::OnceLock<::gorge_core::types::TypeCount> =
+                static COUNT: ::std::sync::OnceLock<::gorge_core::objective::types::TypeCount> =
                     ::std::sync::OnceLock::new();
                 COUNT.get_or_init(|| <#self_ty>::gorge_field_type_count())
             }
 
             fn invoke_native_static(
                 &self,
-                ctx: &mut ::gorge_core::native::NativeContext,
+                ctx: &mut ::gorge_core::objective::native::NativeContext,
                 method_id: usize,
             ) {
                 match method_id {
@@ -95,7 +95,7 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             fn invoke_native_method(
                 &self,
-                ctx: &mut ::gorge_core::native::NativeContext,
+                ctx: &mut ::gorge_core::objective::native::NativeContext,
                 this: usize,
                 method_id: usize,
             ) {
@@ -107,7 +107,7 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             fn do_construct_native(
                 &self,
-                ctx: &mut ::gorge_core::native::NativeContext,
+                ctx: &mut ::gorge_core::objective::native::NativeContext,
                 target: ::std::option::Option<usize>,
                 ctor_id: usize,
             ) -> usize {
@@ -115,7 +115,7 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 let this = match target {
                     ::std::option::Option::Some(id) => id,
                     ::std::option::Option::None => {
-                        let obj = ::gorge_core::object::RuntimeObject::new_simple(
+                        let obj = ::gorge_core::objective::object::RuntimeObject::new_simple(
                             <#self_ty>::GORGE_FULL_NAME.to_string(),
                             &<#self_ty>::gorge_field_type_count(),
                         );

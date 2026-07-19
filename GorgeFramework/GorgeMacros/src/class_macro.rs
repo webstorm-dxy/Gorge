@@ -83,12 +83,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             /// 对象字段各值类型数量
-            pub fn gorge_field_type_count() -> ::gorge_core::types::TypeCount {
+            pub fn gorge_field_type_count() -> ::gorge_core::objective::types::TypeCount {
                 #tc_field
             }
 
             /// 注入器字段各值类型数量
-            pub fn gorge_injector_field_type_count() -> ::gorge_core::types::TypeCount {
+            pub fn gorge_injector_field_type_count() -> ::gorge_core::objective::types::TypeCount {
                 #tc_inject
             }
 
@@ -252,7 +252,7 @@ fn count_by_kind<'a>(fields: impl Iterator<Item = &'a FieldSpec>) -> KindCounts 
 fn build_type_count(c: &KindCounts) -> TokenStream2 {
     let (i, f, b, s, o) = (c.int, c.float, c.bool, c.string, c.object);
     quote! {
-        ::gorge_core::types::TypeCount {
+                ::gorge_core::objective::types::TypeCount {
             int_count: #i,
             float_count: #f,
             bool_count: #b,
@@ -429,14 +429,14 @@ fn build_field_initialize(struct_ident: &syn::Ident, fields: &[FieldSpec]) -> To
         return quote! {
             /// 应用注入器字段覆写（本类无可覆写字段，空实现）。
             #[allow(dead_code, unused_variables)]
-            pub fn gorge_field_initialize(ctx: &mut ::gorge_core::native::NativeContext, this: usize) {}
+            pub fn gorge_field_initialize(ctx: &mut ::gorge_core::objective::native::NativeContext, this: usize) {}
         };
     }
 
     quote! {
         /// 应用注入器字段覆写到对象字段（native 构造时调用，对齐 C# FieldInitialize）。
         #[allow(dead_code)]
-        pub fn gorge_field_initialize(ctx: &mut ::gorge_core::native::NativeContext, this: usize) {
+        pub fn gorge_field_initialize(ctx: &mut ::gorge_core::objective::native::NativeContext, this: usize) {
             #(#stmts)*
         }
     }
