@@ -6,7 +6,9 @@
 
 pub mod system;
 pub mod adaptor;
+pub mod automaton;
 pub mod chart;
+pub mod input;
 pub mod runtime;
 pub mod signal;
 pub mod simulators;
@@ -24,60 +26,60 @@ pub use system::native::touch_signal::TouchSignal;
 pub use system::native::color_argb::ColorArgb;
 pub use system::native::priority::Priority;
 pub use system::native::period_config::PeriodConfig;
-pub use system::native::resource::Graph;
-pub use system::native::element::ElementLinePoint;
-pub use system::native::element::ElementLine;
+pub use system::native::graph::Graph;
+pub use system::native::element_line_point::ElementLinePoint;
+pub use system::native::element_line::ElementLine;
 pub use system::native::logger::Logger;
-pub use system::native::commands::AppendSignalCommand;
-pub use system::native::commands::DeriveElementCommand;
-pub use system::native::commands::DestroyElementCommand;
-pub use system::native::function_curve::ConstantFunctionCurve;
-pub use system::native::function_curve::LinearFunctionCurve;
-pub use system::native::function_curve::QuadraticFunctionCurve;
-pub use system::native::function_curve::LinearCurve;
-pub use system::native::function_curve::ArcFunctionCurve;
-pub use system::native::function_curve::CubicHermiteSpline;
-pub use system::native::time::TimeItem;
+pub use system::native::append_signal_command::AppendSignalCommand;
+pub use system::native::derive_element_command::DeriveElementCommand;
+pub use system::native::destroy_element_command::DestroyElementCommand;
+pub use system::native::constant_function_curve::ConstantFunctionCurve;
+pub use system::native::linear_function_curve::LinearFunctionCurve;
+pub use system::native::quadratic_function_curve::QuadraticFunctionCurve;
+pub use system::native::linear_curve::LinearCurve;
+pub use system::native::arc_function_curve::ArcFunctionCurve;
+pub use system::native::cubic_hermite_spline::CubicHermiteSpline;
+pub use system::native::time_item::TimeItem;
 pub use system::native::float_signal_filter::FloatSignalFilter;
-pub use system::native::input_graph::InputGraphEdge;
+pub use system::native::input_graph_edge::InputGraphEdge;
 pub use system::native::note_linkage::NoteLinkage;
 pub use system::native::variable_float::VariableFloat;
-pub use system::native::function_curve::FunctionPiece;
-pub use system::native::function_curve::CompositeFunctionCurve;
-pub use system::native::function_curve::AdditionFunctionCurve;
-pub use system::native::function_curve::MultiplicationFunctionCurve;
-pub use system::native::function_curve::PeriodicFunctionCurve;
-pub use system::native::function_curve::AxialSymmetricFunctionCurve;
-pub use system::native::function_curve::PiecewiseFunctionCurve;
+pub use system::native::function_curve_combinators::FunctionPiece;
+pub use system::native::function_curve_combinators::CompositeFunctionCurve;
+pub use system::native::function_curve_combinators::AdditionFunctionCurve;
+pub use system::native::function_curve_combinators::MultiplicationFunctionCurve;
+pub use system::native::function_curve_combinators::PeriodicFunctionCurve;
+pub use system::native::function_curve_combinators::AxialSymmetricFunctionCurve;
+pub use system::native::function_curve_combinators::PiecewiseFunctionCurve;
 pub use system::native::node_native::Node;
 pub use system::native::element_native::Element;
-pub use system::native::note_native::Note;
+pub use system::native::note::Note;
 pub use system::native::signal_filter_native::SignalFilter;
-pub use system::native::input_signal_filter_native::InputSignalFilter;
+pub use system::native::input_signal_filter::InputSignalFilter;
 pub use system::native::input_graph::InputGraph;
 pub use system::native::input_graph_state::InputGraphState;
 pub use system::native::history::HistoryStack;
-pub use system::native::time::TimeStack;
+pub use system::native::time_stack::TimeStack;
 pub use system::native::element_simulator::ElementSimulator;
 pub use system::native::lerp_color_curve::LerpColorCurve;
 pub use system::native::annulus_mesh_transformer::AnnulusMeshTransformer;
 pub use system::native::transform::CurveMeshTransformer;
 pub use system::native::curve_warp_transformer::CurveWarpTransformer;
 // S6: 资产族 + 精灵族 + 音频/视频 + 环境
-pub use system::native::resource::Asset;
-pub use system::native::resource::GraphAsset;
-pub use system::native::resource::ImageAsset;
-pub use system::native::resource::NativeAudioAsset;
-pub use system::native::resource::NativeVideoAsset;
+pub use system::native::asset::Asset;
+pub use system::native::graph_asset::GraphAsset;
+pub use system::native::image_asset::ImageAsset;
+pub use system::native::native_audio_asset::NativeAudioAsset;
+pub use system::native::native_video_asset::NativeVideoAsset;
 pub use system::native::audio_asset::AudioAsset;
-pub use system::native::audio_asset::WavAudioAsset;
+pub use system::native::wav_audio_asset::WavAudioAsset;
 pub use system::native::video_asset::VideoAsset;
-pub use system::native::audio_native::AudioNative;
-pub use system::native::video_native::VideoNative;
-pub use system::native::sprite_native::Sprite;
+pub use system::native::audio::AudioNative;
+pub use system::native::video::VideoNative;
+pub use system::native::sprite::Sprite;
 pub use system::native::nine_slice_sprite::NineSliceSprite;
-pub use system::native::curve_sprite_native::CurveSprite;
-pub use system::native::environment_native::EnvironmentNative;
+pub use system::native::curve_sprite::CurveSprite;
+pub use system::native::environment::EnvironmentNative;
 // S7: SignalTsiga 自动机
 pub use system::native::signal_tsiga::SignalTsiga;
 // 阶段1-C: 曲线分派基类
@@ -113,12 +115,21 @@ pub fn native_classes() -> Vec<Arc<dyn NativeClass>> {
         Arc::new(AppendSignalCommand { signal_id: 0, priority: 0 }),
         Arc::new(DeriveElementCommand { element_spec: 0 }),
         Arc::new(DestroyElementCommand { target_type: 0 }),
+        // 简单函数曲线
         Arc::new(ConstantFunctionCurve { value: 0.0 }),
         Arc::new(LinearFunctionCurve { k: 0.0, b: 0.0 }),
         Arc::new(QuadraticFunctionCurve { a: 0.0, b: 0.0, c: 0.0 }),
         Arc::new(LinearCurve { time_start: 0.0, value_start: 0.0, time_end: 0.0, value_end: 0.0 }),
         Arc::new(ArcFunctionCurve { chord_start: 0.0, chord_end: 0.0, angle: 0.0 }),
         Arc::new(CubicHermiteSpline { time_start: 0.0, value_start: 0.0, m0: 0.0, w0: 0.0, time_end: 0.0, value_end: 0.0, m1: 0.0, w1: 0.0 }),
+        // 函数曲线组合器
+        Arc::new(AdditionFunctionCurve { first: 0, second: 0 }),
+        Arc::new(MultiplicationFunctionCurve { first: 0, second: 0 }),
+        Arc::new(CompositeFunctionCurve { outer: 0, inner: 0 }),
+        Arc::new(PeriodicFunctionCurve { curve: 0, start_x: 0.0, end_x: 0.0 }),
+        Arc::new(AxialSymmetricFunctionCurve { curve: 0, axis_center: 0.0, axis_amplitude: 0.0 }),
+        Arc::new(FunctionPiece { curve: 0, start_x: 0.0, end_x: 0.0 }),
+        Arc::new(PiecewiseFunctionCurve { pieces: 0 }),
         Arc::new(TimeItem { time: 0, accept: false, respond_mode: String::new() }),
         Arc::new(FloatSignalFilter { priority: 0, condition_types: 0, end_time: 0, time_mode: 0, accept_consume: true, deny_consume: false, channel_name: String::new(), filter_range: 0 }),
         Arc::new(InputGraphEdge { deny: false, jump: 0, stack_respond: false, edge_respond: false, accept: false, export_state: String::new() }),

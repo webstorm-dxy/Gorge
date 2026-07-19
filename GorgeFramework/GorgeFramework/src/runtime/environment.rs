@@ -4,11 +4,14 @@
 
 pub mod simulation_module;
 pub mod global;
+pub mod scene_manager;
+pub mod simulation_manager;
+pub mod priority_heap;
 
 use crate::runtime::priority_heap::PriorityHeap;
 use crate::signal::channel_split::ChannelSplit;
-use crate::signal::edge::Edge;
-use crate::signal::fragment::Fragment;
+use crate::input::edge::Edge;
+use crate::input::fragment::Fragment;
 use crate::signal::multichannel_split::MultichannelSplit;
 use gorge_core::system::native::injector::Injector;
 

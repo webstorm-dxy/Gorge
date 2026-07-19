@@ -3,7 +3,7 @@
 //! 每个信号 ID 对应一个 FIFO 边沿队列，支持入队和出队操作。
 
 use std::collections::{HashMap, VecDeque};
-use super::edge::Edge;
+use crate::input::edge::Edge;
 
 /// 单通道边沿队列：signalId → FIFO 边沿队列
 #[derive(Debug, Clone)]

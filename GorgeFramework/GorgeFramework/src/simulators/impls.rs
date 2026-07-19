@@ -313,7 +313,7 @@ impl IGameplayAction for AppendSignal {
             &self.channel, self.signal_id, sim_time + self.delay_simulate_time, self.value,
         );
         if add_success && self.delay_simulate_time == 0.0 {
-            edge_queue.enqueue(&self.channel, self.signal_id, crate::signal::edge::Edge::new(sim_time, self.value));
+            edge_queue.enqueue(&self.channel, self.signal_id, crate::input::edge::Edge::new(sim_time, self.value));
         }
     }
 
@@ -870,7 +870,7 @@ impl ISimulator for PreciseAutomatonSimulator {
                         let class_name = detect_ctx.vm.objects.get(&cond.filter_id)
                             .map(|o| o.class_name.clone()).unwrap_or_default();
                         if class_name.contains("InputSignalFilter") {
-                            crate::system::native::input_signal_filter_native::InputSignalFilter::detect_touch(
+                            crate::system::native::input_signal_filter::InputSignalFilter::detect_touch(
                                 &mut detect_ctx, cond.filter_id, *signal_id, 0,
                                 if consume_flag { 0 } else { *value_obj_id }, last_value,
                             )

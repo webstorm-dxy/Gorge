@@ -79,7 +79,7 @@ mod tests {
     use gorge_core::objective::native::NativeClass;
     use gorge_core::objective::object::RuntimeObject;
     use gorge_core::virtual_machine::vm::VirtualMachine;
-    use crate::system::native::function_curve::LinearFunctionCurve;
+    use crate::system::native::linear_function_curve::LinearFunctionCurve;
 
     fn make_vm() -> VirtualMachine {
         VirtualMachine::new()

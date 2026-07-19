@@ -353,7 +353,7 @@ mod tests {
     use gorge_core::objective::object::GorgeObject;
     use gorge_core::virtual_machine::vm::VirtualMachine;
     use crate::system::native::history::HistoryStack;
-    use crate::system::native::time::TimeStack;
+    use crate::system::native::time_stack::TimeStack;
     use crate::system::native::input_graph::InputGraph;
 
     struct Fixture {

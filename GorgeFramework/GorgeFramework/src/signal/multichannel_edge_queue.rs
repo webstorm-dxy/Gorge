@@ -3,7 +3,7 @@
 //! 按频道名组织多个单通道边沿队列。
 
 use std::collections::HashMap;
-use super::edge::Edge;
+use crate::input::edge::Edge;
 use super::channel_edge_queue::ChannelEdgeQueue;
 
 /// 多通道边沿队列：频道名 → 单通道队列

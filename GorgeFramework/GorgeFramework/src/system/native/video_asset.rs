@@ -1,8 +1,7 @@
-//! `GorgeFramework.VideoAsset` / `NativeVideoAsset` —— 视频资产 native 类。
+//! `GorgeFramework.VideoAsset` —— 视频资产 native 类。
 //!
 //! 移植自 C# 参考实现 `VideoAsset.cs`。
-//! VideoAsset 通过 Environment.GetAssetByName 查找资产；
-//! NativeVideoAsset 直接持有 Video 对象引用。
+//! VideoAsset 通过 Environment.GetAssetByName 查找资产。
 
 use gorge_macros::{gorge_native_class, gorge_native_impl};
 use gorge_core::objective::native::NativeContext;
