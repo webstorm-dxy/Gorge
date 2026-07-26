@@ -99,7 +99,19 @@ impl NineSliceSprite {
             let rb_y = ctx.get_object_float_field(slice_right_bottom, 1);
             let bs_x = ctx.get_object_float_field(base_size, 0);
             let bs_y = ctx.get_object_float_field(base_size, 1);
-            sprite_obj.set_graph(graph, bs_x as f32, bs_y as f32, lt_x as f32, lt_y as f32, rb_x as f32, rb_y as f32);
+            let graph_handle = crate::runtime::environment::global::resolve_graph_handle(
+                ctx.vm as *mut _ as usize,
+                graph,
+            );
+            sprite_obj.set_graph(
+                graph_handle,
+                bs_x as f32,
+                bs_y as f32,
+                lt_x as f32,
+                lt_y as f32,
+                rb_x as f32,
+                rb_y as f32,
+            );
             ctx.insert_payload(this, Box::new(sprite_obj));
         }
     }

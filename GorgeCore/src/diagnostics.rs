@@ -208,7 +208,27 @@ impl Diagnostics {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(&Self::render_diagnostic(diagnostic, sources));
+            let source = sources.get(diagnostic.span.source_id).copied().unwrap_or("<unknown>");
+            output.push_str(&Self::render_diagnostic(diagnostic, "<source>", source));
+        }
+        output
+    }
+
+    /// 使用调用方提供的源码名称渲染诊断。
+    ///
+    /// `sources` 的下标仍与 [`Span::source_id`] 对应；每项的第一列用于显示文件名，
+    /// 第二列为源码内容。适用于 zip 包、虚拟文件系统等没有本地路径的场景。
+    pub fn render_with_source_names(&self, sources: &[(&str, &str)]) -> String {
+        let mut output = String::new();
+        for diagnostic in &self.entries {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            let (source_name, source) = sources
+                .get(diagnostic.span.source_id)
+                .copied()
+                .unwrap_or(("<unknown>", "<unknown>"));
+            output.push_str(&Self::render_diagnostic(diagnostic, source_name, source));
         }
         output
     }
@@ -224,14 +244,11 @@ impl Diagnostics {
     ///    |               ^
     ///    |               error: expected expression
     /// ```
-    fn render_diagnostic(diagnostic: &Diagnostic, sources: &[&str]) -> String {
+    fn render_diagnostic(diagnostic: &Diagnostic, source_name: &str, source: &str) -> String {
         use std::fmt::Write;
 
         let mut out = String::new();
         let span = &diagnostic.span;
-
-        // 根据 source_id 获取对应的源代码文本，不存在时回退为 "<unknown>"
-        let source = sources.get(span.source_id).copied().unwrap_or("<unknown>");
 
         // 输出第一行：级别和消息文本
         write!(
@@ -244,8 +261,8 @@ impl Diagnostics {
         // 输出第二行：位置指示符
         write!(
             out,
-            "  --> <source>:{}:{}\n",
-            span.line, span.column
+            "  --> {}:{}:{}\n",
+            source_name, span.line, span.column
         )
         .unwrap();
 
@@ -318,5 +335,19 @@ mod tests {
         assert!(rendered.contains("error: unexpected token"));
         assert!(rendered.contains("-->"));
         assert!(rendered.contains("^"));
+    }
+
+    #[test]
+    fn test_render_with_source_names() {
+        let mut diags = Diagnostics::new();
+        diags.emit_error(Span::new(5, 6, 2, 4, 1), "unknown field");
+
+        let rendered = diags.render_with_source_names(&[
+            ("Native.zip!System.g", "class System {}"),
+            ("Dremu.zip!Note.g", "class Note {\n  x.y;\n}"),
+        ]);
+
+        assert!(rendered.contains("Dremu.zip!Note.g:2:4"));
+        assert!(rendered.contains("x.y;"));
     }
 }

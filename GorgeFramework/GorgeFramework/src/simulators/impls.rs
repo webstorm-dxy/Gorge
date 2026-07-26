@@ -269,14 +269,36 @@ impl ISimulator for GraphicsNodeSimulator {
     }
 }
 
-/// 遍历所有图形节点并调用 UpdateNode（Node 方法 5）
+/// 返回具体图形节点 native 类的更新方法编号。
+///
+/// `Node.UpdateNode` 在 Node native ABI 中是 5 号方法；三个派生渲染节点
+/// 各自在本类 native ABI 中以 0 号方法覆盖更新逻辑。
+fn graphics_node_update_method(class_name: &str) -> Option<usize> {
+    match class_name.rsplit('.').next().unwrap_or(class_name) {
+        "Node" => Some(5),
+        "Sprite" | "NineSliceSprite" | "CurveSprite" => Some(0),
+        _ => None,
+    }
+}
+
+/// 遍历所有图形节点并按实际 native 类型调用 UpdateNode。
 fn simulate_all_nodes(runtime: &GorgeSimulationRuntime, vm: &mut VirtualMachine) {
     let node_ids: Vec<usize> = runtime.graphics.nodes.clone();
     for node_id in node_ids {
         if node_id == 0 { continue; }
+        let class_name = vm.objects
+            .get(&node_id)
+            .map(|node| node.class_name.clone())
+            .unwrap_or_default();
+        let Some(update_method) = graphics_node_update_method(&class_name) else {
+            continue;
+        };
         let mut ctx = gorge_core::objective::native::NativeContext::new(vm);
-        // 调用 Node.UpdateNode（方法 5）
-        ctx.invoke_native_method_on("GorgeFramework.Node", node_id, 5);
+        if update_method == 0 {
+            // 派生更新前先执行 Node 的存在性引用检查。
+            ctx.invoke_native_method_on("GorgeFramework.Node", node_id, 5);
+        }
+        ctx.invoke_native_method_on(&class_name, node_id, update_method);
     }
 }
 
@@ -335,6 +357,16 @@ impl IGameplayAction for Terminate {
 // ==================== 元素生命周期动作 ====================
 
 /// 创生元素动作（对齐 C# `GenerateElement`，S4-1/3/6）
+///
+/// `Element.g` 的 object 字段布局是运行时 ABI：simulator、
+/// lateIndependentSimulator、nodes、derivedElements。`Note.automaton`
+/// 紧随其后。不要在调用点写入裸编号，以免 native stub 变更后静默错读字段。
+const ELEMENT_SIMULATOR_FIELD: usize = 0;
+const ELEMENT_LATE_INDEPENDENT_SIMULATOR_FIELD: usize = 1;
+const ELEMENT_NODES_FIELD: usize = 2;
+const ELEMENT_DERIVED_ELEMENTS_FIELD: usize = 3;
+const NOTE_AUTOMATON_FIELD: usize = 4;
+
 pub struct GenerateElement {
     /// 元素注入器 ID
     pub injector_id: usize,
@@ -378,7 +410,7 @@ impl IGameplayAction for GenerateElement {
         // 3. 读取 element.simulator / element.late_independent_simulator 字段
         // Element 类字段顺序：simulator(对象0), late_independent_simulator(对象1)
         let simulator_id = vm.objects.get(&element_id)
-            .map(|o| o.get_object_field(0))
+            .map(|o| o.get_object_field(ELEMENT_SIMULATOR_FIELD))
             .unwrap_or(0);
         if simulator_id != 0 {
             // S7: 通过 ElementSimulatorAdapter 包装原生物件，注册进 SimRegistry
@@ -387,7 +419,7 @@ impl IGameplayAction for GenerateElement {
             runtime.simulation.simulators.register(10, reg_key);
         }
         let late_sim_id = vm.objects.get(&element_id)
-            .map(|o| o.get_object_field(1))
+            .map(|o| o.get_object_field(ELEMENT_LATE_INDEPENDENT_SIMULATOR_FIELD))
             .unwrap_or(0);
         if late_sim_id != 0 {
             let adapter = Box::new(ElementSimulatorAdapter::new(late_sim_id));
@@ -399,9 +431,9 @@ impl IGameplayAction for GenerateElement {
         let is_note = is_subclass_of_note(&class_name, vm);
         if is_note {
             runtime.chart.alive_notes.push(element_id);
-            // Note 的 automaton 字段（对象字段索引 2，在 simulator 和 late_independent_simulator 之后）
+            // Note 的 automaton 字段位于 Element 全部 object 字段之后。
             let automaton_id = vm.objects.get(&element_id)
-                .map(|o| o.get_object_field(2))
+                .map(|o| o.get_object_field(NOTE_AUTOMATON_FIELD))
                 .unwrap_or(0);
             if automaton_id != 0 {
                 runtime.automaton.automatons.push(automaton_id);
@@ -432,9 +464,9 @@ impl IGameplayAction for GenerateElement {
         }
 
         // 6. Nodes 登记（S4-6）
-        // Element 的 nodes 字段（ObjectArray，对象字段索引 3）
+        // Element 的 nodes 字段（ObjectArray）。
         let nodes_array_id = vm.objects.get(&element_id)
-            .map(|o| o.get_object_field(3))
+            .map(|o| o.get_object_field(ELEMENT_NODES_FIELD))
             .unwrap_or(0);
         if nodes_array_id != 0 {
             // 经 ObjectArray payload 读取各节点对象 ID
@@ -449,9 +481,9 @@ impl IGameplayAction for GenerateElement {
         }
 
         // 7. derivedElements 处理（S4-2）：读取 derived_elements 字段并逐个派生
-        // Element 的 derived_elements 字段（ObjectArray，对象字段索引 4）
+        // Element 的 derived_elements 字段（ObjectArray）。
         let derived_array_id = vm.objects.get(&element_id)
-            .map(|o| o.get_object_field(4))
+            .map(|o| o.get_object_field(ELEMENT_DERIVED_ELEMENTS_FIELD))
             .unwrap_or(0);
         if derived_array_id != 0 {
             let derived_ids = vm.native_payloads
@@ -657,26 +689,44 @@ fn do_derive_element(
     runtime.chart.alive_elements.push(element_id);
     // 注册模拟器
     let simulator_id = vm.objects.get(&element_id)
-        .map(|o| o.get_object_field(0))
+        .map(|o| o.get_object_field(ELEMENT_SIMULATOR_FIELD))
         .unwrap_or(0);
     if simulator_id != 0 {
-        runtime.simulation.simulators.register(10, simulator_id);
+        let adapter = Box::new(ElementSimulatorAdapter::new(simulator_id));
+        let registry_id = runtime.sim_registry.register(adapter);
+        runtime.simulation.simulators.register(10, registry_id);
     }
     let late_sim_id = vm.objects.get(&element_id)
-        .map(|o| o.get_object_field(1))
+        .map(|o| o.get_object_field(ELEMENT_LATE_INDEPENDENT_SIMULATOR_FIELD))
         .unwrap_or(0);
     if late_sim_id != 0 {
-        runtime.simulation.late_independent_simulators.register(10, late_sim_id);
+        let adapter = Box::new(ElementSimulatorAdapter::new(late_sim_id));
+        let registry_id = runtime.late_sim_registry.register(adapter);
+        runtime.simulation.late_independent_simulators.register(10, registry_id);
     }
     // Note 判定 + 自动机注册
     if is_subclass_of_note(&class_name, vm) {
         runtime.chart.alive_notes.push(element_id);
         let automaton_id = vm.objects.get(&element_id)
-            .map(|o| o.get_object_field(2))
+            .map(|o| o.get_object_field(NOTE_AUTOMATON_FIELD))
             .unwrap_or(0);
         if automaton_id != 0 {
             runtime.automaton.automatons.push(automaton_id);
+            fill_pending_detection_conditions(automaton_id, runtime, vm);
         }
+    }
+
+    // 派生元素与普通创生元素使用相同的图形节点登记规则。
+    let nodes_array_id = vm.objects.get(&element_id)
+        .map(|o| o.get_object_field(ELEMENT_NODES_FIELD))
+        .unwrap_or(0);
+    if nodes_array_id != 0 {
+        let node_ids = vm.native_payloads
+            .get(&nodes_array_id)
+            .and_then(|payload| payload.downcast_ref::<gorge_core::system::native::array::ObjectArray>())
+            .map(|nodes| nodes.items.clone())
+            .unwrap_or_default();
+        runtime.graphics.nodes.extend(node_ids.into_iter().filter(|node_id| *node_id != 0));
     }
 }
 
@@ -1040,7 +1090,9 @@ mod s4_integration_tests {
     use gorge_core::diagnostics::Span;
     use gorge_core::objective::class::RuntimeClass;
     use gorge_core::objective::declaration::*;
+    use gorge_core::objective::object::RuntimeObject;
     use gorge_core::objective::types::*;
+    use gorge_core::system::native::array::ObjectArray;
     use gorge_core::system::native::injector::RuntimeInjector;
     use gorge_core::virtual_machine::ir::{
         CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand,
@@ -1077,9 +1129,9 @@ mod s4_integration_tests {
             fields: vec![
                 FieldInfo { name: "simulator".into(), field_type: GorgeType::new(BasicType::Object), is_static: false, is_native: false },
                 FieldInfo { name: "late_independent_simulator".into(), field_type: GorgeType::new(BasicType::Object), is_static: false, is_native: false },
-                FieldInfo { name: "automaton".into(), field_type: GorgeType::new(BasicType::Object), is_static: false, is_native: false },
                 FieldInfo { name: "nodes".into(), field_type: GorgeType::new(BasicType::Object), is_static: false, is_native: false },
                 FieldInfo { name: "derived_elements".into(), field_type: GorgeType::new(BasicType::Object), is_static: false, is_native: false },
+                FieldInfo { name: "automaton".into(), field_type: GorgeType::new(BasicType::Object), is_static: false, is_native: false },
             ],
             methods: vec![MethodInfo {
                 name: "__annotation_ForwardTimedDestroy_time".into(),
@@ -1162,12 +1214,6 @@ mod s4_integration_tests {
         assert_eq!(gen_injector, injector_id);
         assert_eq!(gen_ctor, ctor_id);
 
-        // 注册模拟器
-        let gen_reg_id = runtime.sim_registry.register(Box::new(TimedElementGenerator));
-        runtime.simulation.simulators.register(10, gen_reg_id);
-        let des_reg_id = runtime.sim_registry.register(Box::new(TimedElementDestroyer));
-        runtime.simulation.simulators.register(10, des_reg_id);
-
         // 创建模拟机并初始化
         let mut machine = SimulationMachine::new(0.0, 100.0, 1.0);
         machine.runtime_initialize();
@@ -1217,8 +1263,8 @@ mod s4_integration_tests {
         let mut runtime = GorgeSimulationRuntime::new();
         runtime.chart.add_score_element(injector_id, &mut vm);
 
-        assert_eq!(runtime.chart.forward_timed_generate_list.len(), 1);
-        assert!((runtime.chart.forward_timed_generate_list[0].0 - 0.0).abs() < 0.01);
+        assert_eq!(runtime.chart.initialize_generate_list.len(), 1);
+        assert_eq!(runtime.chart.initialize_generate_list[0], (injector_id, 0));
     }
 
     /// 测试：add_score_element 处理 Delegate 注解参数
@@ -1268,5 +1314,51 @@ mod s4_integration_tests {
         // Delegate 方法体返回 float 3.0
         assert!((runtime.chart.forward_timed_generate_list[0].0 - 3.0).abs() < 0.01,
             "Delegate 方法返回 3.0，time 应为 3.0");
+    }
+
+    #[test]
+    fn test_graphics_node_update_method_uses_derived_native_abi() {
+        assert_eq!(ELEMENT_SIMULATOR_FIELD, 0);
+        assert_eq!(ELEMENT_LATE_INDEPENDENT_SIMULATOR_FIELD, 1);
+        assert_eq!(ELEMENT_NODES_FIELD, 2);
+        assert_eq!(ELEMENT_DERIVED_ELEMENTS_FIELD, 3);
+        assert_eq!(NOTE_AUTOMATON_FIELD, 4);
+        assert_eq!(graphics_node_update_method("GorgeFramework.Node"), Some(5));
+        assert_eq!(graphics_node_update_method("GorgeFramework.Sprite"), Some(0));
+        assert_eq!(graphics_node_update_method("NineSliceSprite"), Some(0));
+        assert_eq!(graphics_node_update_method("GorgeFramework.CurveSprite"), Some(0));
+        assert_eq!(graphics_node_update_method("Dremu.UnknownNode"), None);
+    }
+
+    #[test]
+    fn test_derive_element_registers_nodes_from_element_nodes_field() {
+        let mut vm = VirtualMachine::new();
+        let (class_name, _) = register_test_class(&mut vm);
+        let element_id = 1;
+        let nodes_array_id = 2;
+        let node_id = 3;
+
+        let mut element = RuntimeObject::new_simple(
+            class_name,
+            &TypeCount { object_count: 5, ..TypeCount::zero() },
+        );
+        element.set_object_field(ELEMENT_NODES_FIELD, nodes_array_id);
+        vm.objects.insert(element_id, element);
+        vm.native_payloads.insert(
+            nodes_array_id,
+            Box::new(ObjectArray { items: vec![node_id] }),
+        );
+
+        let mut runtime = GorgeSimulationRuntime::new();
+        do_derive_element(
+            &mut runtime,
+            &mut vm,
+            element_id,
+            SimulateDirection::Forward,
+        );
+
+        assert_eq!(runtime.chart.alive_elements, vec![element_id]);
+        assert_eq!(runtime.graphics.nodes, vec![node_id]);
+        assert!(runtime.automaton.automatons.is_empty());
     }
 }

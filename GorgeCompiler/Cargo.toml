@@ -3,6 +3,10 @@ name = "GorgeCompiler"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "gorge_compiler"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gorgec"
 path = "src/main.rs"

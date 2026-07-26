@@ -200,7 +200,6 @@ mod tests {
     use super::*;
     use crate::system::native::time_item::TimeItem;
     use gorge_core::objective::native::NativeClass;
-    use gorge_core::objective::object::GorgeObject;
     use gorge_core::virtual_machine::vm::VirtualMachine;
     use crate::system::native::history::{HistoryStack, HistoryStackPayload};
 

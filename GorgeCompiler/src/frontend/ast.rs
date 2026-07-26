@@ -419,6 +419,31 @@ pub enum TypeRef {
     },
 }
 
+impl std::fmt::Display for TypeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeRef::Simple { name, .. } => write!(f, "{name}"),
+            TypeRef::Generic { name, type_args, .. } => {
+                write!(f, "{name}<")?;
+                for (i, arg) in type_args.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ">")
+            }
+            TypeRef::Array { element_type, .. } => write!(f, "{element_type}[]"),
+            TypeRef::Delegate { return_type, param_types, .. } => {
+                write!(f, "delegate<{return_type}")?;
+                for param in param_types {
+                    write!(f, ":{param}")?;
+                }
+                write!(f, ">")
+            }
+            TypeRef::Injector { base_type, .. } => write!(f, "{base_type}^"),
+        }
+    }
+}
+
 impl TypeRef {
     /// 构造一个简单类型引用，不包含泛型参数或数组维度。
     ///
@@ -561,6 +586,13 @@ pub enum Expression {
     Null(Span),
     /// 注入器字段引用 `^fieldName`，用于字段初始化表达式中引用注入器字段
     InjectorFieldRef(String, Span),
+    /// 基于注入器字段构造对象：`new ^field(args)`
+    /// injector_field 不含 ^ 前缀，args 为构造参数列表
+    InjectorNew {
+        injector_field: String,
+        args: Vec<Expression>,
+        span: Span,
+    },
 }
 
 impl Expression {
@@ -590,6 +622,7 @@ impl Expression {
             Expression::Super(span) => *span,
             Expression::Null(span) => *span,
             Expression::InjectorFieldRef(_, span) => *span,
+            Expression::InjectorNew { span, .. } => *span,
         }
     }
 }

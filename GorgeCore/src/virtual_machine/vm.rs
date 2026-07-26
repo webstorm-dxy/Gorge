@@ -133,6 +133,9 @@ pub struct VirtualMachine {
     /// 类注册表：类全名 → RuntimeClass（供方法分派使用）
     pub class_table: HashMap<String, Arc<RuntimeClass>>,
 
+    /// 类 ID → 类全名映射（供 DoConstruct 按 class_id 查找类名）
+    pub class_name_by_id: Vec<String>,
+
     /// Native 类注册表：类全名 → NativeClass（供 native 方法/构造分派）
     pub native_class_table: HashMap<String, Arc<dyn crate::objective::native::NativeClass>>,
     /// Native 对象载荷表：对象 ID → 类型化的 Rust 数据
@@ -179,6 +182,7 @@ impl VirtualMachine {
             class_delegate_impls: HashMap::new(),
             runtime_delegates: HashMap::new(),
             class_table: HashMap::new(),
+            class_name_by_id: Vec::new(),
             native_class_table: HashMap::new(),
             native_payloads: HashMap::new(),
             class_super_name: HashMap::new(),
@@ -220,13 +224,24 @@ impl VirtualMachine {
         self.class_table.insert(class_name.to_string(), cls);
     }
 
+    /// 按 class_id 注册类名（供 DoConstruct 按 ID 查找类名）
+    pub fn register_class_name_by_id(&mut self, class_name: &str) {
+        self.class_name_by_id.push(class_name.to_string());
+    }
+
     /// 注册 native 类（供 native 方法/构造分派使用）
     pub fn register_native_class(
         &mut self,
         class_name: &str,
         cls: Arc<dyn crate::objective::native::NativeClass>,
     ) {
-        self.native_class_table.insert(class_name.to_string(), cls);
+        // 编译期部分路径仍使用短类名，而 native 调用与运行时对象保存完整类名。
+        // 两种名称必须指向同一实现，否则全限定的 native 调用会被静默跳过。
+        let full_name = cls.full_name().to_string();
+        let simple_name = full_name.rsplit('.').next().unwrap_or(&full_name).to_string();
+        self.native_class_table.insert(class_name.to_string(), cls.clone());
+        self.native_class_table.insert(full_name, cls.clone());
+        self.native_class_table.insert(simple_name, cls);
     }
 
     /// 注册类的委托实现（供 InvokeDelegate 按类查找，含返回类型与捕获变量类型）
@@ -1780,14 +1795,18 @@ impl VirtualMachine {
                     .and_then(|cls| cls.find_method(*method_id))
                 {
                     Some(m) => m,
-                    None => {
-                        // 编译子类继承 native 类：方法可能属于 native 祖先（F2）
-                        if let Some(native_anc) = self.find_native_ancestor(&class_name) {
-                            self.dispatch_native_method(&native_anc, target_obj_id, *method_id);
-                            self.write_native_return_to_result(code.result.as_ref());
-                        }
+                None => {
+                    // 编译子类继承 native 类：方法可能属于 native 祖先（F2）
+                    if let Some(native_anc) = self.find_native_ancestor(&class_name) {
+                        self.dispatch_native_method(&native_anc, target_obj_id, *method_id);
+                        self.write_native_return_to_result(code.result.as_ref());
                         return Ok(true);
                     }
+                    return Err(format!(
+                        "未找到方法（全局 ID {}）在类 `{}`（含 native 祖先）中",
+                        method_id, class_name
+                    ));
+                }
                 };
                 let return_type = code.result.as_ref().map(|r| r.value_type).unwrap_or(ValueType::Int);
                 self.call_compiled_method(&method, &ParamMode::Batch, code.result.as_ref(), return_type, None, Some(target_obj_id), false)?;
@@ -1817,10 +1836,10 @@ impl VirtualMachine {
                 if target_obj_id == 0 {
                     return Err("接口方法调用目标对象为空".into());
                 }
-                let iface_name = match Self::read_target_class(code.right.as_ref()) {
-                    Some(n) => n,
-                    None => return Ok(true),
-                };
+            let iface_name = match Self::read_target_class(code.right.as_ref()) {
+                Some(n) => n,
+                None => return Err("接口方法调用缺少接口名（right 操作数非 String）".into()),
+            };
                 let class_name = self.objects
                     .get(&target_obj_id)
                     .map(|o| o.class_name.clone())
@@ -1833,17 +1852,23 @@ impl VirtualMachine {
                     .and_then(|cls| cls.declaration.interface_method_impl_id.get(&iface_name))
                     .and_then(|ids| ids.get(*iface_method_id))
                     .copied();
-                let global_method_id = match global_method_id {
-                    Some(id) if id != usize::MAX => id,
-                    _ => return Ok(true),
-                };
-                let method = match self.class_table
-                    .get(&class_name)
-                    .and_then(|cls| cls.find_method(global_method_id))
-                {
-                    Some(m) => m,
-                    None => return Ok(true),
-                };
+            let global_method_id = match global_method_id {
+                Some(id) if id != usize::MAX => id,
+                _ => return Err(format!(
+                    "类 `{}` 未实现接口 `{}` 的方法（接口方法 ID {}）",
+                    class_name, iface_name, iface_method_id
+                )),
+            };
+            let method = match self.class_table
+                .get(&class_name)
+                .and_then(|cls| cls.find_method(global_method_id))
+            {
+                Some(m) => m,
+                None => return Err(format!(
+                    "类 `{}` 中未找到接口方法实现（全局 ID {}，接口 `{}` 方法 {}）",
+                    class_name, global_method_id, iface_name, iface_method_id
+                )),
+            };
                 let return_type = code.result.as_ref().map(|r| r.value_type).unwrap_or(ValueType::Int);
                 self.call_compiled_method(&method, &ParamMode::Batch, code.result.as_ref(), return_type, Some(&class_name), Some(target_obj_id), false)?;
                 return Ok(true);
@@ -1937,14 +1962,19 @@ impl VirtualMachine {
                 }
                 return Ok(true);
             }
-            IntermediateOperator::DoConstruct(_) => {
+            IntermediateOperator::DoConstruct(class_id) => {
+                let class_name = if *class_id != 0 && *class_id <= self.class_name_by_id.len() {
+                    &self.class_name_by_id[*class_id - 1]
+                } else {
+                    &self.current_class
+                };
                 let obj_id = self.next_object_id;
                 self.next_object_id += 1;
                 let field_counts = self.class_field_counts
-                    .get(&self.current_class)
+                    .get(class_name)
                     .cloned()
                     .unwrap_or_default();
-                let obj = RuntimeObject::new_simple(self.current_class.clone(), &field_counts);
+                let obj = RuntimeObject::new_simple(class_name.clone(), &field_counts);
                 self.objects.insert(obj_id, obj);
                 self.object_stack.write(0, obj_id);
                 let addr = self.get_object_addr(code.result);
@@ -1953,22 +1983,25 @@ impl VirtualMachine {
 
             // === 父类构造调用（super）===
             IntermediateOperator::InvokeSuperConstructor(ctor_id) => {
-                let super_class = match Self::read_target_class(code.right.as_ref()) {
-                    Some(c) => c,
-                    None => return Ok(true),
-                };
+            let super_class = match Self::read_target_class(code.right.as_ref()) {
+                Some(c) => c,
+                None => return Err("super 构造调用缺少父类名（right 操作数非 String）".into()),
+            };
                 let this_id = *self.object_stack.read(0);
                 if self.native_class_table.contains_key(&super_class) {
                     let _ = self.dispatch_native_construct(&super_class, Some(this_id), *ctor_id);
                     return Ok(true);
                 }
-                let ctor_method = match self.class_table
-                    .get(&super_class)
-                    .and_then(|cls| cls.find_constructor(*ctor_id))
-                {
-                    Some(m) => m,
-                    None => return Ok(true),
-                };
+            let ctor_method = match self.class_table
+                .get(&super_class)
+                .and_then(|cls| cls.find_constructor(*ctor_id))
+            {
+                Some(m) => m,
+                None => return Err(format!(
+                    "父类 `{}` 中未找到构造方法（全局 ID {}）",
+                    super_class, ctor_id
+                )),
+            };
                 let param_count = match &code.left {
                     Operand::Immediate(crate::virtual_machine::ir::ImmediateValue::Int(v)) => *v as usize,
                     _ => 0,
@@ -1985,15 +2018,18 @@ impl VirtualMachine {
                 if injector_id != 0 {
                     self.current_injector = Some(injector_id);
                 }
-                let ctor_id = match self.class_table.get(&target_class)
-                    .and_then(|cls| cls.declaration.injector_constructor_impl_id.get(*inj_ctor_idx))
-                {
-                    Some(&real_id) => real_id,
-                    None => {
-                        self.current_injector = saved_injector;
-                        return Ok(true);
-                    }
-                };
+            let ctor_id = match self.class_table.get(&target_class)
+                .and_then(|cls| cls.declaration.injector_constructor_impl_id.get(*inj_ctor_idx))
+            {
+                Some(&real_id) => real_id,
+                None => {
+                    self.current_injector = saved_injector;
+                    return Err(format!(
+                        "类 `{}` 中未找到注入器构造方法映射（注入器构造 ID {}）",
+                        target_class, inj_ctor_idx
+                    ));
+                }
+            };
                 if self.native_class_table.contains_key(&target_class) {
                     let new_id = self.dispatch_native_construct(&target_class, None, ctor_id);
                     let obj_id = if new_id != 0 { new_id } else { self.param_pool.get_object_return() };
@@ -2044,7 +2080,10 @@ impl VirtualMachine {
                     );
                     // 创建编译层包装对象并建立双向引用
                     let obj_id = self.next_object_id; self.next_object_id += 1;
-                    let mut wrapper = RuntimeObject::new_simple(array_class.clone(), &TypeCount::zero());
+                    let mut wrapper = RuntimeObject::new_simple(array_class.clone(), &TypeCount { int_count: 1, ..TypeCount::zero() });
+                    // int 字段 0 存放 length（对齐 C# native 数组类的 `int length` 字段），
+                    // 使编译侧 `arr.length` 的 LoadIntField(0) 能读到数组长度
+                    wrapper.set_int_field(0, size as i64);
                     wrapper.native_object_id = Some(native_id);
                     self.objects.insert(obj_id, wrapper);
                     if let Some(native_obj) = self.objects.get_mut(&native_id) {
@@ -2074,12 +2113,15 @@ impl VirtualMachine {
 
             // 注入器常量加载（G2）
             IntermediateOperator::LoadInjectorConstant(idx) => {
-                let constant = match self.injector_constants.get(*idx) {
-                    Some(c) => c.clone(),
-                    None => {
-                        return Ok(true);
-                    }
-                };
+            let constant = match self.injector_constants.get(*idx) {
+                Some(c) => c.clone(),
+                None => {
+                    return Err(format!(
+                        "注入器常量索引 {} 越界（共 {} 个常量）",
+                        idx, self.injector_constants.len()
+                    ));
+                }
+            };
                 let inj = crate::system::native::injector::RuntimeInjector::from_constant(&constant);
                 let inj_id = self.next_object_id;
                 self.next_object_id += 1;
@@ -2333,6 +2375,7 @@ impl Clone for VirtualMachine {
             class_delegate_impls: self.class_delegate_impls.clone(),
             runtime_delegates: HashMap::new(),
             class_table: self.class_table.clone(),
+            class_name_by_id: self.class_name_by_id.clone(),
             native_class_table: self.native_class_table.clone(),
             native_payloads: HashMap::new(),
             class_super_name: self.class_super_name.clone(),
@@ -3067,6 +3110,15 @@ mod tests {
             name: "Demo.Native".into(),
             counts: TypeCount { float_count: 1, ..TypeCount::zero() },
         })
+    }
+
+    #[test]
+    fn test_native_registration_supports_full_and_simple_names() {
+        let mut vm = VirtualMachine::new();
+        vm.register_native_class("Native", make_demo_native());
+
+        assert!(vm.native_class_table.contains_key("Demo.Native"));
+        assert!(vm.native_class_table.contains_key("Native"));
     }
 
     #[test]
@@ -4090,5 +4142,120 @@ mod tests {
         assert_eq!(vm.param_pool.get_int_param(0), 10);
         assert_eq!(vm.param_pool.get_int_param(1), 20);
         assert!((vm.param_pool.get_float_param(0) - 1.5).abs() < 1e-9);
+    }
+
+    // ==================== 静默吞错回归测试 ====================
+
+    /// InvokeInstance：调用不存在的方法（编译类和 native 祖先均无）应返回 Err
+    #[test]
+    fn test_invoke_instance_method_not_found_returns_err() {
+        use std::sync::Arc;
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::objective::types::GorgeType;
+
+        // 注册一个无任何方法的编译类
+        let decl = ClassDeclaration {
+            class_type: GorgeType::class("Empty", None),
+            is_native: false, annotations: vec![], fields: vec![],
+            methods: vec![], static_methods: vec![],
+            constructors: vec![], injector_fields: vec![],
+            super_class: None, super_interfaces: vec![],
+            field_type_count: TypeCount::zero(),
+            method_count: 0, static_method_count: 0, constructor_count: 0,
+            injector_field_type_count: TypeCount::zero(),
+            injector_field_default_value_type_count: TypeCount::zero(),
+            method_start_id: 0, constructor_start_id: 0,
+            interface_method_impl_id: HashMap::new(),
+            method_override_id: HashMap::new(),
+            injector_constructor_impl_id: vec![],
+            method_annotations: HashMap::new(),
+            constructor_annotations: HashMap::new(),
+        };
+        let cls = Arc::new(RuntimeClass::new(decl, None));
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("Empty", cls.clone());
+        vm.register_class_field_counts("Empty", TypeCount::zero());
+
+        let obj_id = vm.next_object_id;
+        vm.next_object_id += 1;
+        let obj = RuntimeObject::new_simple("Empty".into(), &TypeCount::zero());
+        vm.objects.insert(obj_id, obj);
+        vm.object_stack.push_frame(3);
+        vm.int_stack.push_frame(3);
+        vm.float_stack.push_frame(3);
+        vm.bool_stack.push_frame(3);
+        vm.string_stack.push_frame(3);
+
+        // 调用不存在的实例方法 method_id=0
+        let result_addr = Address::new(ValueType::Int, 1);
+        let invoke_code = IntermediateCode::new(
+            IntermediateOperator::InvokeInstance(0),
+            Operand::Address(Address::new(ValueType::Object, 0)),
+            None,
+            Some(result_addr),
+        );
+        vm.object_stack.write(0, obj_id);
+
+        let result = vm.execute_one(&invoke_code);
+        assert!(result.is_err(), "调用不存在的方法应返回 Err");
+        assert!(result.unwrap_err().contains("未找到方法"), "错误信息应包含'未找到方法'");
+    }
+
+    /// InvokeInterface：类未实现指定接口的方法时返回 Err
+    #[test]
+    fn test_invoke_interface_method_not_implemented_returns_err() {
+        use std::sync::Arc;
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::objective::types::GorgeType;
+
+        // 注册一个未实现任何接口的编译类
+        let decl = ClassDeclaration {
+            class_type: GorgeType::class("NoIface", None),
+            is_native: false, annotations: vec![], fields: vec![],
+            methods: vec![], static_methods: vec![],
+            constructors: vec![], injector_fields: vec![],
+            super_class: None, super_interfaces: vec![],
+            field_type_count: TypeCount::zero(),
+            method_count: 0, static_method_count: 0, constructor_count: 0,
+            injector_field_type_count: TypeCount::zero(),
+            injector_field_default_value_type_count: TypeCount::zero(),
+            method_start_id: 0, constructor_start_id: 0,
+            interface_method_impl_id: HashMap::new(),
+            method_override_id: HashMap::new(),
+            injector_constructor_impl_id: vec![],
+            method_annotations: HashMap::new(),
+            constructor_annotations: HashMap::new(),
+        };
+        let cls = Arc::new(RuntimeClass::new(decl, None));
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("NoIface", cls.clone());
+
+        let obj_id = vm.next_object_id;
+        vm.next_object_id += 1;
+        let obj = RuntimeObject::new_simple("NoIface".into(), &TypeCount::zero());
+        vm.objects.insert(obj_id, obj);
+        vm.object_stack.push_frame(3);
+        vm.int_stack.push_frame(3);
+        vm.float_stack.push_frame(3);
+        vm.bool_stack.push_frame(3);
+        vm.string_stack.push_frame(3);
+
+        // 接口调用：接口名为 "IShape"，接口方法 ID=0
+        let result_addr = Address::new(ValueType::Int, 1);
+        let invoke_code = IntermediateCode::new(
+            IntermediateOperator::InvokeInterface(0),
+            Operand::Address(Address::new(ValueType::Object, 0)),
+            Some(Operand::Immediate(crate::virtual_machine::ir::ImmediateValue::String("IShape".into()))),
+            Some(result_addr),
+        );
+        vm.object_stack.write(0, obj_id);
+
+        let result = vm.execute_one(&invoke_code);
+        assert!(result.is_err(), "调用未实现的接口方法应返回 Err");
+        assert!(result.unwrap_err().contains("未实现接口"), "错误信息应包含'未实现接口'");
     }
 }

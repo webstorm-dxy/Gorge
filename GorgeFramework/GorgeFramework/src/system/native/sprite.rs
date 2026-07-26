@@ -125,13 +125,18 @@ impl Sprite {
         let cg = (cg * 255.0) as u8;
         let cb = (cb * 255.0) as u8;
         let ca = (ca * 255.0) as u8;
+        let vm_address = ctx.vm as *mut _ as usize;
+        let graph_handle = crate::runtime::environment::global::resolve_graph_handle(
+            vm_address,
+            graph,
+        );
 
         if let Some(payload) = ctx.get_payload_mut::<Box<dyn crate::adaptor::ISprite>>(this) {
             payload.set_position(px, py, pz);
             payload.set_rotation(rx, ry, rz);
             payload.set_scale(sx, sy, sz);
             payload.set_color(cr, cg, cb, ca);
-            payload.set_graph(graph);
+            payload.set_graph(graph_handle);
         }
     }
 

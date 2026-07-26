@@ -9,11 +9,16 @@ pub mod simulation_manager;
 pub mod priority_heap;
 
 use crate::runtime::priority_heap::PriorityHeap;
+use crate::chart::simulation_score::SimulationScore;
+use crate::chart::staff::ElementStaff;
 use crate::signal::channel_split::ChannelSplit;
 use crate::input::edge::Edge;
 use crate::input::fragment::Fragment;
 use crate::signal::multichannel_split::MultichannelSplit;
 use gorge_core::system::native::injector::Injector;
+use gorge_core::system::native::injector::RuntimeInjector;
+use gorge_core::objective::types::BasicType;
+use crate::simulators::IGameplayAction;
 
 // ==================== 音频乐段数据 ====================
 
@@ -51,6 +56,8 @@ pub struct ChartManager {
     pub forward_timed_generate_list: Vec<(f32, usize, usize)>,
     /// 反转定时创生列表
     pub backward_timed_generate_list: Vec<(f32, usize, usize)>,
+    /// 初始化时立即创生的元素：(元素 injector ID, 构造方法全局 ID)
+    pub initialize_generate_list: Vec<(usize, usize)>,
     /// 正转定时销毁列表：(时间, 元素对象 ID)
     pub forward_timed_destroy_list: Vec<(f32, usize)>,
     /// 反转定时销毁列表
@@ -60,7 +67,7 @@ pub struct ChartManager {
     /// 存活 Note 表
     pub alive_notes: Vec<usize>,
     /// 存活非派生元素 → 创生时注入器 ID 的映射
-    pub alive_injector_map: std::collections::HashMap<usize, usize>,
+    pub alive_injector_map: HashMap<usize, usize>,
 }
 
 impl ChartManager {
@@ -71,11 +78,12 @@ impl ChartManager {
             begin_simulate_speed: 1.0,
             forward_timed_generate_list: Vec::new(),
             backward_timed_generate_list: Vec::new(),
+            initialize_generate_list: Vec::new(),
             forward_timed_destroy_list: Vec::new(),
             backward_timed_destroy_list: Vec::new(),
             alive_elements: Vec::new(),
             alive_notes: Vec::new(),
-            alive_injector_map: std::collections::HashMap::new(),
+            alive_injector_map: HashMap::new(),
         }
     }
 
@@ -116,9 +124,12 @@ impl ChartManager {
     pub fn add_score_element(
         &mut self, injector_id: usize, vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
     ) {
-        let class_name = match vm.injectors.get(&injector_id) {
+        let declared_class_name = match vm.injectors.get(&injector_id) {
             Some(inj) => inj.injection_class_declaration().class_type.full_name(),
             None => return,
+        };
+        let Some(class_name) = resolve_registered_class_name(vm, &declared_class_name) else {
+            return;
         };
 
         // 先克隆注解列表以释放不可变借用
@@ -128,7 +139,7 @@ impl ChartManager {
                 .into_iter().map(|(id, ann)| (id, ann.clone())).collect())
             .unwrap_or_default();
         for (ctor_id, _ann) in init_ctors {
-            self.forward_timed_generate_list.push((0.0, injector_id, ctor_id));
+            self.initialize_generate_list.push((injector_id, ctor_id));
         }
 
         let fwd_ctors: Vec<(usize, _)> = vm.class_table
@@ -152,6 +163,120 @@ impl ChartManager {
         }
     }
 
+    /// 将总谱中的元素 JSON 物化为 VM 注入器，并填充创生队列。
+    pub fn load_score(
+        &mut self,
+        score: &SimulationScore,
+        vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
+    ) {
+        self.unload_score();
+        self.begin_chart_time = score.start_time;
+        self.terminate_chart_time = score.terminate_time;
+        self.begin_simulate_speed = score.simulation_speed;
+
+        for staff in &score.stave {
+            let Some(element_staff) = staff.as_any().downcast_ref::<ElementStaff>() else {
+                continue;
+            };
+            for period in &element_staff.periods {
+                if !period.period_data.config.active {
+                    continue;
+                }
+                for element in &period.elements {
+                    if let Some(injector_id) = self.materialize_injector(element, vm) {
+                        self.add_score_element(injector_id, vm);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 清理由已加载谱面产生的队列和存活索引。
+    pub fn unload_score(&mut self) {
+        self.begin_chart_time = 0.0;
+        self.terminate_chart_time = 0.0;
+        self.begin_simulate_speed = 1.0;
+        self.initialize_generate_list.clear();
+        self.forward_timed_generate_list.clear();
+        self.backward_timed_generate_list.clear();
+        self.forward_timed_destroy_list.clear();
+        self.backward_timed_destroy_list.clear();
+        self.alive_elements.clear();
+        self.alive_notes.clear();
+        self.alive_injector_map.clear();
+    }
+
+    /// 从谱面 JSON 递归创建 RuntimeInjector。
+    fn materialize_injector(
+        &self,
+        value: &serde_json::Value,
+        vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
+    ) -> Option<usize> {
+        let object = value.as_object()?;
+        let class_name = object.get("__type")?.as_str()?;
+        if matches!(class_name, "int" | "float" | "bool" | "string" | "object") {
+            return None;
+        }
+
+        let registered_class_name = resolve_registered_class_name(vm, class_name)?;
+        let class = vm.class_table.get(&registered_class_name)?.clone();
+        // 注入器后续会以声明中的类型名查回 VM。Demo 以短类名注册，
+        // 因此这里必须保存实际注册键，而不是 JSON 中的全限定名。
+        let mut declaration = class.declaration.clone();
+        declaration.class_type = gorge_core::objective::types::GorgeType::class(
+            registered_class_name,
+            None,
+        );
+        let mut injector = RuntimeInjector::new(std::sync::Arc::new(declaration));
+        let mut int_index = 0;
+        let mut float_index = 0;
+        let mut bool_index = 0;
+        let mut string_index = 0;
+        let mut object_index = 0;
+
+        for field in &class.declaration.injector_fields {
+            let field_value = object.get(&field.name);
+            match field.field_type.basic_type {
+                BasicType::Int | BasicType::Enum => {
+                    if let Some(number) = json_scalar(field_value).and_then(serde_json::Value::as_i64) {
+                        injector.set_injector_int(int_index, number);
+                    }
+                    int_index += 1;
+                }
+                BasicType::Float => {
+                    if let Some(number) = json_scalar(field_value).and_then(serde_json::Value::as_f64) {
+                        injector.set_injector_float(float_index, number);
+                    }
+                    float_index += 1;
+                }
+                BasicType::Bool => {
+                    if let Some(flag) = json_scalar(field_value).and_then(serde_json::Value::as_bool) {
+                        injector.set_injector_bool(bool_index, flag);
+                    }
+                    bool_index += 1;
+                }
+                BasicType::String => {
+                    if let Some(text) = json_scalar(field_value).and_then(serde_json::Value::as_str) {
+                        injector.set_injector_string(string_index, text.to_string());
+                    }
+                    string_index += 1;
+                }
+                BasicType::Object | BasicType::Interface | BasicType::Delegate => {
+                    if let Some(nested) = field_value.and_then(|v| self.materialize_injector(v, vm)) {
+                        injector.set_injector_object(object_index, nested);
+                    }
+                    object_index += 1;
+                }
+                BasicType::Void | BasicType::Null => {}
+            }
+        }
+
+        let injector_id = vm.next_object_id;
+        vm.next_object_id += 1;
+        vm.injectors.insert(injector_id, injector);
+        Some(injector_id)
+    }
+
     /// 从注解参数中解析 time 值（Float 直接取值 / Delegate 经 invoke_method_by_id 求值）
     fn resolve_annotation_time(
         ann: &gorge_core::objective::declaration::MethodAnnotation,
@@ -170,6 +295,31 @@ impl ChartManager {
             }
             _ => 0.0,
         }
+    }
+}
+
+/// 返回可用于 VM `class_table` 查询的类名。
+///
+/// 谱面 JSON 保存全限定名，而 Demo 为兼容 native/编译类注册约定使用短类名。
+/// 先保持全名精确匹配，再退回末段名称，避免错误覆盖本来已注册的全名。
+fn resolve_registered_class_name(
+    vm: &gorge_core::virtual_machine::vm::VirtualMachine,
+    declared_class_name: &str,
+) -> Option<String> {
+    if vm.class_table.contains_key(declared_class_name) {
+        return Some(declared_class_name.to_string());
+    }
+
+    let simple_name = declared_class_name.rsplit('.').next().unwrap_or(declared_class_name);
+    vm.class_table
+        .contains_key(simple_name)
+        .then(|| simple_name.to_string())
+}
+
+fn json_scalar(value: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+    match value {
+        Some(serde_json::Value::Object(object)) => object.get("value").or(value),
+        _ => value,
     }
 }
 
@@ -556,7 +706,7 @@ pub struct GorgeSimulationRuntime {
 
 impl GorgeSimulationRuntime {
     pub fn new() -> Self {
-        Self {
+        let mut runtime = Self {
             chart: ChartManager::new(),
             simulation: SimulationManager::new(),
             automaton: AutomatonManager::new(),
@@ -572,7 +722,9 @@ impl GorgeSimulationRuntime {
             chart_time: 0.0,
             is_score_loaded: false,
             is_simulating: false,
-        }
+        };
+        runtime.register_standard_simulators();
+        runtime
     }
 
     // ==================== F-3 生命周期方法 ====================
@@ -580,12 +732,16 @@ impl GorgeSimulationRuntime {
     /// 加载谱面（对齐 C# `LoadScore` 37-48 行）
     ///
     /// 若已加载则先卸载。调用 Chart.LoadScore 读取谱面数据。
-    pub fn load_score(&mut self) {
+    pub fn load_score(
+        &mut self,
+        score: &SimulationScore,
+        vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
+    ) {
         if self.is_score_loaded {
             self.unload_score();
         }
         // Chart.LoadScore —— 读取谱面
-        self.chart_load_score();
+        self.chart_load_score(score, vm);
         self.is_score_loaded = true;
     }
 
@@ -607,7 +763,7 @@ impl GorgeSimulationRuntime {
     /// 启动仿真（对齐 C# `StartSimulation` 67-89 行）
     ///
     /// 若未加载谱面则 panic。若已在仿真中则先停止再启动。
-    pub fn start_simulation(&mut self) {
+    pub fn start_simulation(&mut self, vm: &mut gorge_core::virtual_machine::vm::VirtualMachine) {
         if !self.is_score_loaded {
             panic!("尝试在谱面加载前启动仿真");
         }
@@ -621,7 +777,7 @@ impl GorgeSimulationRuntime {
         self.graphics_start_simulation();
         self.simulation_runtime_initialize();
         self.automaton_runtime_initialize();
-        self.chart_start_simulation();
+        self.chart_start_simulation(vm);
         // Simulation.SimulationMachine.DriveInstantly —— 由 RuntimeManager::drive 负责
 
         self.is_simulating = true;
@@ -661,7 +817,7 @@ impl GorgeSimulationRuntime {
         let now_chart_time = self.chart_time;
 
         self.stop_simulation();
-        self.start_simulation();
+        self.start_simulation(vm);
         machine.drive_to_chart_time(now_chart_time, self, vm);
         self.audio.stop_all_song();
     }
@@ -680,9 +836,42 @@ impl GorgeSimulationRuntime {
 
     // ==================== 子管理器生命周期钩子（内部） ====================
 
-    fn chart_load_score(&mut self) {}
-    fn chart_unload_score(&mut self) {}
-    fn chart_start_simulation(&mut self) {}
+    fn register_standard_simulators(&mut self) {
+        let generator = self.sim_registry.register(Box::new(crate::simulators::impls::TimedElementGenerator));
+        self.simulation.simulators.register(-1, generator);
+        let destroyer = self.sim_registry.register(Box::new(crate::simulators::impls::TimedElementDestroyer));
+        self.simulation.simulators.register(-1, destroyer);
+        let automaton = self.sim_registry.register(Box::new(crate::simulators::impls::PreciseAutomatonSimulator));
+        self.simulation.simulators.register(0, automaton);
+        let song = self.sim_registry.register(Box::new(crate::simulators::impls::SongSimulator));
+        self.simulation.simulators.register(10_000, song);
+        let graphics = self.late_sim_registry.register(Box::new(crate::simulators::impls::GraphicsNodeSimulator));
+        self.simulation.late_independent_simulators.register(100_000, graphics);
+    }
+
+    fn chart_load_score(
+        &mut self,
+        score: &SimulationScore,
+        vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
+    ) {
+        self.chart.load_score(score, vm);
+    }
+
+    fn chart_unload_score(&mut self) { self.chart.unload_score(); }
+
+    fn chart_start_simulation(&mut self, vm: &mut gorge_core::virtual_machine::vm::VirtualMachine) {
+        let initial_elements = self.chart.initialize_generate_list.clone();
+        let mut edge_queue = crate::signal::multichannel_edge_queue::MultichannelEdgeQueue::new();
+        for (injector_id, constructor_id) in initial_elements {
+            crate::simulators::impls::GenerateElement {
+                injector_id,
+                constructor_id,
+                is_auto_play: false,
+                is_reverse: false,
+                direction: crate::runtime::simulation_types::SimulateDirection::Infinitesimal,
+            }.do_action(self, &mut edge_queue, vm);
+        }
+    }
     fn chart_stop_simulation(&mut self) {}
 
     fn audio_start_simulation(&mut self) {}
@@ -716,6 +905,10 @@ impl GorgeSimulationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_score() -> SimulationScore {
+        SimulationScore::new(0.0, 100.0, 1.0)
+    }
 
     // ==================== AutomatonManager 测试 ====================
 
@@ -867,15 +1060,17 @@ mod tests {
     #[test]
     fn test_f3_lifecycle_full_sequence() {
         let mut rt = GorgeSimulationRuntime::new();
+        let score = empty_score();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         // 初始状态
         assert!(!rt.is_score_loaded);
         assert!(!rt.is_simulating);
 
-        rt.load_score();
+        rt.load_score(&score, &mut vm);
         assert!(rt.is_score_loaded);
         assert!(!rt.is_simulating);
 
-        rt.start_simulation();
+        rt.start_simulation(&mut vm);
         assert!(rt.is_score_loaded);
         assert!(rt.is_simulating);
 
@@ -891,11 +1086,13 @@ mod tests {
     #[test]
     fn test_f3_double_load_rejects_previous() {
         let mut rt = GorgeSimulationRuntime::new();
-        rt.load_score();
+        let score = empty_score();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        rt.load_score(&score, &mut vm);
         assert!(rt.is_score_loaded);
 
         // 第二次 load 应先 unload 再 load
-        rt.load_score();
+        rt.load_score(&score, &mut vm);
         assert!(rt.is_score_loaded);
     }
 
@@ -903,19 +1100,94 @@ mod tests {
     #[should_panic(expected = "尝试在谱面加载前启动仿真")]
     fn test_f3_start_before_load_panics() {
         let mut rt = GorgeSimulationRuntime::new();
-        rt.start_simulation();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        rt.start_simulation(&mut vm);
     }
 
     #[test]
     fn test_f3_unload_while_simulating_stops_first() {
         let mut rt = GorgeSimulationRuntime::new();
-        rt.load_score();
-        rt.start_simulation();
+        let score = empty_score();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        rt.load_score(&score, &mut vm);
+        rt.start_simulation(&mut vm);
         assert!(rt.is_simulating);
 
         rt.unload_score();
         assert!(!rt.is_simulating);
         assert!(!rt.is_score_loaded);
+    }
+
+    #[test]
+    fn test_chart_score_load_and_initialize_generate() {
+        use gorge_core::diagnostics::Span;
+        use gorge_core::objective::class::RuntimeClass;
+        use gorge_core::objective::declaration::{InjectorFieldInfo, MethodAnnotation};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::{CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut declaration = gorge_core::objective::declaration::ClassDeclaration::dummy("Demo.ScoreElement".into());
+        declaration.injector_fields.push(InjectorFieldInfo {
+            name: "value".into(),
+            field_type: GorgeType::new(BasicType::Int),
+            has_default_value: false,
+        });
+        declaration.injector_field_type_count = TypeCount { int_count: 1, ..TypeCount::zero() };
+        declaration.field_type_count = TypeCount { object_count: 5, ..TypeCount::zero() };
+        declaration.constructor_count = 1;
+        declaration.constructor_annotations = HashMap::from([(
+            0,
+            vec![MethodAnnotation { name: "InitializeGenerate".into(), parameters: vec![] }],
+        )]);
+
+        let mut runtime_class = RuntimeClass::new(declaration, None);
+        runtime_class.register_constructor(0, CompiledMethod {
+            name: "ctor".into(),
+            codes: vec![CodeWithSpan::new(IntermediateCode {
+                result: None,
+                operator: IntermediateOperator::ReturnInt,
+                left: Operand::int(0),
+                right: None,
+            }, Span::dummy())],
+            local_count: 0,
+        });
+
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        vm.class_table.insert("ScoreElement".into(), Arc::new(runtime_class));
+        let score = SimulationScore::load_score_from_element_list(
+            "TestForm",
+            vec![serde_json::json!({ "__type": "Demo.ScoreElement", "value": 7 })],
+            vec![],
+            1.0,
+            10.0,
+            1.5,
+        );
+        let mut runtime = GorgeSimulationRuntime::new();
+
+        runtime.load_score(&score, &mut vm);
+        assert_eq!(runtime.chart.begin_chart_time, 1.0);
+        assert_eq!(runtime.chart.initialize_generate_list.len(), 1);
+        assert_eq!(vm.injectors.len(), 1);
+
+        runtime.start_simulation(&mut vm);
+        assert_eq!(runtime.chart.alive_elements.len(), 1);
+    }
+
+    #[test]
+    fn test_standard_simulators_match_reference_priorities() {
+        let runtime = GorgeSimulationRuntime::new();
+        let mut main_priorities: Vec<i32> = runtime.simulation.simulators.iter()
+            .map(|(priority, _)| *priority)
+            .collect();
+        main_priorities.sort_unstable();
+        assert_eq!(main_priorities, vec![-1, -1, 0, 10_000]);
+
+        let late_priorities: Vec<i32> = runtime.simulation.late_independent_simulators.iter()
+            .map(|(priority, _)| *priority)
+            .collect();
+        assert_eq!(late_priorities, vec![100_000]);
     }
 
     #[test]
@@ -970,14 +1242,15 @@ mod tests {
         use gorge_core::virtual_machine::vm::VirtualMachine;
 
         let mut rt = GorgeSimulationRuntime::new();
-        rt.load_score();
-        rt.start_simulation();
+        let score = empty_score();
+        let mut vm = VirtualMachine::new();
+        rt.load_score(&score, &mut vm);
+        rt.start_simulation(&mut vm);
         rt.chart_time = 42.0;
 
         // RePlay: stop → start → drive_to_chart_time，chart_time 被恢复
         let mut machine = SimulationMachine::new(0.0, 100.0, 1.0);
         machine.runtime_initialize();
-        let mut vm = VirtualMachine::new();
         rt.replay(&mut machine, &mut vm);
 
         assert!(rt.is_simulating);

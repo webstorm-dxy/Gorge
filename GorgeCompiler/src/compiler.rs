@@ -130,8 +130,8 @@ pub struct Compiler {
     pub class_delegate_ranges: std::collections::HashMap<String, (usize, usize)>,
     /// 字段初始化器（Phase P）：按类名分组的已编译字段初始化器
     pub field_initializers: std::collections::HashMap<String, Vec<CompiledFieldInitializer>>,
-    /// 类注解（Phase Q3）：按类名分组的注解信息，(注解名, 可选的泛型类型)
-    pub class_annotations: std::collections::HashMap<String, Vec<(String, Option<String>)>>,
+    /// 类注解（Phase Q3）：按类名分组的注解信息（V6 含参数）
+    pub class_annotations: std::collections::HashMap<String, Vec<gorge_core::objective::bytecode::CompiledAnnotation>>,
     /// 方法注解（S3）：按类名 + 方法全局ID 分组，(类名, 方法全局ID) → 注解列表
     pub method_annotations: std::collections::HashMap<String, std::collections::HashMap<usize, Vec<gorge_core::objective::declaration::MethodAnnotation>>>,
     /// 构造方法注解（S3）：按类名 + 构造方法全局ID 分组
@@ -150,6 +150,12 @@ pub struct Compiler {
 
     /// 注入器构造方法局部 ID → 全局构造方法 ID 映射（按类分组，B-5）
     pub injector_constructor_impl_id: std::collections::HashMap<String, Vec<usize>>,
+
+    /// 当前正在声明成员的类的泛型参数名列表（J1，Pass 3 期间有效）
+    ///
+    /// 用于把 `native class ObjectArray<TItem>` 成员声明中的 `TItem`
+    /// 解析为 `TypeInfo::GenericParam`，而非报「未找到类型」。
+    current_generic_params: Vec<String>,
 }
 
 /// 编译后的方法内容（简化）
@@ -186,6 +192,7 @@ impl Compiler {
             progress_reporter: Box::new(SilentReporter),
             class_injector_constructor_count: std::collections::HashMap::new(),
             injector_constructor_impl_id: std::collections::HashMap::new(),
+            current_generic_params: Vec::new(),
         }
     }
 }
@@ -492,10 +499,25 @@ impl Compiler {
         // 设置泛型参数
         let class_info = self.symbol_table.classes.get_mut(class_id.0);
         class_info.generic_params = decl.generic_params.clone(); // J1
-        // Q3: 收集类注解到 Compiler 的 class_annotations
-        let anns: Vec<(String, Option<String>)> = decl.annotations.iter().map(|a| {
+        // Q3: 收集类注解到 Compiler 的 class_annotations（V6 含参数和元数据）
+        let anns: Vec<gorge_core::objective::bytecode::CompiledAnnotation> = decl.annotations.iter().map(|a| {
             let gt = a.generic_type.as_ref().map(|t| format_type_ref(t));
-            (a.name.clone(), gt)
+            // 转换参数：将 AST 的 (key, Expression) 转换为 (key, string_val)
+            let mut arguments: Vec<(String, String)> = a.arguments.iter().map(|(k, expr)| {
+                let val = literal_to_string(expr);
+                (k.clone(), val)
+            }).collect();
+            // 转换元数据项：metadata name = expr → (name, string_val)
+            for meta in &a.metadatas {
+                if let Some(ref expr) = meta.value {
+                    arguments.push((meta.name.clone(), literal_to_string(expr)));
+                }
+            }
+            gorge_core::objective::bytecode::CompiledAnnotation {
+                name: a.name.clone(),
+                generic_type: gt,
+                arguments,
+            }
         }).collect();
         if !anns.is_empty() {
             self.class_annotations.insert(decl.name.clone(), anns);
@@ -646,6 +668,8 @@ impl Compiler {
                 return;
             }
         };
+        // 类作用域（含正确 using_scopes），用于跨命名空间类型解析
+        let class_scope = self.symbol_table.classes.get(class_id.0).scope_id;
 
         // 解析父类
         if let Some(ref super_type) = decl.super_class {
@@ -654,9 +678,23 @@ impl Compiler {
                 self.diagnostics.emit_error(decl.span, msg);
                 return;
             }
-            match self.resolve_type_or_diagnose(scope, super_type) {
+            match self.resolve_type_or_diagnose(class_scope, super_type) {
                 Ok(Some(TypeInfo::Object(super_id))) => {
                     self.symbol_table.set_super_class(class_id, super_id);
+                }
+                Ok(Some(TypeInfo::Interface(iface_id))) => {
+                    let iface_name = &self.symbol_table.interfaces.get(iface_id.0).name;
+                    self.diagnostics.emit_error(
+                        super_type.span(),
+                        format!("类 `{}` 不能继承接口 `{}`（请用 :: implements 语法）", decl.name, iface_name),
+                    );
+                }
+                Ok(Some(TypeInfo::Enum(enum_id))) => {
+                    let enum_name = &self.symbol_table.enums.get(enum_id.0).name;
+                    self.diagnostics.emit_error(
+                        super_type.span(),
+                        format!("类 `{}` 不能继承枚举 `{}`", decl.name, enum_name),
+                    );
                 }
                 Ok(_) => {
                     self.diagnostics.emit_error(
@@ -680,7 +718,7 @@ impl Compiler {
         }
         let mut interfaces = Vec::new();
         for iface_type in &decl.super_interfaces {
-            match self.resolve_type_or_diagnose(scope, iface_type) {
+            match self.resolve_type_or_diagnose(class_scope, iface_type) {
                 Ok(Some(TypeInfo::Interface(iface_id))) => {
                     // K1b: 检测重复接口实现
                     if interfaces.contains(&iface_id) {
@@ -690,6 +728,20 @@ impl Compiler {
                         );
                     }
                     interfaces.push(iface_id);
+                }
+                Ok(Some(TypeInfo::Enum(enum_id))) => {
+                    let enum_name = &self.symbol_table.enums.get(enum_id.0).name;
+                    self.diagnostics.emit_error(
+                        iface_type.span(),
+                        format!("类 `{}` 不能实现枚举 `{}`", decl.name, enum_name),
+                    );
+                }
+                Ok(Some(TypeInfo::Object(other_class_id))) => {
+                    let other_class_name = &self.symbol_table.classes.get(other_class_id.0).name;
+                    self.diagnostics.emit_error(
+                        iface_type.span(),
+                        format!("类 `{}` 不能实现另一个类 `{}`（请用继承）", decl.name, other_class_name),
+                    );
                 }
                 Ok(_) => {
                     self.diagnostics.emit_error(
@@ -719,13 +771,22 @@ impl Compiler {
                 return;
             }
         };
+        // 接口作用域，用于跨命名空间类型解析
+        let iface_scope = self.symbol_table.interfaces.get(iface_id.0).scope_id;
 
         // 解析父接口
         let mut super_ifaces = Vec::new();
         for super_type in &decl.super_interfaces {
-            match self.resolve_type_or_diagnose(scope, super_type) {
+            match self.resolve_type_or_diagnose(iface_scope, super_type) {
                 Ok(Some(TypeInfo::Interface(super_id))) => {
                     super_ifaces.push(super_id);
+                }
+                Ok(Some(TypeInfo::Object(class_id))) => {
+                    let class_name = &self.symbol_table.classes.get(class_id.0).name;
+                    self.diagnostics.emit_error(
+                        super_type.span(),
+                        format!("接口 `{}` 错误继承自类 `{}`", decl.name, class_name),
+                    );
                 }
                 Ok(_) => {
                     self.diagnostics.emit_error(
@@ -881,6 +942,9 @@ impl Compiler {
         }
         let class_scope = self.symbol_table.classes.get(class_id.0).scope_id;
 
+        // J1：记录本类泛型参数名，供成员声明中的类型解析（如 ObjectArray<TItem> 的 TItem）
+        self.current_generic_params = decl.generic_params.clone();
+
         // 字段偏移按值类型分组计数，每种类型从父类已占用数开始
         // 继承链中子类的字段偏移 = 父类字段总数 + 本类 local_offset
         // 注意：此时 freeze_inheritance 尚未执行，field_start_type_count 为 0，
@@ -966,7 +1030,31 @@ impl Compiler {
                         "float" => ValueType::Float,
                         "bool" => ValueType::Bool,
                         "string" => ValueType::String,
-                        _ => ValueType::Object,
+                        _ => {
+                            // 解析类型，验证是否为可注入的具体类（非接口、非枚举）
+                            if let Some(ti) = self.symbol_table.resolve_type(class_scope, &field.field_type) {
+                                match ti {
+                                    TypeInfo::Interface(iface_id) => {
+                                        let iface_name = &self.symbol_table.interfaces.get(iface_id.0).name;
+                                        self.diagnostics.emit_error(
+                                            field.span,
+                                            format!("类型 `{}` 不可注入（仅具体类支持注入器）", iface_name),
+                                        );
+                                        continue;
+                                    }
+                                    TypeInfo::Enum(enum_id) => {
+                                        let enum_name = &self.symbol_table.enums.get(enum_id.0).name;
+                                        self.diagnostics.emit_error(
+                                            field.span,
+                                            format!("类型 `{}` 不可注入（仅具体类支持注入器）", enum_name),
+                                        );
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            ValueType::Object
+                        }
                     },
                     _ => ValueType::Object,
                 };
@@ -978,6 +1066,9 @@ impl Compiler {
                 });
             }
         }
+
+        // J1：本类成员声明完毕，清除泛型参数上下文
+        self.current_generic_params.clear();
     }
 
     /// Pass 3：声明一个字段
@@ -1330,6 +1421,11 @@ impl Compiler {
 
     /// 将 AST TypeRef 解析为 TypeInfo，解析失败时使用 Unresolved 并报错
     fn resolve_ast_type(&mut self, scope: ScopeId, type_ref: &TypeRef) -> TypeInfo {
+        // J1：当前声明类的泛型参数名优先解析为 GenericParam
+        // （如 `native class ObjectArray<TItem>` 成员中的 `TItem` / `TItem[]`）
+        if let Some(ti) = self.resolve_generic_param_type(type_ref) {
+            return ti;
+        }
         match self.symbol_table.resolve_type(scope, type_ref) {
             Some(ti) => ti,
             None => {
@@ -1340,6 +1436,22 @@ impl Compiler {
                 );
                 TypeInfo::Unresolved
             }
+        }
+    }
+
+    /// 若类型引用涉及当前声明类的泛型参数，返回对应 TypeInfo；否则返回 None
+    ///
+    /// 仅处理 Simple（`TItem`）与 Array（`TItem[]`）两种形态，
+    /// 其余形态（Generic、Delegate、Injector）回退到符号表常规解析。
+    fn resolve_generic_param_type(&self, type_ref: &TypeRef) -> Option<TypeInfo> {
+        match type_ref {
+            TypeRef::Simple { name, .. } if self.current_generic_params.contains(name) => {
+                Some(TypeInfo::GenericParam(name.clone()))
+            }
+            TypeRef::Array { element_type, .. } => self
+                .resolve_generic_param_type(element_type)
+                .map(|e| TypeInfo::Array(Box::new(e))),
+            _ => None,
         }
     }
 
@@ -1672,6 +1784,24 @@ impl Compiler {
             let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
             cg.set_class_context(&task.class_name);
 
+            // 设置注入器字段上下文（G1），使隐藏方法中可引用注入器字段
+            if let Some(inj_fields) = self.injector_fields.get(&task.class_name) {
+                let inj_pairs: Vec<(String, ValueType)> = inj_fields.iter()
+                    .map(|f| (f.name.clone(), f.value_type))
+                    .collect();
+                cg.set_injector_context(&inj_pairs);
+            }
+
+            // 在方法体开头发射 LoadInjector，使后续 ^field 引用能读取到注入器对象
+            let temp_inj = cg.alloc_temp(ValueType::Object);
+            cg.emit(
+                gorge_core::virtual_machine::ir::IntermediateCode::new(
+                    IntermediateOperator::LoadInjector,
+                    Operand::int(0), None, Some(temp_inj),
+                ),
+                task.class_span,
+            );
+
             // 编译表达式
             let val_op = cg.generate_expression(&task.expression);
             let code = match task.return_value_type {
@@ -1921,6 +2051,16 @@ impl Compiler {
                                     &mut self.delegate_impls,
                                 );
                                 cg.set_class_context(&class_name);
+
+                                // 设置注入器字段上下文（G1），
+                                // 使字段初始化器可引用注入器字段（如 `= ^generateTime`）
+                                if let Some(inj_fields) = self.injector_fields.get(&class_name) {
+                                    let inj_pairs: Vec<(String, ValueType)> = inj_fields.iter()
+                                        .map(|f| (f.name.clone(), f.value_type))
+                                        .collect();
+                                    cg.set_injector_context(&inj_pairs);
+                                }
+
                                 let span = fi.span;
 
                                 // 对齐 C# 初始化器 IR 序列：
@@ -2136,6 +2276,8 @@ fn type_info_to_value_type(ti: &TypeInfo) -> ValueType {
         TypeInfo::Float => ValueType::Float,
         TypeInfo::Bool => ValueType::Bool,
         TypeInfo::String => ValueType::String,
+        // 枚举在 VM 中以整数存储（Enum → Int）
+        TypeInfo::Enum(_) => ValueType::Int,
         _ => ValueType::Object,
     }
 }
@@ -3729,5 +3871,394 @@ class AnnHidden {
         assert_eq!(result, Err(CompileError::Cancelled), "中途取消应返回 Cancelled");
         // 验证取消确实发生了（flag 被设置过）
         assert!(cancel_flag.load(std::sync::atomic::Ordering::SeqCst), "取消标志应被设置");
+    }
+
+    // ==================== 编译诊断测试 ====================
+
+    /// 注入器字段类型为接口时，应报错"不可注入"
+    #[test]
+    fn test_injector_field_interface_rejected() {
+        let source = SourceFile {
+            members: vec![
+                TopLevelMember::Interface(InterfaceDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "IService".into(),
+                    super_interfaces: vec![],
+                    methods: vec![],
+                    span: dummy_span(),
+                }),
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Consumer".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![],
+                    injector: Some(InjectorDeclaration {
+                        fields: vec![InjectorField {
+                            name: "svc".into(),
+                            field_type: TypeRef::simple("IService", dummy_span()),
+                            span: dummy_span(),
+                        }],
+                        span: dummy_span(),
+                    }),
+                    span: dummy_span(),
+                }),
+            ],
+            ..empty_source()
+        };
+
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source]);
+        assert!(compiler.diagnostics.has_errors(), "注入器字段类型为接口时应报错");
+    }
+
+    /// 类继承接口时应报错（应使用 :: implements 语法）
+    #[test]
+    fn test_class_inherits_interface_rejected() {
+        let source = SourceFile {
+            members: vec![
+                TopLevelMember::Interface(InterfaceDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "IRunnable".into(),
+                    super_interfaces: vec![],
+                    methods: vec![],
+                    span: dummy_span(),
+                }),
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Task".into(),
+                    generic_params: vec![],
+                    super_class: Some(TypeRef::simple("IRunnable", dummy_span())),
+                    super_interfaces: vec![],
+                    members: vec![],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            ..empty_source()
+        };
+
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source]);
+        assert!(compiler.diagnostics.has_errors(), "类继承接口时应报错");
+    }
+
+    /// 类实现枚举时应报错
+    #[test]
+    fn test_class_implements_enum_rejected() {
+        let source = SourceFile {
+            members: vec![
+                TopLevelMember::Enum(EnumDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Color".into(),
+                    values: vec![EnumValue {
+                        annotations: vec![],
+                        name: "Red".into(),
+                        value: Some(1),
+                        span: dummy_span(),
+                    }],
+                    span: dummy_span(),
+                }),
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "MyClass".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![TypeRef::simple("Color", dummy_span())],
+                    members: vec![],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            ..empty_source()
+        };
+
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source]);
+        assert!(compiler.diagnostics.has_errors(), "类实现枚举时应报错");
+    }
+
+    /// 跨命名空间 native 类解析：Dremu 文件中引用 GorgeFramework 中的 native 类
+    #[test]
+    fn test_dremu_native_type_resolution() {
+        // GorgeFramework 命名空间中的 native stub（不含 using Gorge，因 Gorge 命名空间不存在）
+        let native_source = SourceFile {
+            namespace: Some(QualifiedName {
+                parts: vec!["GorgeFramework".into()],
+                span: dummy_span(),
+            }),
+            usings: vec![],
+            members: vec![
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![Modifier::Native],
+                    name: "Element".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            span: dummy_span(),
+        };
+
+        // Dremu 命名空间中的用户类，继承 GorgeFramework.Element
+        let user_source = SourceFile {
+            namespace: Some(QualifiedName {
+                parts: vec!["Dremu".into()],
+                span: dummy_span(),
+            }),
+            usings: vec![
+                UsingDirective {
+                    alias: None,
+                    name: QualifiedName { parts: vec!["GorgeFramework".into()], span: dummy_span() },
+                    span: dummy_span(),
+                },
+            ],
+            members: vec![
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "DremuNote".into(),
+                    generic_params: vec![],
+                    super_class: Some(TypeRef::simple("Element", dummy_span())),
+                    super_interfaces: vec![],
+                    members: vec![
+                        ClassMember::Constructor(ConstructorDeclaration {
+                            annotations: vec![],
+                            modifiers: vec![],
+                            parameters: vec![],
+                            base_arguments: vec![],
+                            body: Some(vec![]),
+                            span: dummy_span(),
+                        }),
+                    ],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            span: dummy_span(),
+        };
+
+        let mut compiler = Compiler::new();
+        let result = compiler.compile(&[native_source, user_source]);
+
+        // 不应报 "未找到类型 Element" 错误
+        let errors: Vec<_> = compiler.diagnostics.iter()
+            .filter(|d| d.level == gorge_core::diagnostics::DiagnosticLevel::Error)
+            .map(|d| d.message.clone())
+            .collect();
+        let has_unresolved_type = errors.iter().any(|e| e.contains("未找到类型 `Element`"));
+        assert!(!has_unresolved_type,
+            "不应报未找到类型 Element 错误，但诊断包含: {:?}", errors);
+
+        // 验证继承关系正确建立
+        if result.is_ok() {
+            let dremu_scope = compiler.lookup_namespace_scope(
+                &QualifiedName { parts: vec!["Dremu".into()], span: dummy_span() }
+            );
+            if let Some(class_id) = compiler.symbol_table.lookup_class(dremu_scope, "DremuNote") {
+                let ci = compiler.symbol_table.classes.get(class_id.0);
+                assert!(ci.super_class.is_some(), "DremuNote 应该有父类 Element");
+            }
+        }
+    }
+
+    // ==================== 注入器字段链路回归测试（步骤 5）====================
+
+    /// 辅助：从源码文本完整编译，返回编译结果
+    fn compile_text(source_text: &str) -> Result<(), crate::Diagnostics> {
+        let (tokens, lexer_diags) = crate::frontend::lexer::tokenize(source_text, 0);
+        assert!(lexer_diags.is_empty(), "词法错误: {:?}", lexer_diags);
+        let mut parser = crate::frontend::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().expect("语法错误");
+        crate::compile_sources(&[source_file], false).map(|_| ())
+    }
+
+    /// 字段初始化器引用同名注入器字段：`@Inject float generateTime = ^generateTime;`
+    ///
+    /// 回归：字段初始化器任务此前未设置注入器字段上下文，
+    /// 导致 `= ^generateTime` 报「未定义的注入器字段（当前类未声明注入器字段）」。
+    #[test]
+    fn test_injector_field_in_field_initializer() {
+        let result = compile_text(r#"
+namespace Dremu;
+class Lane
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float generateTime = ^generateTime;
+}
+"#);
+        assert!(result.is_ok(), "字段初始化器引用注入器字段应编译通过: {:?}", result.err());
+    }
+
+    /// 方法体内 `this.^field` 读取注入器字段
+    #[test]
+    fn test_injector_field_this_access_in_method() {
+        let result = compile_text(r#"
+namespace Dremu;
+class Lane
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float generateTime = ^generateTime;
+
+    float Get()
+    {
+        return this.^generateTime;
+    }
+}
+"#);
+        assert!(result.is_ok(), "this.^field 应编译通过: {:?}", result.err());
+    }
+
+    /// 方法体内裸 `^field`（InjectorFieldRef 表达式）读取注入器字段
+    #[test]
+    fn test_injector_field_bare_access_in_method() {
+        let result = compile_text(r#"
+namespace Dremu;
+class Lane
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float generateTime = ^generateTime;
+
+    float Get()
+    {
+        return ^generateTime;
+    }
+}
+"#);
+        assert!(result.is_ok(), "裸 ^field 应编译通过: {:?}", result.err());
+    }
+
+    /// Lambda 参数上的 `obj.^field` 访问（DremuLane 类注解 display lambda 模式）
+    #[test]
+    fn test_injector_field_access_on_lambda_param() {
+        let result = compile_text(r#"
+namespace Dremu;
+class Lane
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float generateTime = ^generateTime;
+
+    delegate<float:Lane^> MakeDisplay()
+    {
+        return float:(Lane^ inj) -> { return inj.^generateTime; };
+    }
+}
+"#);
+        assert!(result.is_ok(), "lambda 参数 obj.^field 应编译通过: {:?}", result.err());
+    }
+
+    // ==================== 注入器复合类型 / 限定名回归测试（步骤 6）====================
+
+    /// 点分限定名 + 注入器数组后缀：`static GorgeFramework.Element^[] Period()`
+    ///
+    /// 回归：`resolve_type` 此前不支持点分限定名，
+    /// 报「未找到类型 `GorgeFramework.Element^[]`」。
+    #[test]
+    fn test_qualified_name_injector_array_return_type() {
+        let framework = {
+            let (tokens, _) = crate::frontend::lexer::tokenize(r#"
+namespace GorgeFramework;
+native class Element
+{
+}
+"#, 0);
+            crate::frontend::parser::Parser::new(tokens).parse_source_file().expect("语法错误")
+        };
+        let dremu = {
+            let (tokens, _) = crate::frontend::lexer::tokenize(r#"
+namespace Dremu;
+using GorgeFramework;
+class Staff
+{
+    static GorgeFramework.Element^[] Period()
+    {
+        return null;
+    }
+}
+"#, 1);
+            crate::frontend::parser::Parser::new(tokens).parse_source_file().expect("语法错误")
+        };
+        let result = crate::compile_sources(&[framework, dremu], false);
+        assert!(result.is_ok(), "限定名注入器数组返回类型应编译通过: {:?}", result.err());
+    }
+
+    /// 数组字段的 `.length` 访问 → 解析到对应 native 数组类的 length 字段
+    ///
+    /// 回归：此前 `laneLines.length` 报「未定义的字段 `length`」。
+    #[test]
+    fn test_array_field_length_access() {
+        let result = compile_text(r#"
+native class ObjectArray
+{
+    int length;
+}
+
+namespace Dremu;
+class FunctionCurve
+{
+}
+class Lane
+{
+    FunctionCurve^[] laneLines;
+
+    int Count()
+    {
+        return laneLines.length;
+    }
+}
+"#);
+        assert!(result.is_ok(), "数组字段 .length 应编译通过: {:?}", result.err());
+    }
+
+    /// 完整注入器数组模式：`@Inject<X^[]^>` + `new (^f)[^f.length]`
+    ///
+    /// 回归：此前报「无法确定注入器字段的对应类型」与「未定义的字段 `length`」。
+    #[test]
+    fn test_injector_array_new_with_length() {
+        let result = compile_text(r#"
+native class ObjectArray
+{
+    int length;
+}
+
+namespace Dremu;
+class FunctionCurve
+{
+}
+class Lane
+{
+    @Inject<FunctionCurve^[]^>
+    FunctionCurve^[] laneLines = (^laneLines == null) ? null : (new (^laneLines)[^laneLines.length]);
+}
+"#);
+        assert!(result.is_ok(), "注入器数组构造应编译通过: {:?}", result.err());
+    }
+}
+
+/// 将 AST 字面量表达式转换为字符串（用于注解参数序列化）
+fn literal_to_string(expr: &crate::frontend::ast::Expression) -> String {
+    match expr {
+        crate::frontend::ast::Expression::Literal(lit, _) => match lit {
+            crate::frontend::ast::Literal::String(s) => s.clone(),
+            crate::frontend::ast::Literal::Int(v) => v.to_string(),
+            crate::frontend::ast::Literal::Float(v) => v.to_string(),
+            crate::frontend::ast::Literal::Bool(v) => v.to_string(),
+        },
+        _ => String::new(),
     }
 }

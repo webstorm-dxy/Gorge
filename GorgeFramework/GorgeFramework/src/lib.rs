@@ -593,4 +593,133 @@ mod tests {
         // -1.0f32 → 0xBF800000
         assert_eq!(bit_int(-1.0f32), 0xBF800000u32 as i32);
     }
+
+    // ========== 多态分派测试 ==========
+
+    /// 测试 can_detect 虚方法分派：基类 SignalFilter 返回 false，
+    /// 子类 InputSignalFilter 返回 true，FloatSignalFilter 按 channel 匹配。
+    #[test]
+    fn test_polymorphic_can_detect_dispatch() {
+        let mut fx = Fixture::new();
+
+        // 注册 SignalFilter 基类
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(SignalFilter {
+            priority: 0, condition_types: 0, end_time: 0, time_mode: 0,
+            accept_consume: true, deny_consume: false,
+        }));
+        // 注册 InputSignalFilter 子类
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(InputSignalFilter {
+            priority: 0, condition_types: 0, end_time: 0, time_mode: 0,
+            accept_consume: true, deny_consume: false,
+            on_detected: 0, signal_id_filter: 0, touch_area: 0,
+        }));
+        // 注册 FloatSignalFilter 子类
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(FloatSignalFilter {
+            priority: 0, condition_types: 0, end_time: 0, time_mode: 0,
+            accept_consume: true, deny_consume: false,
+            channel_name: String::new(), filter_range: 0,
+        }));
+
+        // 构造基类 SignalFilter 对象
+        for i in 0..3 { fx.vm.param_pool.set_object_param(i, 0); }
+        fx.vm.param_pool.set_int_param(0, 0);
+        fx.vm.param_pool.set_bool_param(0, true);
+        fx.vm.param_pool.set_bool_param(1, false);
+        let base_id = {
+            let sf = SignalFilter {
+                priority: 0, condition_types: 0, end_time: 0, time_mode: 0,
+                accept_consume: true, deny_consume: false,
+            };
+            let mut ctx = fx.ctx();
+            sf.do_construct_native(&mut ctx, None, 0)
+        };
+
+        // 构造 InputSignalFilter 子类对象
+        for i in 0..6 { fx.vm.param_pool.set_object_param(i, 0); }
+        fx.vm.param_pool.set_int_param(0, 0);
+        fx.vm.param_pool.set_bool_param(0, true);
+        fx.vm.param_pool.set_bool_param(1, false);
+        let input_id = {
+            let isf = InputSignalFilter {
+                priority: 0, condition_types: 0, end_time: 0, time_mode: 0,
+                accept_consume: true, deny_consume: false,
+                on_detected: 0, signal_id_filter: 0, touch_area: 0,
+            };
+            let mut ctx = fx.ctx();
+            isf.do_construct_native(&mut ctx, None, 0)
+        };
+
+        // 构造 FloatSignalFilter 子类对象（channel="speed"）
+        for i in 0..4 { fx.vm.param_pool.set_object_param(i, 0); }
+        fx.vm.param_pool.set_int_param(0, 0);
+        fx.vm.param_pool.set_bool_param(0, true);
+        fx.vm.param_pool.set_bool_param(1, false);
+        fx.vm.param_pool.set_string_param(0, "speed".to_string());
+        let float_id = {
+            let fsf = FloatSignalFilter {
+                priority: 0, condition_types: 0, end_time: 0, time_mode: 0,
+                accept_consume: true, deny_consume: false,
+                channel_name: String::new(), filter_range: 0,
+            };
+            let mut ctx = fx.ctx();
+            fsf.do_construct_native(&mut ctx, None, 0)
+        };
+
+        // 验证：基类 SignalFilter.can_detect 返回 false
+        fx.vm.param_pool.set_string_param(0, "Touch".to_string());
+        { let mut ctx = fx.ctx(); ctx.invoke_native_method_on("GorgeFramework.SignalFilter", base_id, 0); }
+        assert!(!fx.vm.param_pool.get_bool_return(), "SignalFilter.can_detect 应返回 false");
+
+        // 验证：子类 InputSignalFilter.can_detect 返回 true
+        fx.vm.param_pool.set_string_param(0, "Touch".to_string());
+        { let mut ctx = fx.ctx(); ctx.invoke_native_method_on("GorgeFramework.InputSignalFilter", input_id, 0); }
+        assert!(fx.vm.param_pool.get_bool_return(), "InputSignalFilter.can_detect 应返回 true");
+
+        // 验证：子类 FloatSignalFilter.can_detect 按 channel 匹配
+        fx.vm.param_pool.set_string_param(0, "speed".to_string());
+        { let mut ctx = fx.ctx(); ctx.invoke_native_method_on("GorgeFramework.FloatSignalFilter", float_id, 0); }
+        assert!(fx.vm.param_pool.get_bool_return(), "FloatSignalFilter.can_detect(\"speed\") 应返回 true");
+
+        fx.vm.param_pool.set_string_param(0, "other".to_string());
+        { let mut ctx = fx.ctx(); ctx.invoke_native_method_on("GorgeFramework.FloatSignalFilter", float_id, 0); }
+        assert!(!fx.vm.param_pool.get_bool_return(), "FloatSignalFilter.can_detect(\"other\") 应返回 false");
+    }
+
+    /// 测试 evaluate 方法重写：基类 FunctionCurve.evaluate 返回 0.0，
+    /// 子类 ConstantFunctionCurve.evaluate 返回构造时指定的 value。
+    #[test]
+    fn test_polymorphic_function_curve_evaluate_dispatch() {
+        let mut fx = Fixture::new();
+
+        // 注册基类 FunctionCurveNative
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(FunctionCurveNative { _placeholder: false }));
+        // 注册子类 ConstantFunctionCurve
+        register_native_class_to_vm(&mut fx, std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
+
+        // 构造基类 FunctionCurveNative 对象
+        fx.vm.param_pool.set_bool_param(0, false);
+        let base_id = {
+            let fcn = FunctionCurveNative { _placeholder: false };
+            let mut ctx = fx.ctx();
+            fcn.do_construct_native(&mut ctx, None, 0)
+        };
+
+        // 构造子类 ConstantFunctionCurve 对象（value=42.0）
+        fx.vm.param_pool.set_float_param(0, 42.0);
+        let const_id = {
+            let cfc = ConstantFunctionCurve { value: 0.0 };
+            let mut ctx = fx.ctx();
+            cfc.do_construct_native(&mut ctx, None, 0)
+        };
+
+        // 验证：基类 evaluate 返回 0.0
+        fx.vm.param_pool.set_float_param(0, 10.0);
+        { let mut ctx = fx.ctx(); ctx.invoke_native_method_on("GorgeFramework.FunctionCurve", base_id, 0); }
+        assert_eq!(fx.vm.param_pool.get_float_return() as f32, 0.0, "FunctionCurve.evaluate 应返回 0.0");
+
+        // 验证：子类 evaluate 返回 value（42.0），与输入 x 无关
+        fx.vm.param_pool.set_float_param(0, 10.0);
+        { let mut ctx = fx.ctx(); ctx.invoke_native_method_on("GorgeFramework.ConstantFunctionCurve", const_id, 0); }
+        assert_eq!(fx.vm.param_pool.get_float_return() as f32, 42.0, "ConstantFunctionCurve.evaluate 应返回 42.0");
+    }
 }

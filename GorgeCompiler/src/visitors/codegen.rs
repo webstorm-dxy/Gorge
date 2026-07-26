@@ -68,6 +68,8 @@ pub struct CodeGenerator<'a> {
     injector_field_info: HashMap<String, (usize, ValueType)>,
     param_counters: ParamIndexCounters,
     pub current_class_name: Option<String>,
+    /// 当前类的作用域（含正确的 using_scopes），用于跨命名空间类型查找
+    pub current_class_scope: Option<ScopeId>,
     /// 当前类的泛型参数名列表（J1）
     current_generic_params: Vec<String>,
     /// 泛型参数 → 具体类型替换映射（T6 实例化）
@@ -113,6 +115,7 @@ impl<'a> CodeGenerator<'a> {
             injector_field_info: HashMap::new(),
             param_counters: ParamIndexCounters::default(),
             current_class_name: None,
+            current_class_scope: None,
             current_generic_params: Vec::new(),
             generic_substitutions: HashMap::new(),
             block_stack: Vec::new(),
@@ -120,6 +123,14 @@ impl<'a> CodeGenerator<'a> {
             injector_constants: Vec::new(),
             current_block_context: BlockContext::Instance,
         }
+    }
+
+    /// 获取类类型查找的作用域
+    ///
+    /// 优先使用当前类作用域（含正确的跨命名空间 using_scopes），
+    /// 回退到 global_scope。
+    fn class_lookup_scope(&self) -> ScopeId {
+        self.current_class_scope.unwrap_or(self.symbol_table.global_scope)
     }
 
     /// 为方法参数注册地址
@@ -335,12 +346,23 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// 设置类上下文，填充字段名→(偏移,类型) 映射（包含继承字段）
+    ///
+    /// 同时填充 `field_types`（字段名→完整类型信息），供「this 字段再取其成员」
+    /// （如 `lane.noteReferenceNode`）的接收者类型推导使用。
     pub fn set_class_context(&mut self, class_name: &str) {
         self.current_class_name = Some(class_name.to_string());
+        self.current_class_scope = None;
         self.field_info.clear();
+        self.field_types.clear();
         self.current_generic_params.clear();
-        let scope_id = self.symbol_table.global_scope;
-        if let Some(mut class_id) = self.symbol_table.lookup_class(scope_id, class_name) {
+        let starting_class_id = match self.symbol_table.find_class_by_name(class_name) {
+            Some((cid, scope)) => {
+                self.current_class_scope = Some(scope);
+                Some(cid)
+            }
+            None => self.symbol_table.lookup_class(self.symbol_table.global_scope, class_name),
+        };
+        if let Some(mut class_id) = starting_class_id {
             loop {
                 let class_info = self.symbol_table.classes.get(class_id.0);
                 for &field_id in &class_info.fields {
@@ -348,6 +370,9 @@ impl<'a> CodeGenerator<'a> {
                     let vt = Self::type_to_value_type(&fi.field_type);
                     let offset = fi.offset.unwrap_or(0);
                     self.field_info.entry(fi.name.clone()).or_insert((offset, vt));
+                    self.field_types
+                        .entry(fi.name.clone())
+                        .or_insert_with(|| fi.field_type.clone());
                 }
                 // J1: 收集泛型参数名
                 for gp in &class_info.generic_params {
@@ -439,8 +464,8 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// 在指定类中解析实例方法（含重载）
-    fn resolve_instance_method(&self, class_name: &str, method: &str, arg_types: &[TypeInfo]) -> Result<Option<(usize, ValueType)>, ()> {
-        let scope = self.symbol_table.global_scope;
+    fn resolve_instance_method(&self, class_name: &str, method: &str, arg_types: &[TypeInfo]) -> Result<Option<(usize, TypeInfo)>, ()> {
+        let scope = self.class_lookup_scope();
         let mut class_id = match self.symbol_table.lookup_class(scope, class_name) { Some(c) => c, None => return Ok(None) };
         loop {
             let class_info = self.symbol_table.classes.get(class_id.0);
@@ -456,15 +481,15 @@ impl<'a> CodeGenerator<'a> {
                 } else {
                     class_info.method_start_id + i
                 };
-                let ret = Self::type_to_value_type(&mi.return_type);
+                let return_type = mi.return_type.clone();
                 match self.match_params(&mi.parameters, arg_types) {
-                    MatchLevel::Exact => exact.push((global_id, ret)),
-                    MatchLevel::Castable => castable.push((global_id, ret)),
+                    MatchLevel::Exact => exact.push((global_id, return_type)),
+                    MatchLevel::Castable => castable.push((global_id, return_type)),
                     MatchLevel::None => {}
                 }
             }
-            if let Some(&hit) = exact.first() { return Ok(Some(hit)); }
-            if castable.len() == 1 { return Ok(Some(castable[0])); }
+            if let Some(hit) = exact.first() { return Ok(Some(hit.clone())); }
+            if castable.len() == 1 { return Ok(Some(castable[0].clone())); }
             if castable.len() > 1 { return Err(()); }
             match class_info.super_class { Some(sid) => class_id = sid, None => return Ok(None) }
         }
@@ -481,7 +506,7 @@ impl<'a> CodeGenerator<'a> {
     /// - 若存在同名方法但**没有任何重载**的形参个数等于 `arg_count`，报编译错误并返回 `true`；
     /// - 若无同名方法（可能是 native/未解析，交由运行时分派）或存在数量匹配的重载，返回 `false`。
     fn check_method_arg_count(&mut self, class_name: &str, method: &str, want_static: bool, arg_count: usize, span: Span) -> bool {
-        let scope = self.symbol_table.global_scope;
+        let scope = self.class_lookup_scope();
         let mut class_id = match self.symbol_table.lookup_class(scope, class_name) { Some(c) => c, None => return false };
         let mut name_found = false;
         let mut arities: Vec<usize> = Vec::new();
@@ -520,8 +545,11 @@ impl<'a> CodeGenerator<'a> {
                 match name.as_str() {
                     "int" => TypeInfo::Int, "float" => TypeInfo::Float, "bool" => TypeInfo::Bool,
                     "string" => TypeInfo::String, "void" => TypeInfo::Void,
-                    _ => self.symbol_table.lookup_class(self.symbol_table.global_scope, name)
-                        .map(TypeInfo::Object).unwrap_or(TypeInfo::Unresolved),
+                    // lookup_qualified 支持 `GorgeFramework.Element` 限定名
+                    _ => match self.symbol_table.lookup_qualified(self.class_lookup_scope(), name) {
+                        Some((SymbolEntry::Class(cid), _)) => TypeInfo::Object(*cid),
+                        _ => TypeInfo::Unresolved,
+                    },
                 }
             },
             // J1: 泛型实例化 `Foo<int>`
@@ -544,7 +572,7 @@ impl<'a> CodeGenerator<'a> {
             Expression::Literal(Literal::Bool(_), _) => TypeInfo::Bool,
             Expression::Literal(Literal::String(_), _) => TypeInfo::String,
             Expression::Identifier(name, _) => self.var_types.get(name).cloned().or_else(|| self.field_types.get(name).cloned()).unwrap_or(TypeInfo::Unresolved),
-            Expression::This(_) => self.current_class_name.as_ref().and_then(|n| self.symbol_table.lookup_class(self.symbol_table.global_scope, n)).map(TypeInfo::Object).unwrap_or(TypeInfo::Unresolved),
+            Expression::This(_) => self.current_class_name.as_ref().and_then(|n| self.symbol_table.lookup_class(self.class_lookup_scope(), n)).map(TypeInfo::Object).unwrap_or(TypeInfo::Unresolved),
             Expression::New { class_type, .. } => self.resolve_type_ref(class_type),
             Expression::Cast { target_type, .. } => self.resolve_type_ref(target_type),
             Expression::Binary { left, operator, .. } => {
@@ -552,7 +580,7 @@ impl<'a> CodeGenerator<'a> {
                 match operator { Less|LessEqual|Greater|GreaterEqual|Equal|NotEqual|LogicAnd|LogicOr => TypeInfo::Bool, _ => self.infer_type(left) }
             }
             // 委托调用 d1(arg) → 从委托变量推导返回类型
-            Expression::MethodCall { receiver, .. } => {
+            Expression::MethodCall { receiver, method, arguments, .. } => {
                 if let Expression::Identifier(name, _) = receiver.as_ref() {
                     if let Some(idx) = self.delegate_vars.get(name) {
                         if let Some(di) = self.delegate_impls.get(*idx) {
@@ -566,7 +594,11 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
                 }
-                TypeInfo::Unresolved
+                let argument_types: Vec<TypeInfo> = arguments.iter()
+                    .map(|argument| self.infer_type(argument))
+                    .collect();
+                self.resolve_instance_method_return_type(receiver, method, &argument_types)
+                    .unwrap_or(TypeInfo::Unresolved)
             }
             // 直接委托调用 d1(arg)（语法为 StaticMethodCall，class_name 为空）
             Expression::StaticMethodCall { method, .. } => {
@@ -583,7 +615,57 @@ impl<'a> CodeGenerator<'a> {
                 }
                 TypeInfo::Unresolved
             }
+            // 成员访问优先按接收者字段类型推导；枚举成员访问保留专门回退逻辑。
+            Expression::MemberAccess { object, .. } => {
+                if let Some(ty) = self.resolve_object_type(expr) {
+                    return ty;
+                }
+                if let Expression::Identifier(name, _) = object.as_ref() {
+                    if self.lookup_var(name).is_none() && !self.field_info.contains_key(name) {
+                        if let Some(enum_id) =
+                            self.symbol_table.find_enum_by_name(self.class_lookup_scope(), name)
+                        {
+                            return TypeInfo::Enum(enum_id);
+                        }
+                    }
+                }
+                TypeInfo::Unresolved
+            }
+            // 数组访问的表达式类型就是数组元素类型（对齐 C# ArrayAccessExpression）。
+            Expression::ArrayAccess { array, .. } => self.resolve_object_type(array)
+                .and_then(|ty| match ty {
+                    TypeInfo::Array(element_type) => Some(*element_type),
+                    _ => None,
+                })
+                .unwrap_or(TypeInfo::Unresolved),
             _ => TypeInfo::Unresolved,
+        }
+    }
+
+    /// 解析实例方法调用的返回类型，支持成员链、数组元素等任意可推导接收者。
+    fn resolve_instance_method_return_type(
+        &self,
+        receiver: &Expression,
+        method: &str,
+        argument_types: &[TypeInfo],
+    ) -> Option<TypeInfo> {
+        let receiver_type = self.resolve_object_type(receiver).or_else(|| match receiver {
+            Expression::New { class_type, .. } => Some(self.resolve_type_ref(class_type)),
+            _ => None,
+        })?;
+
+        match receiver_type {
+            TypeInfo::Object(class_id) => {
+                let class_name = &self.symbol_table.classes.get(class_id.0).name;
+                self.resolve_instance_method(class_name, method, argument_types)
+                    .ok()
+                    .flatten()
+                    .map(|(_, return_type)| return_type)
+            }
+            TypeInfo::Interface(interface_id) => self
+                .resolve_interface_method(interface_id, method, argument_types)
+                .map(|(_, _, return_type)| return_type),
+            _ => None,
         }
     }
 
@@ -598,24 +680,13 @@ impl<'a> CodeGenerator<'a> {
         None
     }
 
-    /// 在类中查找方法返回类型（含继承链）
-    fn lookup_method_return_type(&self, obj_ty: &TypeInfo, method: &str) -> Option<TypeInfo> {
-        let mut class_id = match obj_ty { TypeInfo::Object(cid) => Some(*cid), _ => None };
-        while let Some(cid) = class_id {
-            let ci = self.symbol_table.classes.get(cid.0);
-            for &mid in &ci.methods { let mi = self.symbol_table.methods.get(mid.0); if mi.name == method { return Some(mi.return_type.clone()); } }
-            class_id = ci.super_class;
-        }
-        None
-    }
-
     /// 在接口中解析方法
-    fn resolve_interface_method(&self, iface_id: InterfaceId, method: &str, arg_types: &[TypeInfo]) -> Option<(usize, String, ValueType)> {
+    fn resolve_interface_method(&self, iface_id: InterfaceId, method: &str, arg_types: &[TypeInfo]) -> Option<(usize, String, TypeInfo)> {
         let iface = self.symbol_table.interfaces.get(iface_id.0);
         for (local_idx, &mid) in iface.methods.iter().enumerate() {
             let mi = self.symbol_table.methods.get(mid.0);
             if mi.name == method && self.match_params(&mi.parameters, arg_types) != MatchLevel::None {
-                return Some((local_idx, iface.name.clone(), Self::type_to_value_type(&mi.return_type)));
+                return Some((local_idx, iface.name.clone(), mi.return_type.clone()));
             }
         }
         None
@@ -723,6 +794,8 @@ impl<'a> CodeGenerator<'a> {
             TypeInfo::Float => ValueType::Float,
             TypeInfo::Bool => ValueType::Bool,
             TypeInfo::String => ValueType::String,
+            // 枚举在 VM 中以整数存储（Enum → Int）
+            TypeInfo::Enum(_) => ValueType::Int,
             // 泛型参数保持 Object（字段偏移不展开），但让调用方能区分具体类型
             TypeInfo::GenericParam(_) | TypeInfo::GenericInstance { .. } => ValueType::Object,
             _ => ValueType::Object,
@@ -893,7 +966,8 @@ impl<'a> CodeGenerator<'a> {
                 Operand::Address(Address::new(ValueType::Object, 0))
             }
             Expression::Null(_span) => {
-                Operand::Address(Address::new(ValueType::Object, 0))
+                // Object 地址 0 固定保留给 this；null 必须使用默认值为 0 的独立临时槽位。
+                Operand::Address(self.alloc_temp(ValueType::Object))
             }
             Expression::InjectorObject { class_name, fields, span } => {
                 // 注入器对象：将字段值求值为编译时常量，存入常量池（G2）
@@ -933,12 +1007,15 @@ impl<'a> CodeGenerator<'a> {
                     Operand::Address(temp)
                 } else {
                     self.diagnostics.emit_error(*span, "注入器数组元素必须是编译时常量");
-                    let temp = self.alloc_temp(ValueType::Object);
-                    self.emit(IntermediateCode::nop(), *span);
-                    Operand::Address(temp)
+                    Operand::Address(Address::new(ValueType::Object, 0))
                 }
             }
             Expression::InjectorFieldRef(name, span) => {
+                // 校验当前类是否有注入器字段定义
+                if self.injector_field_info.is_empty() {
+                    self.diagnostics.emit_error(*span, &format!("未定义的注入器字段 `^{}`（当前类未声明注入器字段）", name));
+                    return Operand::Address(Address::new(ValueType::Int, 0));
+                }
                 // 从 VM 上下文加载当前注入器对象 ID
                 let temp_inj = self.alloc_temp(ValueType::Object);
                 self.emit(IntermediateCode::new(
@@ -963,6 +1040,9 @@ impl<'a> CodeGenerator<'a> {
                     self.diagnostics.emit_error(*span, &format!("未定义的注入器字段 `^{}`", name));
                     Operand::Address(Address::new(ValueType::Int, 0))
                 }
+            }
+            Expression::InjectorNew { injector_field, args, span } => {
+                self.generate_injector_new(injector_field, args, *span)
             }
             Expression::Lambda { parameters, body, span } => {
                 // 1. 自由变量分析（须在生成子代码之前，以便注册捕获变量到 sub_cg）
@@ -1091,11 +1171,60 @@ impl<'a> CodeGenerator<'a> {
             }
             // 数组元素访问 a[i] → 调用 native Array 的 get 方法（Phase H3）
             Expression::ArrayAccess { array, index, span } => {
+                // `new (^field)[size]` — 注入器数组构造（对齐 C# ArrayConstructorInvocationExpression）：
+                // parser 将其解析为 InjectorNew 上的 ArrayAccess；
+                // 元素类型取注入器字段同名类字段声明类型（`FunctionCurve^[]`）的数组元素。
+                // 注意：size 表达式必须先于 SetInjector 求值，
+                // 否则 `new (^laneLines)[^laneLines.length]` 中的 `^laneLines` 会读到被切换后的注入器。
+                if let Expression::InjectorNew { injector_field, .. } = array.as_ref() {
+                    if let Some(TypeInfo::Array(elem)) = self.field_types.get(injector_field) {
+                        let elem_name = match elem.as_ref() {
+                            TypeInfo::Object(cid) => self.symbol_table.classes.get(cid.0).name.clone(),
+                            TypeInfo::Int | TypeInfo::Enum(_) => "int".to_string(),
+                            TypeInfo::Float => "float".to_string(),
+                            TypeInfo::Bool => "bool".to_string(),
+                            TypeInfo::String => "string".to_string(),
+                            _ => "object".to_string(),
+                        };
+                        let size_op = self.generate_expression(index);
+                        // 加载注入器字段值并设为当前注入器上下文（与 generate_injector_new 一致）
+                        if let Some(&(field_idx, _)) = self.injector_field_info.get(injector_field) {
+                            let temp_inj = self.alloc_temp(ValueType::Object);
+                            self.emit(IntermediateCode::new(
+                                IntermediateOperator::LoadInjector,
+                                Operand::int(0), None, Some(temp_inj),
+                            ), *span);
+                            let temp_field = self.alloc_temp(ValueType::Object);
+                            self.emit(IntermediateCode::new(
+                                IntermediateOperator::LoadObjectInjectorField(field_idx),
+                                Operand::Address(temp_inj), None, Some(temp_field),
+                            ), *span);
+                            self.emit(IntermediateCode::new(
+                                IntermediateOperator::SetInjector,
+                                Operand::Address(temp_field), None, None,
+                            ), *span);
+                        }
+                        let temp = self.alloc_temp(ValueType::Object);
+                        self.emit(IntermediateCode::new(
+                            IntermediateOperator::InvokeArrayConstructor,
+                            size_op,
+                            Some(Operand::string(elem_name)),
+                            Some(temp),
+                        ), *span);
+                        return Operand::Address(temp);
+                    }
+                }
                 let arr_op = self.generate_expression(array);
                 let idx_op = self.generate_expression(index);
                 self.param_counters.reset();
                 self.emit_set_param(idx_op, *span);
-                let temp = self.alloc_temp(ValueType::Int);
+                let element_value_type = self.resolve_object_type(array)
+                    .and_then(|array_type| match array_type {
+                        TypeInfo::Array(element_type) => Some(Self::type_to_value_type(&element_type)),
+                        _ => None,
+                    })
+                    .unwrap_or(ValueType::Int);
+                let temp = self.alloc_temp(element_value_type);
                 self.emit(
                     IntermediateCode::new(
                         IntermediateOperator::InvokeInstance(0),
@@ -1107,14 +1236,21 @@ impl<'a> CodeGenerator<'a> {
                 );
                 Operand::Address(temp)
             }
-            // 暂未实现的其他表达式类型
-            _ => {
-                let temp = self.alloc_temp(ValueType::Int);
+            // 类型转换表达式 (TargetType)expr
+            Expression::Cast { target_type, expression, span } => {
+                self.generate_cast(target_type, expression, *span)
+            }
+            // super 关键字，生成 LoadThis（VM 层面 super 与 this 等同，运行时分派由父类方法表完成）
+            Expression::Super(span) => {
+                let this_temp = self.alloc_temp(ValueType::Object);
                 self.emit(
-                    IntermediateCode::assign(temp, Operand::int(0)),
-                    expr.span(),
+                    IntermediateCode::new(
+                        IntermediateOperator::LoadThis,
+                        Operand::int(0), None, Some(this_temp),
+                    ),
+                    *span,
                 );
-                Operand::Address(temp)
+                Operand::Address(this_temp)
             }
         }
     }
@@ -1165,7 +1301,10 @@ impl<'a> CodeGenerator<'a> {
                     ValueType::Int => IntermediateOperator::IntAdd,
                     ValueType::Float => IntermediateOperator::FloatAdd,
                     ValueType::String => IntermediateOperator::StringAddition,
-                    _ => unreachable!(),
+                    _ => {
+                        self.diagnostics.emit_error(span, "内部错误：非预期的操作数类型".to_string());
+                        return Operand::Address(self.alloc_temp(ValueType::Int));
+                    }
                 };
                 let result = self.alloc_temp(operand_vt);
                 self.emit(IntermediateCode::binary(ir_op, l, r, result), span);
@@ -1194,7 +1333,10 @@ impl<'a> CodeGenerator<'a> {
                     (Divide, ValueType::Float) => IntermediateOperator::FloatDiv,
                     (Modulo, ValueType::Int) => IntermediateOperator::IntMod,
                     (Modulo, ValueType::Float) => IntermediateOperator::FloatMod,
-                    _ => unreachable!(),
+                    _ => {
+                        self.diagnostics.emit_error(span, "内部错误：非预期的操作数类型".to_string());
+                        return Operand::Address(self.alloc_temp(ValueType::Int));
+                    }
                 };
                 let result = self.alloc_temp(operand_vt);
                 self.emit(IntermediateCode::binary(ir_op, l, r, result), span);
@@ -1223,7 +1365,10 @@ impl<'a> CodeGenerator<'a> {
                     (Greater, ValueType::Float) => IntermediateOperator::FloatGreater,
                     (GreaterEqual, ValueType::Int) => IntermediateOperator::IntGreaterEqual,
                     (GreaterEqual, ValueType::Float) => IntermediateOperator::FloatGreaterEqual,
-                    _ => unreachable!(),
+                    _ => {
+                        self.diagnostics.emit_error(span, "内部错误：非预期的操作数类型".to_string());
+                        return Operand::Address(self.alloc_temp(ValueType::Bool));
+                    }
                 };
                 let result = self.alloc_temp(ValueType::Bool);
                 self.emit(IntermediateCode::binary(ir_op, l, r, result), span);
@@ -1254,7 +1399,10 @@ impl<'a> CodeGenerator<'a> {
                     (NotEqual, ValueType::Bool) => IntermediateOperator::BoolNotEqual,
                     (NotEqual, ValueType::String) => IntermediateOperator::StringNotEqual,
                     (NotEqual, ValueType::Object) => IntermediateOperator::ObjectNotEqual,
-                    _ => unreachable!(),
+                    _ => {
+                        self.diagnostics.emit_error(span, "内部错误：非预期的操作数类型".to_string());
+                        return Operand::Address(self.alloc_temp(ValueType::Bool));
+                    }
                 };
                 let result = self.alloc_temp(ValueType::Bool);
                 self.emit(IntermediateCode::binary(ir_op, l, r, result), span);
@@ -1312,9 +1460,81 @@ impl<'a> CodeGenerator<'a> {
                     span,
                 );
             }
-            _ => {
-                // 前置/后置自增自减暂未实现
-                self.emit(IntermediateCode::assign(result, inner), span);
+            UnaryOp::PreIncrement | UnaryOp::PreDecrement | UnaryOp::PostIncrement | UnaryOp::PostDecrement => {
+                let is_pre = matches!(op, UnaryOp::PreIncrement | UnaryOp::PreDecrement);
+                let is_inc = matches!(op, UnaryOp::PreIncrement | UnaryOp::PostIncrement);
+
+                // 仅支持 int 和 float 类型的自增/自减
+                let operand_vt = match vt {
+                    ValueType::Int | ValueType::Float => vt,
+                    _ => {
+                        self.diagnostics.emit_error(span, "自增/自减操作仅支持 int 或 float 类型");
+                        self.emit(IntermediateCode::assign(result, inner), span);
+                        return Operand::Address(result);
+                    }
+                };
+
+                // 保存原值到临时变量（后置操作返回原值）
+                let orig_temp = self.alloc_temp(operand_vt);
+                self.emit(IntermediateCode::assign(orig_temp, inner.clone()), span);
+
+                // 计算新值：原值 ± 1
+                let one_op = match operand_vt {
+                    ValueType::Int => Operand::int(1),
+                    ValueType::Float => Operand::float(1.0),
+                    _ => unreachable!(),
+                };
+                let arith_op = match (operand_vt, is_inc) {
+                    (ValueType::Int, true) => IntermediateOperator::IntAdd,
+                    (ValueType::Int, false) => IntermediateOperator::IntSub,
+                    (ValueType::Float, true) => IntermediateOperator::FloatAdd,
+                    (ValueType::Float, false) => IntermediateOperator::FloatSub,
+                    _ => unreachable!(),
+                };
+                let new_val = self.alloc_temp(operand_vt);
+                self.emit(IntermediateCode::binary(arith_op, Operand::Address(orig_temp), one_op, new_val), span);
+
+                // 写回操作数：区分局部变量 / this.field / obj.field
+                match operand {
+                    Expression::Identifier(name, var_span) => {
+                        if let Some(addr) = self.lookup_var(name) {
+                            self.emit(IntermediateCode::assign(addr, Operand::Address(new_val)), *var_span);
+                        } else if let Some(&(offset, _)) = self.field_info.get(name) {
+                            let this_temp = self.alloc_temp(ValueType::Object);
+                            self.emit(IntermediateCode::new(
+                                IntermediateOperator::LoadThis,
+                                Operand::int(0), None, Some(this_temp),
+                            ), *var_span);
+                            let set_op = Self::set_field_op(operand_vt, offset);
+                            self.emit(IntermediateCode::new(
+                                set_op,
+                                Operand::Address(this_temp),
+                                Some(Operand::Address(new_val)),
+                                None,
+                            ), *var_span);
+                        }
+                    }
+                    Expression::MemberAccess { object, member, .. } => {
+                        let obj_op = self.generate_expression(object);
+                        let field_lookup = self.lookup_field_for_object(object, member)
+                            .or_else(|| self.field_info.get(member).copied());
+                        if let Some((offset, _)) = field_lookup {
+                            let set_op = Self::set_field_op(operand_vt, offset);
+                            self.emit(IntermediateCode::new(
+                                set_op,
+                                obj_op,
+                                Some(Operand::Address(new_val)),
+                                None,
+                            ), span);
+                        }
+                    }
+                    _ => {
+                        self.diagnostics.emit_error(span, "自增/自减操作的目标必须为变量或字段");
+                    }
+                }
+
+                // 前置返回新值，后置返回原值
+                self.emit(IntermediateCode::assign(result, if is_pre { Operand::Address(new_val) } else { Operand::Address(orig_temp) }), span);
             }
         }
 
@@ -1478,22 +1698,48 @@ impl<'a> CodeGenerator<'a> {
     ///
     /// 当前 `self.field_info` 仅包含正在编译的类的字段，而 `obj.field` 中的
     /// `obj` 可能属于其他类。此方法根据变量声明的类，沿继承链查找字段偏移和类型。
-    fn lookup_field_for_object(&self, object: &Expression, field_name: &str) -> Option<(usize, ValueType)> {
+    pub(crate) fn lookup_field_for_object(&self, object: &Expression, field_name: &str) -> Option<(usize, ValueType)> {
+        // 数组类型对象的成员（如 `arr.length`）→ 在对应 native 数组类中查找
+        // （对齐 C#：数组即 IntArray/ObjectArray 等 native 类的实例，`length` 是其 int 字段）
+        if let Some(ti) = self.resolve_object_type(object) {
+            if let Some(array_class) = Self::native_array_class_name(&ti) {
+                let (cid, _) = self.symbol_table.find_class_by_name(array_class)?;
+                let ci = self.symbol_table.classes.get(cid.0);
+                for &fid in &ci.fields {
+                    let fi = self.symbol_table.fields.get(fid.0);
+                    if fi.name == field_name {
+                        let vt = Self::type_to_value_type(&fi.field_type);
+                        return Some((fi.offset.unwrap_or(0), vt));
+                    }
+                }
+                return None;
+            }
+        }
         // 从变量声明中获取类名
         let class_name = match object {
             Expression::Identifier(name, _) => self.var_class.get(name).cloned(),
             Expression::This(_) => self.current_class_name.clone(),
-            _ => None,
-        };
-        // 从 var_types 中获取类 ID（更精确的路径）
-        let class_id_from_type = match object {
-            Expression::Identifier(name, _) => {
-                self.var_types.get(name).and_then(|ty| {
-                    if let TypeInfo::Object(cid) = ty { Some(*cid) } else { None }
-                })
+            // 成员链访问 t.fieldA.fieldB：递归解析外侧字段类型所属的类
+            Expression::MemberAccess { object: inner, member: inner_field, .. } => {
+                let inner_type = self.resolve_object_type(inner)?;
+                let field_type = self.lookup_field_type_in(&inner_type, inner_field)?;
+                match field_type {
+                    TypeInfo::Object(cid) => Some(self.symbol_table.classes.get(cid.0).name.clone()),
+                    _ => None,
+                }
             }
             _ => None,
         };
+        // 从 var_types 中获取类 ID（更精确的路径）
+        // 局部变量未命中时回退到当前类字段（隐式 this.field 作为接收者的情形，
+        // 如 `lane.noteReferenceNode` 中的 `lane`）
+        let class_id_from_type = self.resolve_object_type(object).and_then(|ty| {
+            if let TypeInfo::Object(class_id) = ty {
+                Some(class_id)
+            } else {
+                None
+            }
+        });
         // 优先用 var_class 查找，回退到 var_types
         let class_name = class_name.or_else(|| {
             class_id_from_type.map(|cid| self.symbol_table.classes.get(cid.0).name.clone())
@@ -1503,7 +1749,7 @@ impl<'a> CodeGenerator<'a> {
             None => return None,
         };
         // 沿继承链查找字段
-        let scope_id = self.symbol_table.global_scope;
+        let scope_id = self.class_lookup_scope();
         let mut class_id = self.symbol_table.lookup_class(scope_id, &class_name)?;
         loop {
             let class_info = self.symbol_table.classes.get(class_id.0);
@@ -1521,6 +1767,52 @@ impl<'a> CodeGenerator<'a> {
             };
         }
         None
+    }
+
+    /// 递归解析表达式的对象类型，用于成员链访问的类型推导
+    ///
+    /// 标识符优先查局部变量，未命中时回退到当前类字段（隐式 `this.field`），
+    /// 使 `lane.noteReferenceNode.x` 这类以 this 字段开头的成员链可以推导。
+    pub(crate) fn resolve_object_type(&self, expr: &Expression) -> Option<TypeInfo> {
+        match expr {
+            Expression::Identifier(name, _) => self
+                .var_types
+                .get(name)
+                .or_else(|| self.field_types.get(name))
+                .cloned(),
+            // 注入器字段引用 `^field` 与同名类字段类型一致（如 `^laneLines` ↔ `FunctionCurve^[]`）
+            Expression::InjectorFieldRef(name, _) => self.field_types.get(name).cloned(),
+            Expression::This(_) => self.current_class_name.as_ref()
+                .and_then(|n| self.symbol_table.lookup_class(self.class_lookup_scope(), n))
+                .map(TypeInfo::Object),
+            Expression::MemberAccess { object, member, .. } => {
+                let inner_type = self.resolve_object_type(object)?;
+                self.lookup_field_type_in(&inner_type, member)
+            }
+            Expression::ArrayAccess { array, .. } => {
+                let array_type = self.resolve_object_type(array)?;
+                match array_type {
+                    TypeInfo::Array(element_type) => Some(*element_type),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// 数组类型对应的 native 数组类名（对齐 C#：`int[]` ↔ `IntArray`，对象数组 ↔ `ObjectArray`）
+    pub(crate) fn native_array_class_name(ti: &TypeInfo) -> Option<&'static str> {
+        if let TypeInfo::Array(elem) = ti {
+            Some(match elem.as_ref() {
+                TypeInfo::Int | TypeInfo::Enum(_) => "IntArray",
+                TypeInfo::Float => "FloatArray",
+                TypeInfo::Bool => "BoolArray",
+                TypeInfo::String => "StringArray",
+                _ => "ObjectArray",
+            })
+        } else {
+            None
+        }
     }
 
     /// 生成成员访问代码
@@ -1562,6 +1854,29 @@ impl<'a> CodeGenerator<'a> {
             }
             self.diagnostics.emit_error(object.span(), &format!("未定义的注入器字段 `^{}`", field_name));
             return Operand::Address(Address::new(ValueType::Int, 0));
+        }
+        // 枚举成员访问 Enum.Value → 直接替换为枚举整数值（对齐 C# 枚举即整数）
+        // 仅当标识符不是局部变量/当前类字段时按枚举解析，避免遮蔽
+        if let Expression::Identifier(name, _) = object {
+            if self.lookup_var(name).is_none() && !self.field_info.contains_key(name) {
+                let scope = self.class_lookup_scope();
+                if let Some(enum_id) = self.symbol_table.find_enum_by_name(scope, name) {
+                    let enum_info = self.symbol_table.enums.get(enum_id.0);
+                    for (i, &vid) in enum_info.values.iter().enumerate() {
+                        let vi = self.symbol_table.enum_values.get(vid.0);
+                        if vi.name == member {
+                            // 显式值优先，缺省按声明序号（对齐 C# 枚举默认值规则）
+                            let v = vi.value.unwrap_or(i as i64);
+                            return Operand::int(v);
+                        }
+                    }
+                    self.diagnostics.emit_error(
+                        object.span(),
+                        format!("枚举 `{}` 中未定义的值 `{}`", name, member),
+                    );
+                    return Operand::int(0);
+                }
+            }
         }
         // this.field → 生成 LoadField（对齐 C#：显式 LoadThis 再 LoadField）
         if matches!(object, Expression::This(_)) {
@@ -1610,7 +1925,7 @@ impl<'a> CodeGenerator<'a> {
     ) -> Operand {
         // 检查是否为静态方法调用 ClassName.method(args)
         if let Expression::Identifier(class_name, _) = receiver {
-            let scope = self.symbol_table.global_scope;
+            let scope = self.class_lookup_scope();
             if let Some(class_id) = self.symbol_table.lookup_class(scope, class_name) {
                 let class_info = self.symbol_table.classes.get(class_id.0);
                 // 在类方法中查找匹配的静态方法
@@ -1651,7 +1966,6 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // 原有的委托/实例调用逻辑
-        let recv_op = self.generate_expression(receiver);
         let delegate_idx = match receiver {
             Expression::Identifier(name, _) => self.delegate_vars.get(name).copied(),
             _ => None,
@@ -1660,7 +1974,7 @@ impl<'a> CodeGenerator<'a> {
         // 非委托调用：尝试查找实例方法
         if delegate_idx.is_none() {
             if let Expression::Identifier(class_name, _) = receiver {
-                let scope = self.symbol_table.global_scope;
+                let scope = self.class_lookup_scope();
                 if let Some(class_id) = self.symbol_table.lookup_class(scope, class_name) {
                     let class_info = self.symbol_table.classes.get(class_id.0);
                     for (i, &method_id) in class_info.methods.iter().enumerate() {
@@ -1694,44 +2008,70 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
             }
-            // 无法静态解析（如变量调用），发出 InvokeInstance(0) 让 VM 运行时分派
+            // 变量.方法() 或 new Class().方法()：参数与接收者各只求值一次，
+            // 避免重复发射求值 IR（副作用重复执行）与重复诊断
             let arg_ops: Vec<Operand> = arguments.iter().map(|a| self.generate_expression(a)).collect();
+            let recv_op = self.generate_expression(receiver);
+            // 解析实例方法编号与返回类型（含成员链、数组元素等接收者）。
+            let receiver_type = self.resolve_object_type(receiver).or_else(|| match receiver {
+                Expression::New { class_type, .. } => Some(self.resolve_type_ref(class_type)),
+                _ => None,
+            });
+            let arg_types: Vec<TypeInfo> = arguments.iter()
+                .map(|argument| self.infer_type(argument))
+                .collect();
+            match receiver_type {
+                Some(TypeInfo::Object(class_id)) => {
+                    let class_name = self.symbol_table.classes.get(class_id.0).name.clone();
+                    self.check_method_arg_count(&class_name, method, false, arguments.len(), span);
+                    if let Ok(Some((method_idx, return_type))) =
+                        self.resolve_instance_method(&class_name, method, &arg_types)
+                    {
+                        self.param_counters.reset();
+                        for arg_op in &arg_ops {
+                            self.emit_set_param(arg_op.clone(), span);
+                        }
+                        let result = self.alloc_temp(Self::type_to_value_type(&return_type));
+                        self.emit(IntermediateCode::new(
+                            IntermediateOperator::InvokeInstance(method_idx),
+                            recv_op,
+                            Some(Operand::string(class_name)),
+                            Some(result),
+                        ), span);
+                        return Operand::Address(result);
+                    }
+                }
+                Some(TypeInfo::Interface(interface_id)) => {
+                    if let Some((method_idx, interface_name, return_type)) =
+                        self.resolve_interface_method(interface_id, method, &arg_types)
+                    {
+                        self.param_counters.reset();
+                        for arg_op in &arg_ops {
+                            self.emit_set_param(arg_op.clone(), span);
+                        }
+                        let result = self.alloc_temp(Self::type_to_value_type(&return_type));
+                        self.emit(IntermediateCode::new(
+                            IntermediateOperator::InvokeInterface(method_idx),
+                            recv_op,
+                            Some(Operand::string(interface_name)),
+                            Some(result),
+                        ), span);
+                        return Operand::Address(result);
+                    }
+                }
+                _ => {}
+            }
+            // 无法静态解析（如变量调用），发出 InvokeInstance(0) 让 VM 运行时分派
+            // 注意：先求值接收者再布置参数，避免接收者中的嵌套调用覆写参数池
             self.param_counters.reset();
             for arg_op in &arg_ops {
                 self.emit_set_param(arg_op.clone(), span);
             }
-            // 变量.方法() 或 new Class().方法()：解析实例方法编号与返回类型（含重载）
-            let receiver_class = match receiver {
-                Expression::Identifier(var_name, _) => self.var_class.get(var_name).cloned(),
-                Expression::New { class_type, .. } => match class_type {
-                    TypeRef::Simple { name, .. } => Some(name.clone()),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(class_name) = receiver_class {
-                // 参数数量校验：同名实例方法存在但无匹配 arity 时报错
-                self.check_method_arg_count(&class_name, method, false, arguments.len(), span);
-                let arg_types: Vec<TypeInfo> = arguments.iter().map(|a| {
-                    match a { Expression::Literal(Literal::Int(_), _) => TypeInfo::Int, Expression::Literal(Literal::Float(_), _) => TypeInfo::Float, Expression::Literal(Literal::Bool(_), _) => TypeInfo::Bool, Expression::Literal(Literal::String(_), _) => TypeInfo::String, _ => TypeInfo::Unresolved }
-                }).collect();
-                if let Ok(Some((method_idx, ret_vt))) = self.resolve_instance_method(&class_name, method, &arg_types) {
-                    let arg_ops: Vec<Operand> = arguments.iter().map(|a| self.generate_expression(a)).collect();
-                    self.param_counters.reset();
-                    for arg_op in &arg_ops { self.emit_set_param(arg_op.clone(), span); }
-                    let recv_op = self.generate_expression(receiver);
-                    let result = self.alloc_temp(ret_vt);
-                    self.emit(IntermediateCode::new(IntermediateOperator::InvokeInstance(method_idx), recv_op, Some(Operand::string(class_name)), Some(result)), span);
-                    return Operand::Address(result);
-                }
-            }
-            // 无法静态解析（如变量调用），发出 InvokeInstance(0) 让 VM 运行时分派
-            let recv_addr_op = self.generate_expression(receiver);
             let result = self.alloc_temp(ValueType::Int);
             self.emit(
                 IntermediateCode::new(
                     IntermediateOperator::InvokeInstance(0),
-                    recv_addr_op,
+                    recv_op,
                     None,
                     Some(result),
                 ),
@@ -1741,6 +2081,7 @@ impl<'a> CodeGenerator<'a> {
         }
 
         // 委托调用
+        let recv_op = self.generate_expression(receiver);
         let arg_ops: Vec<Operand> = arguments.iter().map(|a| self.generate_expression(a)).collect();
         self.param_counters.reset();
         for arg_op in &arg_ops {
@@ -1773,6 +2114,11 @@ impl<'a> CodeGenerator<'a> {
         let recv_op = match self.lookup_var(var_name) {
             Some(addr) => Operand::Address(addr),
             None => {
+                // 隐式 this 调用：无接收者的 `Method(args)` 回退为 `this.Method(args)`
+                // （对齐 C# 成员方法可省略 this 直接调用）
+                if let Some(result) = self.try_generate_implicit_this_call(var_name, arguments, span) {
+                    return result;
+                }
                 self.diagnostics.emit_error(span, format!("未定义的变量 `{}`", var_name));
                 return Operand::Address(self.alloc_temp(ValueType::Int));
             }
@@ -1800,6 +2146,84 @@ impl<'a> CodeGenerator<'a> {
             span,
         );
         Operand::Address(result)
+    }
+
+    /// 尝试将无接收者调用 `Method(args)` 解析为隐式 this 调用 `this.Method(args)`
+    ///
+    /// 查找顺序：当前类及父类的实例方法（含重载解析）→ 当前类的静态方法。
+    /// 均不匹配时返回 None，由调用方报「未定义的变量」。
+    fn try_generate_implicit_this_call(
+        &mut self,
+        method: &str,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Option<Operand> {
+        let class_name = self.current_class_name.clone()?;
+        let arg_types: Vec<TypeInfo> = arguments.iter().map(|a| {
+            match a { Expression::Literal(Literal::Int(_), _) => TypeInfo::Int, Expression::Literal(Literal::Float(_), _) => TypeInfo::Float, Expression::Literal(Literal::Bool(_), _) => TypeInfo::Bool, Expression::Literal(Literal::String(_), _) => TypeInfo::String, _ => TypeInfo::Unresolved }
+        }).collect();
+
+        // 1. 实例方法（含继承链与重载解析，与 var.Method() 路径一致）
+        if let Ok(Some((method_idx, ret_vt))) =
+            self.resolve_instance_method(&class_name, method, &arg_types)
+        {
+            let arg_ops: Vec<Operand> =
+                arguments.iter().map(|a| self.generate_expression(a)).collect();
+            self.param_counters.reset();
+            for arg_op in &arg_ops {
+                self.emit_set_param(arg_op.clone(), span);
+            }
+            // this 固定为地址 0 的 Object（与 This 表达式一致）
+            let this_op = Operand::Address(Address::new(ValueType::Object, 0));
+            let result = self.alloc_temp(Self::type_to_value_type(&ret_vt));
+            self.emit(
+                IntermediateCode::new(
+                    IntermediateOperator::InvokeInstance(method_idx),
+                    this_op,
+                    Some(Operand::string(class_name)),
+                    Some(result),
+                ),
+                span,
+            );
+            return Some(Operand::Address(result));
+        }
+
+        // 2. 当前类的静态方法（分派逻辑与 ClassName.Method() 静态分支一致）
+        let scope = self.class_lookup_scope();
+        let class_id = self.symbol_table.lookup_class(scope, &class_name)?;
+        let class_info = self.symbol_table.classes.get(class_id.0);
+        for (i, &method_id) in class_info.methods.iter().enumerate() {
+            let mi = self.symbol_table.methods.get(method_id.0);
+            if mi.name == method && mi.is_static {
+                self.check_method_arg_count(&class_name, method, true, arguments.len(), span);
+                let arg_ops: Vec<Operand> =
+                    arguments.iter().map(|a| self.generate_expression(a)).collect();
+                self.param_counters.reset();
+                for arg_op in &arg_ops {
+                    self.emit_set_param(arg_op.clone(), span);
+                }
+                // native 类的方法编号按同类方法独立计数（静态方法与实例方法分开编号）
+                let idx = if class_info.is_native {
+                    class_info.methods.iter().take(i).filter(|&&mid| {
+                        self.symbol_table.methods.get(mid.0).is_static
+                    }).count()
+                } else {
+                    i
+                };
+                let result = self.alloc_temp(Self::type_to_value_type(&mi.return_type));
+                self.emit(
+                    IntermediateCode::new(
+                        IntermediateOperator::InvokeStatic(idx),
+                        Operand::int(arguments.len() as i64),
+                        Some(Operand::string(class_name.clone())),
+                        Some(result),
+                    ),
+                    span,
+                );
+                return Some(Operand::Address(result));
+            }
+        }
+        None
     }
 
     /// 生成 new 表达式代码
@@ -1846,7 +2270,7 @@ impl<'a> CodeGenerator<'a> {
         }
         // 调用构造方法（B-5: 根据构造方法是否为 injector 选择操作码）
         let target = match class_type { TypeRef::Simple { name, .. } => Some(name.clone()), _ => None };
-        let scope = self.symbol_table.global_scope;
+        let scope = self.class_lookup_scope();
         let (is_injector, injector_local_id, global_ctor_id) = target.as_ref().and_then(|name| {
             self.symbol_table.lookup_class(scope, name).map(|cid| {
                 let ci = self.symbol_table.classes.get(cid.0);
@@ -1895,6 +2319,70 @@ impl<'a> CodeGenerator<'a> {
             );
         }
         Operand::Address(temp)
+    }
+
+    /// 生成注入器字段构造表达式 `new ^field(args)` 代码
+    ///
+    /// 从当前类的字段声明中反查注入器字段对应的目标类名，
+    /// 加载注入器字段值作为注入器上下文，然后委托给 `generate_new` 完成构造。
+    fn generate_injector_new(
+        &mut self,
+        injector_field: &str,
+        args: &[Expression],
+        span: Span,
+    ) -> Operand {
+        // 从当前类的字段中查找注入器字段对应的目标类名
+        let scope = self.class_lookup_scope();
+        let target_class_name = self.current_class_name.as_ref().and_then(|cn| {
+            self.symbol_table.lookup_class(scope, cn).and_then(|class_id| {
+                let ci = self.symbol_table.classes.get(class_id.0);
+                ci.fields.iter().find_map(|&fid| {
+                    let fi = self.symbol_table.fields.get(fid.0);
+                    if fi.name == injector_field {
+                        match &fi.field_type {
+                            TypeInfo::Object(cls_id) => {
+                                Some(self.symbol_table.classes.get(cls_id.0).name.clone())
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+            })
+        });
+
+        // 加载注入器字段值并设置为当前注入器上下文
+        if let Some(&(field_idx, _vt)) = self.injector_field_info.get(injector_field) {
+            let temp_inj = self.alloc_temp(ValueType::Object);
+            self.emit(IntermediateCode::new(
+                IntermediateOperator::LoadInjector,
+                Operand::int(0),
+                None,
+                Some(temp_inj),
+            ), span);
+            let temp_field = self.alloc_temp(ValueType::Object);
+            self.emit(IntermediateCode::new(
+                IntermediateOperator::LoadObjectInjectorField(field_idx),
+                Operand::Address(temp_inj),
+                None,
+                Some(temp_field),
+            ), span);
+            self.emit(IntermediateCode::new(
+                IntermediateOperator::SetInjector,
+                Operand::Address(temp_field),
+                None,
+                None,
+            ), span);
+        }
+
+        if let Some(ref class_name) = target_class_name {
+            let class_type = TypeRef::Simple { name: class_name.clone(), span };
+            self.generate_new(&class_type, args, None, span)
+        } else {
+            self.diagnostics.emit_error(span, &format!("无法确定注入器字段 `^{}` 的对应类型", injector_field));
+            Operand::Address(self.alloc_temp(ValueType::Object))
+        }
     }
 
     /// 生成条件表达式 `?:` 代码
@@ -1988,6 +2476,11 @@ impl<'a> CodeGenerator<'a> {
             }
             Expression::New { arguments, .. } => {
                 for arg in arguments {
+                    Self::collect_free_vars(arg, params, vars);
+                }
+            }
+            Expression::InjectorNew { args, .. } => {
+                for arg in args {
                     Self::collect_free_vars(arg, params, vars);
                 }
             }
@@ -2729,6 +3222,22 @@ mod tests {
         let ops: Vec<IntermediateOperator> = cg.codes.iter().map(|c| c.code.operator.clone()).collect();
         assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Bool);
         assert!(has_op(&ops, |o| matches!(o, IntermediateOperator::ObjectEqual)));
+    }
+
+    #[test]
+    fn test_null_uses_an_object_slot_other_than_this() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+
+        let result = cg.generate_expression(&Expression::Null(dummy_span()));
+
+        let Operand::Address(address) = result else {
+            panic!("null 应生成对象地址");
+        };
+        assert_eq!(address.value_type, ValueType::Object);
+        assert_ne!(address.index, 0, "对象地址 0 保留给 this，不可代表 null");
     }
 
     #[test]
@@ -3717,5 +4226,741 @@ mod tests {
 
         let has_invoke = cg.codes.iter().any(|c| matches!(c.code.operator, IntermediateOperator::InvokeConstructor(_)));
         assert!(has_invoke, "普通构造方法应发射 InvokeConstructor");
+    }
+
+    // ==================== 修复 1: Cast 表达式测试 ====================
+
+    #[test]
+    fn test_generate_cast_int_to_float() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        let expr = Expression::Cast {
+            target_type: TypeRef::simple("float", dummy_span()),
+            expression: Box::new(Expression::Literal(Literal::Int(42), dummy_span())),
+            span: dummy_span(),
+        };
+        let result = cg.generate_expression(&expr);
+
+        assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Float);
+        assert!(cg.codes.iter().any(|c| matches!(c.code.operator, IntermediateOperator::IntToFloat)));
+    }
+
+    #[test]
+    fn test_generate_cast_float_to_int() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        let expr = Expression::Cast {
+            target_type: TypeRef::simple("int", dummy_span()),
+            expression: Box::new(Expression::Literal(Literal::Float(3.14), dummy_span())),
+            span: dummy_span(),
+        };
+        let result = cg.generate_expression(&expr);
+
+        assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Int);
+        assert!(cg.codes.iter().any(|c| matches!(c.code.operator, IntermediateOperator::FloatToInt)));
+    }
+
+    #[test]
+    fn test_generate_cast_same_type_no_op() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // int → int 不产生转换指令
+        let expr = Expression::Cast {
+            target_type: TypeRef::simple("int", dummy_span()),
+            expression: Box::new(Expression::Literal(Literal::Int(10), dummy_span())),
+            span: dummy_span(),
+        };
+        let _result = cg.generate_expression(&expr);
+        assert!(cg.codes.is_empty(), "同类型转换不应生成指令");
+    }
+
+    // ==================== 修复 2: Super 关键字测试 ====================
+
+    #[test]
+    fn test_generate_super_emits_load_this() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        let expr = Expression::Super(dummy_span());
+        let result = cg.generate_expression(&expr);
+
+        assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Object);
+        assert_eq!(cg.codes.len(), 1);
+        assert!(matches!(cg.codes[0].code.operator, IntermediateOperator::LoadThis));
+    }
+
+    // ==================== 修复 3: 自增自减测试 ====================
+
+    #[test]
+    fn test_generate_pre_increment_int() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // 声明局部变量 x
+        cg.declare_local("x", ValueType::Int);
+        let expr = Expression::Unary {
+            operator: UnaryOp::PreIncrement,
+            operand: Box::new(Expression::Identifier("x".into(), dummy_span())),
+            span: dummy_span(),
+        };
+        let result = cg.generate_expression(&expr);
+
+        // 应包含 IntAdd 指令
+        assert!(cg.codes.iter().any(|c| matches!(c.code.operator, IntermediateOperator::IntAdd)));
+        // 返回值应为 Int 类型
+        assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Int);
+    }
+
+    #[test]
+    fn test_generate_pre_decrement_float() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        cg.declare_local("f", ValueType::Float);
+        let expr = Expression::Unary {
+            operator: UnaryOp::PreDecrement,
+            operand: Box::new(Expression::Identifier("f".into(), dummy_span())),
+            span: dummy_span(),
+        };
+        let result = cg.generate_expression(&expr);
+
+        assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Float);
+        assert!(cg.codes.iter().any(|c| matches!(c.code.operator, IntermediateOperator::FloatSub)));
+    }
+
+    #[test]
+    fn test_generate_post_increment_int() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        cg.declare_local("n", ValueType::Int);
+        let expr = Expression::Unary {
+            operator: UnaryOp::PostIncrement,
+            operand: Box::new(Expression::Identifier("n".into(), dummy_span())),
+            span: dummy_span(),
+        };
+        let result = cg.generate_expression(&expr);
+
+        assert_eq!(CodeGenerator::operand_value_type(&result), ValueType::Int);
+        // post-increment: 应包含原值保存 + 加法 + 写回
+        assert!(cg.codes.iter().any(|c| matches!(c.code.operator, IntermediateOperator::IntAdd)));
+    }
+
+    #[test]
+    fn test_generate_increment_on_non_numeric_reports_error() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        cg.declare_local("s", ValueType::String);
+        let expr = Expression::Unary {
+            operator: UnaryOp::PreIncrement,
+            operand: Box::new(Expression::Identifier("s".into(), dummy_span())),
+            span: dummy_span(),
+        };
+        let _result = cg.generate_expression(&expr);
+        assert!(diags.has_errors(), "对 string 类型自增应报错");
+    }
+
+    // ==================== 修复 4a: 跨对象字段访问 / resolve_object_type 测试 ====================
+
+    #[test]
+    fn test_resolve_object_type_identifier() {
+        let mut st = SymbolTable::new();
+        let global = st.global_scope;
+        let class_id = st.declare_class("Point", global, None, vec![], false, dummy_span());
+        // 声明 int 字段 x
+        st.declare_field("x", class_id, TypeInfo::Int, false, dummy_span());
+        // 分配偏移
+        st.allocate_field_offset(FieldId(0), 0);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.register_var_type("p", TypeInfo::Object(class_id));
+
+        let ty = cg.resolve_object_type(&Expression::Identifier("p".into(), dummy_span()));
+        assert!(matches!(ty, Some(TypeInfo::Object(_))));
+    }
+
+    #[test]
+    fn test_resolve_object_type_member_access() {
+        let mut st = SymbolTable::new();
+        let global = st.global_scope;
+
+        // 创建类 Point { x: int }
+        let point_id = st.declare_class("Point", global, None, vec![], false, dummy_span());
+        st.declare_field("x", point_id, TypeInfo::Int, false, dummy_span());
+        st.allocate_field_offset(FieldId(0), 0);
+
+        // 创建类 Container { pos: Point }
+        let container_id = st.declare_class("Container", global, None, vec![], false, dummy_span());
+        st.declare_field("pos", container_id, TypeInfo::Object(point_id), false, dummy_span());
+        st.allocate_field_offset(FieldId(1), 0);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.register_var_type("c", TypeInfo::Object(container_id));
+
+        // c.pos 的类型应为 Point (Object)
+        let member = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("c".into(), dummy_span())),
+            member: "pos".into(),
+            span: dummy_span(),
+        };
+        let ty = cg.resolve_object_type(&member);
+        assert!(matches!(ty, Some(TypeInfo::Object(cid)) if cid == point_id));
+    }
+
+    #[test]
+    fn test_lookup_field_for_object_chained() {
+        // 测试 t.nativeObjectField.innerField → 跨成员链字段查找
+        let mut st = SymbolTable::new();
+        let global = st.global_scope;
+
+        // NativeObject 类：有 innerField (int)
+        let native_id = st.declare_class("NativeObject", global, None, vec![], false, dummy_span());
+        st.declare_field("innerField", native_id, TypeInfo::Int, false, dummy_span());
+        st.allocate_field_offset(FieldId(0), 0);
+
+        // Target 类：有 nativeObjectField (NativeObject)
+        let target_id = st.declare_class("Target", global, None, vec![], false, dummy_span());
+        st.declare_field("nativeObjectField", target_id, TypeInfo::Object(native_id), false, dummy_span());
+        st.allocate_field_offset(FieldId(1), 0);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.register_var_type("t", TypeInfo::Object(target_id));
+        cg.register_var_class("t", "Target");
+
+        // t.nativeObjectField → 应能查到 innerField
+        let member_access = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("t".into(), dummy_span())),
+            member: "nativeObjectField".into(),
+            span: dummy_span(),
+        };
+        let result = cg.lookup_field_for_object(&member_access, "innerField");
+        assert!(result.is_some(), "跨成员链应能查找到 innerField");
+        let (offset, vt) = result.unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(vt, ValueType::Int);
+    }
+
+    // ==================== 修复 6: 注入器数组非编译时常量测试 ====================
+
+    #[test]
+    fn test_injector_array_non_const_returns_zero_address() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // 数组元素含变量引用（非编译时常量）→ 应报错并返回 Object(0)
+        let expr = Expression::InjectorArray {
+            elements: vec![
+                Expression::Identifier("x".into(), dummy_span()),
+            ],
+            span: dummy_span(),
+        };
+        let result = cg.generate_expression(&expr);
+
+        assert!(diags.has_errors());
+        match result {
+            Operand::Address(a) => {
+                assert_eq!(a.value_type, ValueType::Object);
+                assert_eq!(a.index, 0);
+            }
+            _ => panic!("应返回 Address(0) 而非 Nop"),
+        }
+    }
+
+    // ==================== this 字段成员访问推导（field_types 回退）测试 ====================
+
+    /// 构造 Node/Lane/Note 三层类结构的符号表：
+    /// `Node { x: float }`、`Lane { noteReferenceNode: Node }`、`Note { lane: Lane }`
+    fn make_nested_field_table() -> SymbolTable {
+        let mut st = SymbolTable::new();
+        let g = st.global_scope;
+        let node_id = st.declare_class("Node", g, None, vec![], false, dummy_span());
+        let fx = st.declare_field("x", node_id, TypeInfo::Float, false, dummy_span());
+        st.allocate_field_offset(fx, 0);
+        let lane_id = st.declare_class("Lane", g, None, vec![], false, dummy_span());
+        let fref = st.declare_field(
+            "noteReferenceNode",
+            lane_id,
+            TypeInfo::Object(node_id),
+            false,
+            dummy_span(),
+        );
+        st.allocate_field_offset(fref, 0);
+        let note_id = st.declare_class("Note", g, None, vec![], false, dummy_span());
+        let flane = st.declare_field("lane", note_id, TypeInfo::Object(lane_id), false, dummy_span());
+        st.allocate_field_offset(flane, 0);
+        st
+    }
+
+    /// 两级访问：this 字段 `lane` 的成员 `noteReferenceNode` 应解析为 Lane 的字段
+    #[test]
+    fn test_this_field_member_access_two_level() {
+        let st = make_nested_field_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Note");
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("lane".into(), dummy_span())),
+            member: "noteReferenceNode".into(),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        // 应发射 LoadObjectField(0)（noteReferenceNode 在 Lane 中的偏移）
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::LoadObjectField(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted);
+    }
+
+    /// 三级成员链：`lane.noteReferenceNode.x` 应沿字段类型逐级推导
+    #[test]
+    fn test_this_field_member_chain_three_level() {
+        let st = make_nested_field_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Note");
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::MemberAccess {
+                object: Box::new(Expression::Identifier("lane".into(), dummy_span())),
+                member: "noteReferenceNode".into(),
+                span: dummy_span(),
+            }),
+            member: "x".into(),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        // 最后应发射 LoadFloatField(0)（x 在 Node 中的偏移）
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::LoadFloatField(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted);
+    }
+
+    /// 以 this 字段为接收者的字段赋值：`lane.noteReferenceNode = val` 应解析成功
+    #[test]
+    fn test_this_field_member_assignment() {
+        let st = make_nested_field_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Note");
+
+        let expr = Expression::Assignment {
+            target: AssignmentTarget::Field {
+                object: Box::new(Expression::Identifier("lane".into(), dummy_span())),
+                field: "noteReferenceNode".into(),
+                span: dummy_span(),
+            },
+            operator: AssignmentOp::Assign,
+            value: Box::new(Expression::Literal(Literal::Int(0), dummy_span())),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::SetObjectField(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted);
+    }
+
+    /// 继承场景：SubLane 继承 Lane，`subLane.noteReferenceNode` 沿父类链解析
+    #[test]
+    fn test_this_field_member_access_inherited() {
+        let mut st = make_nested_field_table();
+        let g = st.global_scope;
+        let lane_id = st.lookup_class(g, "Lane").unwrap();
+        let sub_lane_id = st.declare_class("SubLane", g, Some(lane_id), vec![], false, dummy_span());
+        let note2_id = st.declare_class("Note2", g, None, vec![], false, dummy_span());
+        let fsub = st.declare_field(
+            "subLane",
+            note2_id,
+            TypeInfo::Object(sub_lane_id),
+            false,
+            dummy_span(),
+        );
+        st.allocate_field_offset(fsub, 0);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Note2");
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("subLane".into(), dummy_span())),
+            member: "noteReferenceNode".into(),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::LoadObjectField(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted);
+    }
+
+    /// 局部变量优先级：同名局部变量的类型应优先于 this 字段
+    #[test]
+    fn test_local_var_takes_precedence_over_field() {
+        let st = make_nested_field_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Note");
+        // 局部变量 lane 声明为 Node 类型（与字段 lane: Lane 同名不同类）
+        let node_id = st.lookup_class(st.global_scope, "Node").unwrap();
+        cg.register_var_class("lane", "Node");
+        cg.var_types.insert("lane".into(), TypeInfo::Object(node_id));
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("lane".into(), dummy_span())),
+            member: "x".into(),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        // x 是 Node 的字段：若错误地用了字段类型 Lane 则会报「未定义的字段 x」
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::LoadFloatField(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted);
+    }
+
+    // ==================== 枚举支持测试 ====================
+
+    /// 构造含枚举 TimeMode { CatchBefore, KeepUntil } 的符号表
+    fn make_enum_table() -> (SymbolTable, EnumId) {
+        let mut st = SymbolTable::new();
+        let g = st.global_scope;
+        let eid = st.declare_enum("TimeMode", g, dummy_span());
+        st.declare_enum_value("CatchBefore", eid, None, dummy_span());
+        st.declare_enum_value("KeepUntil", eid, None, dummy_span());
+        (st, eid)
+    }
+
+    /// 枚举成员访问：缺省值按声明序号（CatchBefore=0, KeepUntil=1）
+    #[test]
+    fn test_enum_member_access_ordinal() {
+        let (st, _eid) = make_enum_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        let first = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("TimeMode".into(), dummy_span())),
+            member: "CatchBefore".into(),
+            span: dummy_span(),
+        };
+        let r0 = cg.generate_expression(&first);
+        let second = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("TimeMode".into(), dummy_span())),
+            member: "KeepUntil".into(),
+            span: dummy_span(),
+        };
+        let r1 = cg.generate_expression(&second);
+
+        assert!(matches!(r0, Operand::Immediate(ImmediateValue::Int(0))));
+        assert!(matches!(r1, Operand::Immediate(ImmediateValue::Int(1))));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+    }
+
+    /// 枚举成员访问：显式值优先于声明序号
+    #[test]
+    fn test_enum_member_access_explicit_value() {
+        let mut st = SymbolTable::new();
+        let g = st.global_scope;
+        let eid = st.declare_enum("RespondResult", g, dummy_span());
+        st.declare_enum_value("Miss", eid, Some(10), dummy_span());
+        st.declare_enum_value("Perfect", eid, Some(30), dummy_span());
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("RespondResult".into(), dummy_span())),
+            member: "Perfect".into(),
+            span: dummy_span(),
+        };
+        let r = cg.generate_expression(&expr);
+
+        assert!(matches!(r, Operand::Immediate(ImmediateValue::Int(30))));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+    }
+
+    /// 访问未定义的枚举值应报错
+    #[test]
+    fn test_enum_undefined_value_reports_error() {
+        let (st, _eid) = make_enum_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("TimeMode".into(), dummy_span())),
+            member: "NoSuchValue".into(),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        assert!(diags.has_errors(), "应报未定义的枚举值错误");
+    }
+
+    /// 枚举类型字段：赋值枚举值 → SetIntField；相等比较 → IntEqual
+    #[test]
+    fn test_enum_field_assignment_and_equality() {
+        let (mut st, eid) = make_enum_table();
+        let g = st.global_scope;
+        let foo_id = st.declare_class("Foo", g, None, vec![], false, dummy_span());
+        let fmode = st.declare_field("mode", foo_id, TypeInfo::Enum(eid), false, dummy_span());
+        st.allocate_field_offset(fmode, 0);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Foo");
+
+        // mode = TimeMode.CatchBefore
+        let assign = Expression::Assignment {
+            target: AssignmentTarget::Variable("mode".into(), dummy_span()),
+            operator: AssignmentOp::Assign,
+            value: Box::new(Expression::MemberAccess {
+                object: Box::new(Expression::Identifier("TimeMode".into(), dummy_span())),
+                member: "CatchBefore".into(),
+                span: dummy_span(),
+            }),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&assign);
+
+        // mode == TimeMode.KeepUntil
+        let eq = Expression::Binary {
+            left: Box::new(Expression::Identifier("mode".into(), dummy_span())),
+            operator: BinaryOp::Equal,
+            right: Box::new(Expression::MemberAccess {
+                object: Box::new(Expression::Identifier("TimeMode".into(), dummy_span())),
+                member: "KeepUntil".into(),
+                span: dummy_span(),
+            }),
+            span: dummy_span(),
+        };
+        cg.generate_expression(&eq);
+
+        let has_set = cg
+            .codes
+            .iter()
+            .any(|c| matches!(c.code.operator, IntermediateOperator::SetIntField(0)));
+        let has_eq = cg
+            .codes
+            .iter()
+            .any(|c| matches!(c.code.operator, IntermediateOperator::IntEqual));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(has_set, "应发射 SetIntField(0)");
+        assert!(has_eq, "枚举相等比较应发射 IntEqual");
+    }
+
+    /// 同名局部变量优先于枚举：`TimeMode.CatchBefore` 中 TimeMode 为变量时不按枚举解析
+    #[test]
+    fn test_local_var_shadows_enum_name() {
+        let (st, _eid) = make_enum_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        // 注册名为 TimeMode 的局部变量（参数注册会写入 local_vars 地址表）
+        cg.register_parameters(&[("TimeMode".into(), ValueType::Int)]);
+        cg.var_types.insert("TimeMode".into(), TypeInfo::Int);
+
+        let expr = Expression::MemberAccess {
+            object: Box::new(Expression::Identifier("TimeMode".into(), dummy_span())),
+            member: "CatchBefore".into(),
+            span: dummy_span(),
+        };
+        let r = cg.generate_expression(&expr);
+
+        // 不应命中枚举路径（不会返回枚举序数 0 的立即数语义之外的值），
+        // 变量无 CatchBefore 字段 → 报「未定义的字段」而非按枚举静默通过
+        assert!(diags.has_errors(), "变量遮蔽枚举时不应按枚举解析");
+        assert!(!matches!(r, Operand::Immediate(ImmediateValue::Int(0))));
+    }
+
+    // ==================== 隐式 this 方法调用测试 ====================
+
+    /// 构造类 Foo：实例方法 `float EvaluateLineY(float x, float now)` + 静态方法 `int Double(int n)`
+    fn make_method_table() -> SymbolTable {
+        let mut st = SymbolTable::new();
+        let g = st.global_scope;
+        let foo = st.declare_class("Foo", g, None, vec![], false, dummy_span());
+        let p1 = st.declare_parameter("x", TypeInfo::Float, 0, dummy_span());
+        let p2 = st.declare_parameter("now", TypeInfo::Float, 1, dummy_span());
+        st.declare_method(
+            "EvaluateLineY",
+            Some(foo),
+            None,
+            TypeInfo::Float,
+            vec![p1, p2],
+            false,
+            false,
+            dummy_span(),
+        );
+        let p3 = st.declare_parameter("n", TypeInfo::Int, 0, dummy_span());
+        st.declare_method(
+            "Double",
+            Some(foo),
+            None,
+            TypeInfo::Int,
+            vec![p3],
+            true,
+            false,
+            dummy_span(),
+        );
+        st
+    }
+
+    /// 无接收者调用 `EvaluateLineY(1.0, 2.0)` 应解析为 this 的实例方法调用
+    #[test]
+    fn test_implicit_this_instance_method_call() {
+        let st = make_method_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Foo");
+
+        let expr = Expression::StaticMethodCall {
+            class_name: String::new(),
+            method: "EvaluateLineY".into(),
+            arguments: vec![
+                Expression::Literal(Literal::Float(1.0), dummy_span()),
+                Expression::Literal(Literal::Float(2.0), dummy_span()),
+            ],
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        // Foo 为根类（method_start_id=0），EvaluateLineY 是第 0 个方法
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::InvokeInstance(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted, "应发射 InvokeInstance(0)");
+    }
+
+    /// 无接收者调用 `Double(21)` 应回退为当前类的静态方法调用
+    #[test]
+    fn test_implicit_this_static_method_call() {
+        let st = make_method_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Foo");
+
+        let expr = Expression::StaticMethodCall {
+            class_name: String::new(),
+            method: "Double".into(),
+            arguments: vec![Expression::Literal(Literal::Int(21), dummy_span())],
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        // Double 在方法表中索引 1（非 native 静态分支按位置编号）
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::InvokeStatic(1)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted, "应发射 InvokeStatic(1)");
+    }
+
+    /// 不存在的方法仍应报「未定义的变量」
+    #[test]
+    fn test_implicit_this_unknown_method_still_errors() {
+        let st = make_method_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Foo");
+
+        let expr = Expression::StaticMethodCall {
+            class_name: String::new(),
+            method: "NoSuchMethod".into(),
+            arguments: vec![Expression::Literal(Literal::Int(1), dummy_span())],
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        assert!(diags.has_errors(), "不存在的方法应报错");
+    }
+
+    /// 委托变量优先级：同名委托变量存在时不触发 this 方法回退
+    #[test]
+    fn test_delegate_var_takes_precedence_over_implicit_this() {
+        let st = make_method_table();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+        cg.set_class_context("Foo");
+        // 注册名为 EvaluateLineY 的委托变量
+        cg.register_parameters(&[("EvaluateLineY".into(), ValueType::Int)]);
+        cg.delegate_vars.insert("EvaluateLineY".into(), 0);
+
+        let expr = Expression::StaticMethodCall {
+            class_name: String::new(),
+            method: "EvaluateLineY".into(),
+            arguments: vec![
+                Expression::Literal(Literal::Float(1.0), dummy_span()),
+                Expression::Literal(Literal::Float(2.0), dummy_span()),
+            ],
+            span: dummy_span(),
+        };
+        cg.generate_expression(&expr);
+
+        let emitted = cg.codes.iter().any(|c| matches!(
+            c.code.operator,
+            IntermediateOperator::InvokeDelegate(0)
+        ));
+        assert!(!diags.has_errors(), "不应报错: {:?}", diags);
+        assert!(emitted, "应走委托调用路径 InvokeDelegate(0)");
     }
 }

@@ -139,6 +139,11 @@ impl Package {
                     .and_then(|n| n.to_str())
                     .unwrap_or("");
 
+                // 过滤 Unity .meta、隐藏文件及系统文件
+                if should_filter_file(file_name) {
+                    continue;
+                }
+
                 if file_name.ends_with(".g") {
                     let raw_bytes = fs::read(&path)?;
                     let code = strip_utf8_bom(&raw_bytes);
@@ -181,6 +186,15 @@ impl Package {
 
             // 跳过目录条目
             if entry.is_dir() {
+                continue;
+            }
+
+            // 从 entry 路径中提取文件名，过滤 Unity .meta、隐藏文件及系统文件
+            let file_name = Path::new(&entry_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if should_filter_file(file_name) {
                 continue;
             }
 
@@ -238,6 +252,25 @@ impl Package {
         writer.finish().map_err(|e| PackageError::ZipError(e.to_string()))?;
         Ok(())
     }
+}
+
+/// 判断文件名是否应被过滤（不加载到包中）
+///
+/// 过滤规则：
+/// - Unity .meta 文件（扩展名为 .meta）
+/// - 隐藏文件（文件名以 . 开头，如 .DS_Store）
+/// - Windows 系统文件（Thumbs.db）
+fn should_filter_file(file_name: &str) -> bool {
+    if file_name.ends_with(".meta") {
+        return true;
+    }
+    if file_name.starts_with('.') {
+        return true;
+    }
+    if file_name.eq_ignore_ascii_case("Thumbs.db") {
+        return true;
+    }
+    false
 }
 
 /// 剥离 UTF-8 BOM（对应 C# 中 `data[0]==0xEF && data[1]==0xBB && data[2]==0xBF` 检测）。
@@ -449,5 +482,96 @@ mod tests {
         assert_eq!(copy.path, "test.png");
         assert_eq!(copy.data, vec![1, 2, 3]);
         assert!(copy.is_chart_asset);
+    }
+
+    #[test]
+    fn test_filter_meta_file() {
+        assert!(should_filter_file("Tap.png.meta"));
+        assert!(should_filter_file("Dremu.g.meta"));
+        assert!(should_filter_file("chart.g.meta"));
+        // 正常 .meta 后缀的被过滤
+        assert!(!should_filter_file("Tap.png"));
+        assert!(!should_filter_file("chart.g"));
+        assert!(!should_filter_file("readme.metal"));
+    }
+
+    #[test]
+    fn test_filter_hidden_file() {
+        assert!(should_filter_file(".DS_Store"));
+        assert!(should_filter_file(".gitkeep"));
+        assert!(should_filter_file(".hidden"));
+        // 正常文件不过滤
+        assert!(!should_filter_file("file.txt"));
+        assert!(!should_filter_file("not.hidden"));
+    }
+
+    #[test]
+    fn test_filter_thumbs_db() {
+        assert!(should_filter_file("Thumbs.db"));
+        assert!(should_filter_file("thumbs.db"));
+        assert!(should_filter_file("THUMBS.DB"));
+        // 非 Thumbs.db 不过滤
+        assert!(!should_filter_file("database.db"));
+        assert!(!should_filter_file("thumbsdata.db"));
+    }
+
+    #[test]
+    fn test_load_zip_with_meta_files() {
+        // 在内存中构造一个包含 .meta 文件的 zip
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            // 正常源码文件
+            writer.start_file("chart.g", options).unwrap();
+            writer.write_all(b"class Chart {}").unwrap();
+
+            // 正常资源文件
+            writer.start_file("tap.png", options).unwrap();
+            writer.write_all(b"fake_png").unwrap();
+
+            // 应被过滤的 .meta 文件
+            writer.start_file("tap.png.meta", options).unwrap();
+            writer.write_all(b"guid: 12345").unwrap();
+
+            // 应被过滤的 .meta 文件（源码的 meta）
+            writer.start_file("chart.g.meta", options).unwrap();
+            writer.write_all(b"guid: 67890").unwrap();
+
+            // 应被过滤的隐藏文件
+            writer.start_file(".DS_Store", options).unwrap();
+            writer.write_all(b"bud1").unwrap();
+
+            // 子目录中的正常文件
+            writer.start_file("sub/dremu.g", options).unwrap();
+            writer.write_all(b"class Dremu {}").unwrap();
+
+            // 子目录中的 .meta 文件（应被过滤）
+            writer.start_file("sub/dremu.g.meta", options).unwrap();
+            writer.write_all(b"guid: abcde").unwrap();
+
+            writer.finish().unwrap();
+        }
+
+        let loaded = Package::load_zip_from_bytes(&buf, true).unwrap();
+
+        // .meta 文件和 .DS_Store 不应出现在任何列表中
+        assert_eq!(loaded.source_code_files.len(), 2, "应有 2 个源码文件（chart.g, sub/dremu.g）");
+        assert_eq!(loaded.asset_files.len(), 1, "应有 1 个资源文件（tap.png）");
+
+        // 验证源码文件
+        let source_paths: Vec<&str> = loaded.source_code_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(source_paths.contains(&"chart.g"));
+        assert!(source_paths.contains(&"sub/dremu.g"));
+        assert!(!source_paths.contains(&"chart.g.meta"));
+        assert!(!source_paths.contains(&"sub/dremu.g.meta"));
+        assert!(!source_paths.contains(&".DS_Store"));
+
+        // 验证资源文件
+        let asset_paths: Vec<&str> = loaded.asset_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(asset_paths.contains(&"tap.png"));
+        assert!(!asset_paths.contains(&"tap.png.meta"));
     }
 }

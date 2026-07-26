@@ -4,6 +4,6 @@ members = [
     "GorgeCore",
     "GorgeFramework/GorgeMacros",
     "GorgeFramework/GorgeFramework",
-    "GorgeFramework/GorgeRunner",
+    "GorgeFramework/GorgeRunner", "DemoImplement/MarcoquadDemo",
 ]
 resolver = "2"

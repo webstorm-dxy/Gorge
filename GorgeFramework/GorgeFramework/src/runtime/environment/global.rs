@@ -57,13 +57,17 @@ impl AliveElementInfo {
 /// 环境全局数据（对应 C# `RuntimeStatic.Runtime`）。
 ///
 /// 持有 native 类（EnvironmentNative）所需的全部环境引用：
-/// - 资产名 → 对象 ID（GetAssetByName）
+/// - 资产名 → 平台资源句柄（GetAssetByName 在 VM 内包装为资产对象）
 /// - 存活元素表（FindAliveLane）
 /// - 计分器（Scoring）
 /// - 响应音效表（PlayRespondEffect）
 pub struct EnvironmentGlobal {
-    /// 资产名 → 资产对象 ID
+    /// 资产名 → 平台资源句柄
     pub assets: HashMap<String, usize>,
+    /// `(VM 地址, 资产名)` → 已包装的 VM 资产对象 ID。
+    pub asset_objects: HashMap<(usize, String), usize>,
+    /// `(VM 地址, Graph 对象 ID)` → 平台纹理句柄。
+    pub graph_handles: HashMap<(usize, usize), usize>,
     /// 存活元素信息表（用于 FindAliveLane）
     pub alive_elements: Vec<AliveElementInfo>,
     /// 计分器（由 SceneManager 在 RuntimeInitialize 时设置）
@@ -80,6 +84,8 @@ impl EnvironmentGlobal {
     pub fn new() -> Self {
         Self {
             assets: HashMap::new(),
+            asset_objects: HashMap::new(),
+            graph_handles: HashMap::new(),
             alive_elements: Vec::new(),
             scoring: None,
             respond_effects: HashMap::new(),
@@ -142,7 +148,51 @@ pub fn sync_assets_from(assets: &HashMap<String, usize>) {
     with_env_global_mut(|env| {
         env.assets.clear();
         env.assets.extend(assets.iter().map(|(k, v)| (k.clone(), *v)));
+        env.asset_objects.clear();
+        env.graph_handles.clear();
     });
+}
+
+/// 查询指定 VM 中已包装的资产对象。
+pub fn get_asset_object(vm_address: usize, asset_name: &str) -> Option<usize> {
+    with_env_global(|env| {
+        env.asset_objects
+            .get(&(vm_address, asset_name.to_string()))
+            .copied()
+    })
+}
+
+/// 记录指定 VM 的资产对象。
+pub fn register_asset_object(vm_address: usize, asset_name: String, object_id: usize) {
+    with_env_global_mut(|env| {
+        env.asset_objects.insert((vm_address, asset_name), object_id);
+    });
+}
+
+/// 记录 Graph VM 对象与平台纹理句柄的对应关系。
+pub fn register_graph_handle(
+    vm_address: usize,
+    graph_object_id: usize,
+    texture_handle: usize,
+) {
+    with_env_global_mut(|env| {
+        env.graph_handles.insert((vm_address, graph_object_id), texture_handle);
+    });
+}
+
+/// 将 Graph VM 对象 ID 解析为平台纹理句柄。
+///
+/// 非资产创建的 Graph 没有注册映射时，保留原始值以兼容直接传入平台句柄的调用方。
+pub fn resolve_graph_handle(vm_address: usize, graph_object_id: usize) -> usize {
+    if graph_object_id == 0 {
+        return 0;
+    }
+    with_env_global(|env| {
+        env.graph_handles
+            .get(&(vm_address, graph_object_id))
+            .copied()
+            .unwrap_or(graph_object_id)
+    })
 }
 
 /// 将 ScoringV1 同步到全局（由 SceneManager.RuntimeInitialize 调用）

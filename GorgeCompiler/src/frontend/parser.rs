@@ -43,6 +43,8 @@ pub struct Parser {
     pos: usize,
     /// 诊断信息收集器
     diagnostics: Diagnostics,
+    /// 抑制 `:` 预检（用于 `?:` 表达式的真/假分支解析，防止 `:` 被误认为 Lambda/注入器中缀）
+    suppress_colon_precheck: bool,
 }
 
 impl Parser {
@@ -52,6 +54,7 @@ impl Parser {
             tokens,
             pos: 0,
             diagnostics: Diagnostics::new(),
+            suppress_colon_precheck: false,
         }
     }
 
@@ -376,6 +379,8 @@ impl Parser {
             TypeRef::simple("void", span)
         } else if self.match_token(&Token::TypeObject) {
             TypeRef::simple("object", span)
+        } else if self.match_token(&Token::KwAuto) {
+            TypeRef::simple("auto", span)
         } else if self.match_token(&Token::KwDelegate) {
             // delegate<ReturnType, ParamType, ...>
             self.expect_token(&Token::Less)?;
@@ -391,12 +396,32 @@ impl Parser {
                 span,
             }
         } else {
-            // 用户自定义类型名
-            let name = self.match_identifier().ok_or_else(|| {
+            // 用户自定义类型名（支持限定名 Name1.Name2...）
+            // 使用回溯机制：限定名解析失败时恢复位置，只取第一个标识符
+            let first = self.match_identifier().ok_or_else(|| {
                 self.diagnostics
                     .emit_error(self.current_span(), "期望类型名称");
                 ()
             })?;
+            let mut name = first.clone();
+            let mut saved_pos = self.pos;
+
+            // 限定名: Name1.Name2.Name3
+            // 仅在 `.` 后紧跟标识符时才消费（通过位置恢复避免误消费成员访问的点）
+            while self.match_token(&Token::Dot) {
+                match self.match_identifier() {
+                    Some(next) => {
+                        name.push('.');
+                        name.push_str(&next);
+                        saved_pos = self.pos;
+                    }
+                    None => {
+                        // 点号后不是标识符，恢复位置并停止
+                        self.pos = saved_pos;
+                        break;
+                    }
+                }
+            }
 
             // 泛型参数
             if self.match_token(&Token::Less) {
@@ -940,14 +965,16 @@ impl Parser {
         let mut entries = Vec::new();
         if !self.match_token(&Token::LBracket) { return entries; }
         while !self.is_at_end() && !self.check(&Token::RBracket) {
-            let type_name = match self.peek().map(|t| &t.token) {
-                Some(Token::TypeInt) => { self.advance(); "int".into() }
-                Some(Token::TypeFloat) => { self.advance(); "float".into() }
-                Some(Token::TypeBool) => { self.advance(); "bool".into() }
-                Some(Token::TypeString) => { self.advance(); "string".into() }
-                Some(Token::TypeObject) => { self.advance(); "object".into() }
-                Some(Token::KwAuto) => { self.advance(); "auto".into() }
-                _ => self.match_identifier().unwrap_or_default(),
+            // 用 parse_type_ref() 替代硬编码类型匹配，支持复杂类型名
+            // 如 delegate<float:DremuLane^>、ColorArgb^、FunctionCurve^[]^
+            let saved = self.pos;
+            let type_name = match self.parse_type_ref() {
+                Ok(type_ref) => type_ref.to_string(),
+                Err(()) => {
+                    self.pos = saved;
+                    self.skip_until_rbracket_or_comma();
+                    continue;
+                }
             };
             if type_name.is_empty() { break; }
             let name = self.match_identifier().unwrap_or_default();
@@ -963,6 +990,14 @@ impl Parser {
     fn skip_metadata_block(&mut self) {
         // 已改为 parse，保留兼容旧调用
         let _ = self.parse_metadata_block();
+    }
+
+    /// 在元数据块中跳过无法解析的条目，直到遇到 `,`、`]` 或文件末尾
+    fn skip_until_rbracket_or_comma(&mut self) {
+        while !self.is_at_end() && !self.check(&Token::RBracket) && !self.check(&Token::Comma) {
+            self.advance();
+        }
+        self.match_token(&Token::Comma);
     }
 
     /// 解析修饰符列表
@@ -1367,7 +1402,8 @@ impl Parser {
         while !self.is_at_end() {
             // `:` 只在后跟 `{`（注入器）或 `(`（Lambda）时作为中缀操作符
             // 否则留给条件表达式 `?:` 的 else 分支消费
-            if self.check(&Token::Colon) {
+            // 但当 suppress_colon_precheck 为 true 时跳过，避免在 `?:` 内部误消费 `:`
+            if !self.suppress_colon_precheck && self.check(&Token::Colon) {
                 if let Some(tok) = self.peek_ahead(1) {
                     if matches!(&tok.token, Token::LBrace | Token::LParen) {
                         left = self.parse_infix(left, PREC_POSTFIX)?;
@@ -1435,7 +1471,9 @@ impl Parser {
         let target_type = self.parse_type_ref()?;
         self.expect_token(&Token::RParen)?;
         // 解析被转换的一元表达式（右结合，绑定到 cast）
-        let expression = Box::new(self.parse_prefix()?);
+        // 按一元优先级解析（含后缀 `.`/`()`/`[]`，高于二元运算），
+        // 使 `(T) a.b()` 正确解析为 `(T)(a.b())` 而非 `((T)a).b()`
+        let expression = Box::new(self.parse_expression_with_precedence(PREC_UNARY)?);
         Ok(Some(Expression::Cast { target_type, expression, span }))
     }
 
@@ -1488,25 +1526,38 @@ impl Parser {
                         span,
                     });
                 }
-                // 检查是否为带类型 Lambda：`TypeRef:(params) -> body`
-                if self.check(&Token::Colon) {
-                    if let Some(TokenSpan { token: Token::LParen, .. }) = self.peek_ahead(1) {
-                        self.advance(); // 消费 ':'
-                        self.advance(); // 消费 '('
-                        let params = self.parse_typed_parameters()?;
-                        self.expect_token(&Token::RParen)?;
-                        self.expect_token(&Token::LambdaArrow)?;
-                        let body = if self.check(&Token::LBrace) {
-                            LambdaBody::Block(self.parse_block()?)
-                        } else {
-                            LambdaBody::Expression(Box::new(self.parse_expression()?))
-                        };
-                        return Ok(Expression::Lambda {
-                            parameters: params,
-                            body,
-                            span,
-                        });
+                // 检查是否为带类型 Lambda（含数组/注入器后缀）：
+                // `Name:(params) -> body` 或 `Name[]:(params) -> body` 或 `Name^:(params) -> body`
+                // 用 peek_ahead 检测，不消费 token、不产生 diagnostic
+                let mut la: usize = 0;
+                while self.peek_ahead(la).map(|t| &t.token) == Some(&Token::LBracket)
+                    && self.peek_ahead(la + 1).map(|t| &t.token) == Some(&Token::RBracket)
+                {
+                    la += 2;
+                }
+                while self.peek_ahead(la).map(|t| &t.token) == Some(&Token::Caret) {
+                    la += 1;
+                }
+                if self.peek_ahead(la).map(|t| &t.token) == Some(&Token::Colon)
+                    && self.peek_ahead(la + 1).map(|t| &t.token) == Some(&Token::LParen)
+                {
+                    // 确认是带类型 Lambda：`Name:(params) ->` 或 `Name[]:(params) ->` 或 `Name^:(params) ->`
+                    // name 已被 parse_prefix 的 Token::Identifier(name) 消费，无需再次 parse_type_ref
+                    // 先消费 [] 和 ^ 后缀（与 lookahead 中 la 的步进一致）
+                    for _ in 0..la {
+                        self.advance();
                     }
+                    self.advance(); // 消费 ':'
+                    self.advance(); // 消费 '('
+                    let params = self.parse_typed_parameters()?;
+                    self.expect_token(&Token::RParen)?;
+                    self.expect_token(&Token::LambdaArrow)?;
+                    let body = if self.check(&Token::LBrace) {
+                        LambdaBody::Block(self.parse_block()?)
+                    } else {
+                        LambdaBody::Expression(Box::new(self.parse_expression()?))
+                    };
+                    return Ok(Expression::Lambda { parameters: params, body, span });
                 }
                 Ok(Expression::Identifier(name, span))
             }
@@ -1589,6 +1640,28 @@ impl Parser {
 
     /// 解析 new 表达式：`new Type(args)` / `new Type[size]` / `new ^field(args)` / `new var(args)`
     fn parse_new_expression(&mut self, span: Span) -> Result<Expression, ()> {
+        // 注入器字段构造：`new ^field(args)` —— 在类型路径检查之前处理，避免
+        // `parse_expression()` 将 `^field(args)` 整体消耗为 MethodCall 导致参数丢失
+        if self.check(&Token::Caret) {
+            self.advance(); // ^
+            let field_name = self.match_identifier().ok_or_else(|| {
+                self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                ()
+            })?;
+            let arguments = if self.match_token(&Token::LParen) {
+                let args = self.parse_argument_list()?;
+                self.expect_token(&Token::RParen)?;
+                args
+            } else {
+                Vec::new()
+            };
+            return Ok(Expression::InjectorNew {
+                injector_field: field_name,
+                args: arguments,
+                span,
+            });
+        }
+
         let saved = self.pos;
 
         // 如果当前 token 是类型开头（关键字/标识符/delegate），尝试类型路径
@@ -1615,31 +1688,33 @@ impl Parser {
                     } else {
                         Vec::new()
                     };
-                    // 可选注入器初始化 `: { fields }`
-                    let injector = if self.check(&Token::Colon) && matches!(self.peek_ahead(1).map(|t| &t.token), Some(Token::LBrace)) {
+                    // 可选注入器初始化 `: { fields }` 或直接 `{ fields }`
+                    let injector = if self.check(&Token::Colon)
+                        && matches!(self.peek_ahead(1).map(|t| &t.token), Some(Token::LBrace))
+                    {
                         self.advance(); // :
                         self.advance(); // {
-                        let fields = if self.check(&Token::Colon) { // 空注入器 `:{:}`
-                            self.advance();
-                            self.expect_token(&Token::RBrace)?;
-                            Vec::new()
-                        } else if self.check(&Token::Comma) { // 空数组注入器 `:{,}`
-                            self.advance();
-                            self.expect_token(&Token::RBrace)?;
-                            Vec::new()
-                        } else {
-                            let mut f = Vec::new();
-                            while !self.check(&Token::RBrace) && !self.is_at_end() {
-                                let key = self.match_identifier().ok_or_else(|| { self.diagnostics.emit_error(self.current_span(), "期望注入器字段名"); () })?;
-                                self.expect_token(&Token::Colon)?;
-                                let val = self.parse_expression()?;
-                                f.push((key, val));
-                                if !self.match_token(&Token::Comma) { break; }
-                            }
-                            self.expect_token(&Token::RBrace)?;
-                            f
-                        };
+                        let fields = self.parse_ctor_injector_fields()?;
                         Some(fields)
+                    } else if self.check(&Token::LBrace) {
+                        // 直接 `{ fields }` 无冒号形式
+                        // 用 lookahead 区分注入器 `{ key: value }` 与代码块 `{ stmts }`
+                        let la1 = self.peek_ahead(1).map(|t| &t.token);
+                        let is_injector = match la1 {
+                            Some(Token::Identifier(_)) => {
+                                matches!(self.peek_ahead(2).map(|t| &t.token), Some(Token::Colon))
+                            }
+                            Some(Token::Colon) | Some(Token::Comma) => true,
+                            Some(Token::RBrace) => true, // 空注入器 {}
+                            _ => false,
+                        };
+                        if is_injector {
+                            self.advance(); // {
+                            let fields = self.parse_ctor_injector_fields()?;
+                            Some(fields)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -1650,6 +1725,20 @@ impl Parser {
                     self.advance(); // [
                     let size = self.parse_expression()?;
                     self.expect_token(&Token::RBracket)?;
+                    let mut args = vec![size];
+                    // 可选的数组初始器 { elem1, elem2, ... } 或 {,}（空数组）
+                    if self.check(&Token::LBrace) {
+                        self.advance(); // {
+                        if !self.check(&Token::Comma) {
+                            while !self.is_at_end() && !self.check(&Token::RBrace) {
+                                args.push(self.parse_expression()?);
+                                self.match_token(&Token::Comma);
+                            }
+                        } else {
+                            self.advance(); // 跳过逗号，处理空数组 {,}
+                        }
+                        self.expect_token(&Token::RBrace)?;
+                    }
                     // 用 StaticMethodCall 暂代数组构造
                     let type_name = match &class_type {
                         TypeRef::Simple { name, .. } => name.clone(),
@@ -1658,7 +1747,7 @@ impl Parser {
                     return Ok(Expression::StaticMethodCall {
                         class_name: type_name,
                         method: "new_array".into(),
-                        arguments: vec![size],
+                        arguments: args,
                         span,
                     });
                 }
@@ -1667,9 +1756,18 @@ impl Parser {
             return Err(());
         }
 
-        // 表达式路径: new ^field(args) 或 new var(args)
+        // 表达式路径: new ^field(args) 或 new var(args) 或 new (expr)(args)
+        // 对于 new (expr)，需确保 LParen handler 只消费括号内的表达式而不消费 `[index]`、
+        // `.member` 等后缀算子；否则 `new (^f)[i]` 会把 `[i]` 吸入 target_expr
         self.pos = saved;
-        let target_expr = self.parse_expression()?;
+        let target_expr = if self.check(&Token::LParen) {
+            self.advance(); // (
+            let inner = self.parse_expression_with_precedence(PREC_POSTFIX + 1)?;
+            self.expect_token(&Token::RParen)?;
+            inner
+        } else {
+            self.parse_prefix()?
+        };
         let arguments = if self.check(&Token::LParen) {
             self.advance(); // (
             let args = self.parse_argument_list()?;
@@ -1680,10 +1778,9 @@ impl Parser {
         };
 
         match &target_expr {
-            Expression::InjectorFieldRef(name, _) => Ok(Expression::StaticMethodCall {
-                class_name: format!("^{}", name),
-                method: String::new(),
-                arguments,
+            Expression::InjectorFieldRef(name, _) => Ok(Expression::InjectorNew {
+                injector_field: name.clone(),
+                args: arguments,
                 span,
             }),
             Expression::Identifier(name, _) => Ok(Expression::StaticMethodCall {
@@ -1698,6 +1795,58 @@ impl Parser {
                 arguments,
                 span,
             }),
+        }
+    }
+
+    /// 解析构造器调用后的注入器字段初始化 `{ key: value, ... }` 并消费 `}`
+    ///
+    /// 调用前需已消费 `{`。支持 `{:}`/`{,}` 空注入器。
+    fn parse_ctor_injector_fields(&mut self) -> Result<Vec<(String, Expression)>, ()> {
+        let fields = if self.check(&Token::Colon) {
+            self.advance();
+            Vec::new()
+        } else if self.check(&Token::Comma) {
+            self.advance();
+            Vec::new()
+        } else {
+            let mut f = Vec::new();
+            while !self.check(&Token::RBrace) && !self.is_at_end() {
+                let key = self.match_identifier().ok_or_else(|| {
+                    self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                    ()
+                })?;
+                self.expect_token(&Token::Colon)?;
+                let val = self.parse_expression()?;
+                f.push((key, val));
+                if !self.match_token(&Token::Comma) { break; }
+            }
+            f
+        };
+        self.expect_token(&Token::RBrace)?;
+        Ok(fields)
+    }
+
+    /// 与 `parse_ctor_injector_fields` 相同，但不消费结尾 `}`
+    fn parse_ctor_injector_fields_no_rbrace(&mut self) -> Result<Vec<(String, Expression)>, ()> {
+        if self.check(&Token::Colon) {
+            self.advance();
+            Ok(Vec::new())
+        } else if self.check(&Token::Comma) {
+            self.advance();
+            Ok(Vec::new())
+        } else {
+            let mut f = Vec::new();
+            while !self.check(&Token::RBrace) && !self.is_at_end() {
+                let key = self.match_identifier().ok_or_else(|| {
+                    self.diagnostics.emit_error(self.current_span(), "期望注入器字段名");
+                    ()
+                })?;
+                self.expect_token(&Token::Colon)?;
+                let val = self.parse_expression()?;
+                f.push((key, val));
+                if !self.match_token(&Token::Comma) { break; }
+            }
+            Ok(f)
         }
     }
 
@@ -1953,9 +2102,15 @@ impl Parser {
 
             // 条件表达式 `?:`
             Token::Question => {
+                // 抑制 `:` 预检，防止 `a ? expr1 : (expr2)` 中 `:` 被
+                // parse_expression_with_precedence 的冒号预检误消费
+                self.suppress_colon_precheck = true;
                 let then_branch = self.parse_expression_with_precedence(PREC_ASSIGNMENT)?;
+                self.suppress_colon_precheck = false;
                 self.expect_token(&Token::Colon)?;
+                self.suppress_colon_precheck = true;
                 let else_branch = self.parse_expression_with_precedence(precedence)?;
+                self.suppress_colon_precheck = false;
                 Ok(Expression::Conditional {
                     condition: Box::new(left),
                     then_branch: Box::new(then_branch),
@@ -2855,4 +3010,349 @@ class Foo
             _ => panic!("Foo 应为类"),
         }
     }
+
+    /// 验证 `new ^field(args)` 语法正确解析为 `Expression::InjectorNew`
+    #[test]
+    fn test_parse_new_injector_field_constructor() {
+        let source = "new ^myField(1, 2)";
+        let result = parse_expr(source).unwrap();
+        match result {
+            Expression::InjectorNew { injector_field, args, .. } => {
+                assert_eq!(injector_field, "myField", "注入器字段名应为 myField");
+                assert_eq!(args.len(), 2, "参数个数应为 2");
+                assert!(matches!(&args[0], Expression::Literal(Literal::Int(1), _)), "第一个参数为 1");
+                assert!(matches!(&args[1], Expression::Literal(Literal::Int(2), _)), "第二个参数为 2");
+            }
+            _ => panic!("期望 Expression::InjectorNew，实际为 {:?}", result),
+        }
+    }
+
+    /// 带类型 Lambda：`TypeName:(params) -> body`
+    #[test]
+    fn test_parse_typed_lambda_expr() {
+        let source = "ElementLine:(int x) -> { return x; }";
+        let result = parse_expr(source).unwrap();
+        match result {
+            Expression::Lambda { parameters, body, .. } => {
+                assert_eq!(parameters.len(), 1);
+                assert_eq!(parameters[0].name, "x");
+                match &body {
+                    LambdaBody::Block(_) => {}
+                    _ => panic!("期望 LambdaBody::Block"),
+                }
+            }
+            _ => panic!("期望 Expression::Lambda，实际为 {:?}", result),
+        }
+    }
+
+    /// 带类型 Lambda + 注入器后缀：`TypeName^:(params) -> body`
+    #[test]
+    fn test_parse_typed_lambda_with_caret() {
+        let source = "MyType^:(MyType^ arg) -> { return arg; }";
+        let result = parse_expr(source).unwrap();
+        match result {
+            Expression::Lambda { parameters, .. } => {
+                assert_eq!(parameters.len(), 1);
+                assert_eq!(parameters[0].name, "arg");
+            }
+            _ => panic!("期望 Expression::Lambda，实际为 {:?}", result),
+        }
+    }
+
+    /// 带类型 Lambda + 数组后缀：`TypeName[]:(params) -> body`
+    #[test]
+    fn test_parse_typed_lambda_with_brackets() {
+        let source = "MyType[]:(int x) -> { return x; }";
+        let result = parse_expr(source).unwrap();
+        match result {
+            Expression::Lambda { parameters, .. } => {
+                assert_eq!(parameters.len(), 1);
+                assert_eq!(parameters[0].name, "x");
+            }
+            _ => panic!("期望 Expression::Lambda，实际为 {:?}", result),
+        }
+    }
+
+    /// metadata 块中包含带类型 Lambda 值（后跟 @ 注解）
+    #[test]
+    fn test_parse_metadata_with_typed_lambda_value() {
+        let source = r#"
+[ delegate<float:DremuLane^> display = string:(DremuLane^ arg) -> { return arg.^name; } ]
+@Anno
+class Foo { }
+"#;
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.annotations.len(), 1);
+                let meta = &c.annotations[0].metadatas;
+                assert_eq!(meta.len(), 1, "metadata 应有 1 条");
+                assert_eq!(meta[0].type_name, "delegate<float:DremuLane^>");
+                assert_eq!(meta[0].name, "display");
+                assert!(meta[0].value.is_some(), "value 不应为空");
+            }
+            _ => panic!("期望类"),
+        }
+    }
+
+    /// metadata 块中包含多个带类型 Lambda 值（后跟 @ 注解）
+    #[test]
+    fn test_parse_metadata_with_multiple_typed_lambdas() {
+        let source = r#"
+[
+    delegate<float:DremuLane^> display = string:(DremuLane^ arg) -> { return arg.^name; },
+    ColorArgb^ color = ColorArgb : {a : 1.0, r : 0.5, g : 0.5, b : 0.5},
+    delegate<ElementLine:DremuLane^> elementLine = ElementLine:(DremuLane^ lane) -> { return null; },
+    string displayName = "Note"
+]
+@EditableElement(type = "Note")
+class Foo { }
+"#;
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.annotations.len(), 1);
+                let meta = &c.annotations[0].metadatas;
+                assert_eq!(meta.len(), 4, "metadata 应有 4 条");
+                assert_eq!(meta[0].name, "display");
+                assert_eq!(meta[1].name, "color");
+                assert_eq!(meta[2].name, "elementLine");
+                assert_eq!(meta[3].name, "displayName");
+                assert!(meta[0].value.is_some(), "display value 不应为空");
+                assert!(meta[1].value.is_some(), "color value 不应为空");
+                assert!(meta[2].value.is_some(), "elementLine value 不应为空");
+                assert!(meta[3].value.is_some(), "displayName value 不应为空");
+            }
+            _ => panic!("期望类"),
+        }
+    }
+
+    /// DremuNote.g 精简版 — 复杂 metadata 块
+    #[test]
+    fn test_parse_dremu_note_metadata() {
+        let source = r#"
+using Gorge;
+using GorgeFramework;
+namespace Dremu;
+
+[
+    delegate<float:DremuLane^> display = string:(DremuLane^ laneInjector) ->
+    {
+        return laneInjector.^name;
+    },
+    ColorArgb^ color = ColorArgb : {a : 1.0, r : 0.2396693, g : 0.6370158, b : 0.8},
+    delegate<ElementLine:DremuLane^> elementLine = ElementLine:(DremuLane^ lane) ->
+    {
+        ElementLinePoint[] points = new ElementLinePoint[2];
+        return null;
+    },
+    string displayName = "Note"
+]
+@EditableElement(type = "Note")
+class DremuNote : Note
+{
+    int x;
+}
+"#;
+        let ast = parse_source(source).unwrap();
+        assert!(!ast.members.is_empty(), "应有成员");
+        // 在 namespace 内部查找类
+        let mut found = false;
+        for member in &ast.members {
+            if let TopLevelMember::Class(c) = member {
+                if c.name == "DremuNote" {
+                    assert!(!c.annotations.is_empty(), "应有注解");
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "应找到 DremuNote 类");
+    }
+
+    /// `new (^field)[index]` — 注入器字段 new 表达式 + 数组索引
+    #[test]
+    fn test_parse_new_injector_ref_with_index() {
+        let source = "new (^laneLines)[^laneLines.length]";
+        let result = parse_expr(source).unwrap();
+        match result {
+            Expression::ArrayAccess { array, index, .. } => {
+                match array.as_ref() {
+                    Expression::InjectorNew { injector_field, args, .. } => {
+                        assert_eq!(injector_field, "laneLines");
+                        assert_eq!(args.len(), 0);
+                    }
+                    _ => panic!("数组目标应为 InjectorNew，实际为 {:?}", array),
+                }
+                match index.as_ref() {
+                    Expression::MemberAccess { object, member, .. } => {
+                        assert_eq!(member, "length");
+                        match object.as_ref() {
+                            Expression::InjectorFieldRef(name, _) => assert_eq!(name, "laneLines"),
+                            _ => panic!("成员访问对象应为 InjectorFieldRef，实际为 {:?}", object),
+                        }
+                    }
+                    _ => panic!("索引应为 MemberAccess，实际为 {:?}", index),
+                }
+            }
+            _ => panic!("期望 ArrayAccess，实际为 {:?}", result),
+        }
+    }
+
+    /// `new (^field)[index]` 在条件表达式内部
+    #[test]
+    fn test_parse_conditional_with_new_injector_index() {
+        let source = "(^laneLines == null) ? null : (new (^laneLines)[^laneLines.length])";
+        let result = parse_expr(source).unwrap();
+        match result {
+            Expression::Conditional { condition, then_branch, else_branch, .. } => {
+                match condition.as_ref() {
+                    Expression::Binary { operator: BinaryOp::Equal, .. } => {}
+                    _ => panic!("条件应为 == 比较"),
+                }
+                match then_branch.as_ref() {
+                    Expression::Null(_) => {}
+                    _ => panic!("真分支应为 null"),
+                }
+                match else_branch.as_ref() {
+                    Some(expr) => match expr.as_ref() {
+                        Expression::ArrayAccess { .. } => {}
+                        _ => panic!("假分支应为 ArrayAccess，实际为 {:?}", expr),
+                    },
+                    None => panic!("假分支不应为空"),
+                }
+            }
+            _ => panic!("期望 Conditional，实际为 {:?}", result),
+        }
+    }
+
+    /// 字段声明：`Type field = (^f == null) ? null : (new (^f)[^f.len]);`
+    #[test]
+    fn test_parse_field_with_conditional_new_injector_index() {
+        let source = r#"
+class Foo
+{
+    FunctionCurve^[] laneLines = (^laneLines == null) ? null : (new (^laneLines)[^laneLines.length]);
+}
+"#;
+        let ast = parse_source(source).unwrap();
+        match &ast.members[0] {
+            TopLevelMember::Class(c) => {
+                assert_eq!(c.name, "Foo");
+                assert_eq!(c.members.len(), 1, "应有 1 个类成员");
+            }
+            _ => panic!("期望类"),
+        }
+    }
+
+    // ==================== 强制转换结合性测试 ====================
+
+    /// `(T) a.b()` 应解析为 `(T)(a.b())`：方法调用属于 cast 的操作数
+    #[test]
+    fn test_cast_binds_postfix_method_call() {
+        let expr = parse_expr("(Asset) Env.GetIt(\"x\")").unwrap();
+        match expr {
+            Expression::Cast { target_type, expression, .. } => {
+                match target_type {
+                    TypeRef::Simple { name, .. } => assert_eq!(name, "Asset"),
+                    other => panic!("目标类型应为 Simple(Asset)，实际为 {:?}", other),
+                }
+                match expression.as_ref() {
+                    Expression::MethodCall { receiver, method, .. } => {
+                        assert_eq!(method, "GetIt");
+                        match receiver.as_ref() {
+                            Expression::Identifier(name, _) => assert_eq!(name, "Env"),
+                            other => panic!("接收者应为 Identifier(Env)，实际为 {:?}", other),
+                        }
+                    }
+                    other => panic!("cast 操作数应为 MethodCall，实际为 {:?}", other),
+                }
+            }
+            other => panic!("应为 Cast，实际为 {:?}", other),
+        }
+    }
+
+    /// `(T) a.b.c` 应解析为 `(T)(a.b.c)`：成员链属于 cast 的操作数
+    #[test]
+    fn test_cast_binds_member_chain() {
+        let expr = parse_expr("(Node) lane.noteReferenceNode").unwrap();
+        match expr {
+            Expression::Cast { expression, .. } => match expression.as_ref() {
+                Expression::MemberAccess { object, member, .. } => {
+                    assert_eq!(member, "noteReferenceNode");
+                    match object.as_ref() {
+                        Expression::Identifier(name, _) => assert_eq!(name, "lane"),
+                        other => panic!("应为 Identifier(lane)，实际为 {:?}", other),
+                    }
+                }
+                other => panic!("cast 操作数应为 MemberAccess，实际为 {:?}", other),
+            },
+            other => panic!("应为 Cast，实际为 {:?}", other),
+        }
+    }
+
+    /// `(T) a[i]` 应解析为 `(T)(a[i])`：数组访问属于 cast 的操作数
+    #[test]
+    fn test_cast_binds_array_access() {
+        let expr = parse_expr("(Node) arr[0]").unwrap();
+        match expr {
+            Expression::Cast { expression, .. } => match expression.as_ref() {
+                Expression::ArrayAccess { .. } => {}
+                other => panic!("cast 操作数应为 ArrayAccess，实际为 {:?}", other),
+            },
+            other => panic!("应为 Cast，实际为 {:?}", other),
+        }
+    }
+
+    /// `(int) x + 1` 应解析为 `((int)x) + 1`：二元运算不进入 cast 操作数
+    #[test]
+    fn test_cast_does_not_bind_binary() {
+        let expr = parse_expr("(int) x + 1").unwrap();
+        match expr {
+            Expression::Binary { left, operator, .. } => {
+                assert!(matches!(operator, BinaryOp::Add));
+                match left.as_ref() {
+                    Expression::Cast { .. } => {}
+                    other => panic!("左操作数应为 Cast，实际为 {:?}", other),
+                }
+            }
+            other => panic!("应为 Binary，实际为 {:?}", other),
+        }
+    }
+
+    /// `(x) + y` 不是 cast（`)` 后为二元操作符），应保持括号表达式语义
+    #[test]
+    fn test_paren_expr_not_cast_before_binary_operator() {
+        let expr = parse_expr("(x) + y").unwrap();
+        match expr {
+            Expression::Binary { left, operator, .. } => {
+                assert!(matches!(operator, BinaryOp::Add));
+                match left.as_ref() {
+                    Expression::Identifier(name, _) => assert_eq!(name, "x"),
+                    other => panic!("左操作数应为 Identifier(x)，实际为 {:?}", other),
+                }
+            }
+            other => panic!("应为 Binary，实际为 {:?}", other),
+        }
+    }
+
+    /// 嵌套 cast：`(A) (B) x` 内层仍是 cast
+    #[test]
+    fn test_nested_cast() {
+        let expr = parse_expr("(A) (B) x").unwrap();
+        match expr {
+            Expression::Cast { target_type, expression, .. } => {
+                match target_type {
+                    TypeRef::Simple { name, .. } => assert_eq!(name, "A"),
+                    other => panic!("外层目标应为 A，实际为 {:?}", other),
+                }
+                match expression.as_ref() {
+                    Expression::Cast { .. } => {}
+                    other => panic!("内层应为 Cast，实际为 {:?}", other),
+                }
+            }
+            other => panic!("应为 Cast，实际为 {:?}", other),
+        }
+    }
+
 }

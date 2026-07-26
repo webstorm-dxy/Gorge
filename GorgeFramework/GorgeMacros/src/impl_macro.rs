@@ -17,6 +17,8 @@ enum Kind {
     Static,
     Method,
     Ctor,
+    /// 注入器构造方法，按本地顺序独立编号，映射到全局构造方法 ID
+    InjectorCtor,
 }
 
 /// 一个被标注的 Gorge 方法
@@ -43,6 +45,8 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut method_counter = 0usize;
     // 构造方法编号计数器
     let mut ctor_counter = 0usize;
+    // 注入器构造方法编号计数器
+    let mut injector_ctor_counter = 0usize;
 
     for item in &input.items {
         if let ImplItem::Fn(f) = item {
@@ -51,7 +55,7 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 Ok(None) => continue, // 未标注，保留为普通方法
                 Err(e) => return e.to_compile_error().into(),
             };
-            let parsed = match parse_method(f, kind, &mut method_counter, &mut ctor_counter) {
+            let parsed = match parse_method(f, kind, &mut method_counter, &mut ctor_counter, &mut injector_ctor_counter) {
                 Ok(m) => m,
                 Err(e) => return e.to_compile_error().into(),
             };
@@ -65,10 +69,49 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // 生成三个分派方法体
     let static_arms = build_arms(&self_ty, &methods, Kind::Static);
     let method_arms = build_arms(&self_ty, &methods, Kind::Method);
-    let ctor_arms = build_ctor_arms(&self_ty, &methods);
+    let ctor_arms = build_ctor_arms(&self_ty, &methods, Kind::Ctor);
+    let injector_ctor_arms = build_ctor_arms(&self_ty, &methods, Kind::InjectorCtor);
+
+    let injector_ctor_count = injector_ctor_counter;
+    let injector_ctor_impl = if injector_ctor_count > 0 {
+        quote! {
+            impl #self_ty {
+                /// 注入器构造方法数量
+                pub fn gorge_injector_constructor_count() -> usize {
+                    #injector_ctor_count
+                }
+
+                /// 注入器构造方法分派
+                ///
+                /// 按注入器构造方法本地 ID 分派到对应的用户方法。
+                /// 对齐 C# `InjectorConstructorImplementationId` 映射的前半段（本地→全局 ID 由调用方负责）。
+                pub fn gorge_invoke_injector_constructor(
+                    ctx: &mut ::gorge_core::objective::native::NativeContext,
+                    this: usize,
+                    injector_ctor_id: usize,
+                ) {
+                    match injector_ctor_id {
+                        #(#injector_ctor_arms)*
+                        _ => {}
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl #self_ty {
+                /// 注入器构造方法数量（本类无注入器构造方法）
+                pub fn gorge_injector_constructor_count() -> usize {
+                    0
+                }
+            }
+        }
+    };
 
     let expanded = quote! {
         #clean_impl
+
+        #injector_ctor_impl
 
         impl                 ::gorge_core::objective::native::NativeClass for #self_ty {
             fn full_name(&self) -> &str {
@@ -149,6 +192,8 @@ fn classify(attrs: &[syn::Attribute]) -> syn::Result<Option<Kind>> {
             Some(Kind::Method)
         } else if attr.path().is_ident("gorge_ctor") {
             Some(Kind::Ctor)
+        } else if attr.path().is_ident("gorge_injector_ctor") {
+            Some(Kind::InjectorCtor)
         } else {
             None
         };
@@ -171,6 +216,7 @@ fn parse_method(
     kind: Kind,
     method_counter: &mut usize,
     ctor_counter: &mut usize,
+    injector_ctor_counter: &mut usize,
 ) -> syn::Result<GorgeMethod> {
     let ident = f.sig.ident.clone();
 
@@ -184,6 +230,11 @@ fn parse_method(
         Kind::Ctor => {
             let v = *ctor_counter;
             *ctor_counter += 1;
+            v
+        }
+        Kind::InjectorCtor => {
+            let v = *injector_ctor_counter;
+            *injector_ctor_counter += 1;
             v
         }
     };
@@ -236,8 +287,8 @@ fn parse_method(
         }
     };
 
-    // 构造方法不应有返回值
-    if kind == Kind::Ctor && ret.is_some() {
+    // 构造方法/注入器构造方法不应有返回值
+    if matches!(kind, Kind::Ctor | Kind::InjectorCtor) && ret.is_some() {
         return Err(syn::Error::new_spanned(
             &f.sig,
             "构造方法（gorge_ctor）不应有返回值",
@@ -328,11 +379,11 @@ fn build_arms(self_ty: &Type, methods: &[GorgeMethod], want: Kind) -> Vec<TokenS
     arms
 }
 
-/// 生成构造方法的分派臂
-fn build_ctor_arms(self_ty: &Type, methods: &[GorgeMethod]) -> Vec<TokenStream2> {
+/// 生成构造方法的分派臂（若指定 kind，则仅匹配该分类；默认 Kind::Ctor）
+fn build_ctor_arms(self_ty: &Type, methods: &[GorgeMethod], kind: Kind) -> Vec<TokenStream2> {
     let mut arms = Vec::new();
     for m in methods {
-        if m.kind != Kind::Ctor {
+        if m.kind != kind {
             continue;
         }
         let id = m.id;
@@ -366,6 +417,7 @@ fn strip_impl(mut input: ItemImpl) -> ItemImpl {
                 !a.path().is_ident("gorge_static")
                     && !a.path().is_ident("gorge_method")
                     && !a.path().is_ident("gorge_ctor")
+                    && !a.path().is_ident("gorge_injector_ctor")
             });
         }
     }

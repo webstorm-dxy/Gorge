@@ -14,6 +14,31 @@ pub struct CompiledModule {
     pub classes: Vec<CompiledClass>,
 }
 
+/// 编译期注解信息（类级别）
+///
+/// 对应 C# 编译后的类注解，包含注解名、泛型参数和键值对参数。
+/// `arguments` 为 `(参数名, 参数值)` 列表，参数名为空字符串表示位置参数。
+/// 元数据项（`[type name = expr]`）也合并进 `arguments`，以 `name` 为键访问。
+#[derive(Debug, Clone)]
+pub struct CompiledAnnotation {
+    pub name: String,
+    pub generic_type: Option<String>,
+    /// 注解参数，(key, value) 对。key 为空字符串表示位置参数。
+    pub arguments: Vec<(String, String)>,
+}
+
+impl CompiledAnnotation {
+    /// 按参数名查找注解参数值（含元数据）
+    pub fn find_argument(&self, name: &str) -> Option<&String> {
+        self.arguments.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    /// 获取第一个位置参数值（如 `@ElementStaff("NoteForm")` 的第一个位置参数）
+    pub fn first_positional_argument(&self) -> Option<&String> {
+        self.arguments.iter().filter(|(k, _)| k.is_empty()).map(|(_, v)| v).next()
+    }
+}
+
 /// 编译后的类
 ///
 /// 包含类元数据和编译后的方法 IR。
@@ -47,9 +72,9 @@ pub struct CompiledClass {
     /// 字段初始化器（Phase P）：每个有初始值的字段编译为独立的 IR 可执行体
     /// 构造流程中先于构造方法体执行，对齐 C# CompiledGorgeClass.FieldInitializerImplementations
     pub field_initializers: Vec<CompiledFieldInitializer>,
-    /// 类注解（Phase Q3）：(注解名, 可选的泛型类型字符串)
+    /// 类注解（Phase Q3 + V6）：(注解名, 可选的泛型类型, 参数列表)
     /// 对齐 C# ClassDeclaration.Annotations，存储类声明的所有注解信息
-    pub annotations: Vec<(String, Option<String>)>,
+    pub annotations: Vec<CompiledAnnotation>,
     /// 方法注解映射表（S3）：方法全局 ID → 注解列表
     pub method_annotations: HashMap<usize, Vec<MethodAnnotation>>,
     /// 构造方法注解映射表（S3）：构造方法全局 ID → 注解列表
@@ -135,7 +160,8 @@ const MAGIC: [u8; 4] = [b'G', b'O', b'R', b'G'];
 /// V3: 注入器构造方法映射 + 字段初始化器 + 类注解
 /// V4: 方法级注解序列化（method_annotations / constructor_annotations）
 /// V5: 委托捕获变量类型序列化（captured_var_types）
-const VERSION: u16 = 5;
+/// V6: 类注解 arguments 参数序列化（CompiledAnnotation 替代元组）
+const VERSION: u16 = 6;
 
 /// 操作码 → u16 编号的双向映射
 fn opcode_to_u16(op: &IntermediateOperator) -> u16 {
@@ -531,18 +557,28 @@ fn serialize_compiled_class(class: &CompiledClass, buf: &mut Vec<u8>) -> Bytecod
         }, buf)?;
     }
 
-    // 类注解（Phase Q3）
+    // 类注解（Phase Q3 / V6）
     buf.extend_from_slice(&(class.annotations.len() as u16).to_le_bytes());
-    for (name, generic) in &class.annotations {
-        let nb = name.as_bytes();
+    for ann in &class.annotations {
+        let nb = ann.name.as_bytes();
         buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         buf.extend_from_slice(nb);
-        if let Some(gt) = generic {
+        if let Some(gt) = &ann.generic_type {
             let gb = gt.as_bytes();
             buf.extend_from_slice(&(gb.len() as u16).to_le_bytes());
             buf.extend_from_slice(gb);
         } else {
             buf.extend_from_slice(&0u16.to_le_bytes());
+        }
+        // V6: 序列化参数 (key, value) 对
+        buf.extend_from_slice(&(ann.arguments.len() as u16).to_le_bytes());
+        for (key, val) in &ann.arguments {
+            let kb = key.as_bytes();
+            buf.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(kb);
+            let vb = val.as_bytes();
+            buf.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(vb);
         }
     }
 
@@ -1166,7 +1202,7 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize, _version: u16) -> Byt
                 if pos + 2 > data.len() { break; }
                 let glen = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
                 pos += 2;
-                let generic = if glen > 0 {
+                let generic_type = if glen > 0 {
                     if pos + glen > data.len() { break; }
                     let gt = String::from_utf8_lossy(&data[pos..pos+glen]).to_string();
                     pos += glen;
@@ -1174,7 +1210,32 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize, _version: u16) -> Byt
                 } else {
                     None
                 };
-                annotations.push((name, generic));
+                // V6: 反序列化参数 (key, value) 对（旧版 V3-V5 格式无此字段，参数为空）
+                let mut arguments = Vec::new();
+                if _version >= 6 {
+                    if pos + 2 <= data.len() {
+                        let arg_count = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                        pos += 2;
+                        for _ in 0..arg_count {
+                            // 读取 key
+                            if pos + 2 > data.len() { break; }
+                            let klen = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                            pos += 2;
+                            if pos + klen > data.len() { break; }
+                            let key = String::from_utf8_lossy(&data[pos..pos+klen]).to_string();
+                            pos += klen;
+                            // 读取 value
+                            if pos + 2 > data.len() { break; }
+                            let vlen = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                            pos += 2;
+                            if pos + vlen > data.len() { break; }
+                            let val = String::from_utf8_lossy(&data[pos..pos+vlen]).to_string();
+                            pos += vlen;
+                            arguments.push((key, val));
+                        }
+                    }
+                }
+                annotations.push(CompiledAnnotation { name, generic_type, arguments });
             }
         }
     }

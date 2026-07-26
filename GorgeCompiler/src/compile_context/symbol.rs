@@ -355,6 +355,8 @@ impl TypeInfo {
         match (self, target) {
             // Int 可隐式转为 Float
             (TypeInfo::Int, TypeInfo::Float) => true,
+            // 枚举值可作为整数使用（Enum → Int）
+            (TypeInfo::Enum(_), TypeInfo::Int) => true,
             // 相同类型当然可以
             (a, b) if a == b => true,
             // Unresolved 宽松处理
@@ -587,6 +589,37 @@ impl SymbolTable {
     /// 仅在指定作用域中查找（不搜索父作用域）
     pub fn lookup_local(&self, scope_id: ScopeId, name: &str) -> Option<&SymbolEntry> {
         self.scopes.get(scope_id.0).symbols.get(name)
+    }
+
+    /// 按点分限定名查找符号（如 `GorgeFramework.Element`）
+    ///
+    /// 不含 `.` 的普通名称直接走 [`lookup`](Self::lookup) 的三级查找；
+    /// 含 `.` 的限定名从全局作用域逐段下钻命名空间子作用域，
+    /// 最后一段在目标命名空间作用域内按常规规则查找（含其父链与 usings）。
+    ///
+    /// # 参数
+    ///
+    /// * `scope_id` - 非限定名查找时的起始作用域
+    /// * `name` - 符号名，可能为点分限定名
+    ///
+    /// # 返回值
+    ///
+    /// 命中时返回符号条目及其所在作用域，未命中返回 `None`。
+    pub fn lookup_qualified(&self, scope_id: ScopeId, name: &str) -> Option<(&SymbolEntry, ScopeId)> {
+        if !name.contains('.') {
+            return self.lookup(scope_id, name);
+        }
+        let mut parts = name.split('.');
+        // 最后一段是符号名，前面各段是命名空间路径
+        let symbol_name = parts.next_back()?;
+        let mut current = self.global_scope;
+        for ns in parts {
+            let child = self.scopes.get(current.0).children.iter().find(|&&cid| {
+                matches!(&self.scopes.get(cid.0).kind, ScopeKind::Namespace { name } if name == ns)
+            });
+            current = *child?;
+        }
+        self.lookup(current, symbol_name)
     }
 
     /// 获取作用域的父作用域
@@ -1016,6 +1049,20 @@ impl SymbolTable {
         }
     }
 
+    /// 按名称查找类（遍历所有注册的类，不限于特定作用域）
+    ///
+    /// 当类可能在任意命名空间时使用此方法。
+    /// 返回类的 ID 和其所属作用域。
+    pub fn find_class_by_name(&self, name: &str) -> Option<(ClassId, ScopeId)> {
+        for cid in 0..self.classes.len() {
+            let ci = &self.classes.get(cid);
+            if ci.name == name {
+                return Some((ClassId(cid), ci.scope_id));
+            }
+        }
+        None
+    }
+
     /// 根据名称在给定作用域中查找接口
     pub fn lookup_interface(&self, scope_id: ScopeId, name: &str) -> Option<InterfaceId> {
         match self.lookup(scope_id, name) {
@@ -1066,14 +1113,13 @@ impl SymbolTable {
                 if let Some(ti) = TypeInfo::from_keyword(name) {
                     return Some(ti);
                 }
-                // 再查找类、接口、枚举
-                if let Some(class_id) = self.lookup_class(scope_id, name) {
-                    return Some(TypeInfo::Object(class_id));
+                // 再查找类、接口、枚举（lookup_qualified 支持 `GorgeFramework.Element` 限定名）
+                match self.lookup_qualified(scope_id, name) {
+                    Some((SymbolEntry::Class(id), _)) => Some(TypeInfo::Object(*id)),
+                    Some((SymbolEntry::Interface(id), _)) => Some(TypeInfo::Interface(*id)),
+                    Some((SymbolEntry::Enum(id), _)) => Some(TypeInfo::Enum(*id)),
+                    _ => None,
                 }
-                if let Some(iface_id) = self.lookup_interface(scope_id, name) {
-                    return Some(TypeInfo::Interface(iface_id));
-                }
-                None
             }
             ast::TypeRef::Array { element_type, .. } => {
                 let inner = self.resolve_type(scope_id, element_type)?;
@@ -1093,13 +1139,13 @@ impl SymbolTable {
                 })
             }
             ast::TypeRef::Generic { name, type_args, .. } => {
-                // 解析基础类型和泛型参数
+                // 解析基础类型和泛型参数（lookup_qualified 支持限定名）
                 let base = match TypeInfo::from_keyword(name) {
                     Some(ti) => ti,
-                    None => {
-                        let class_id = self.lookup_class(scope_id, name)?;
-                        TypeInfo::Object(class_id)
-                    }
+                    None => match self.lookup_qualified(scope_id, name)? {
+                        (SymbolEntry::Class(id), _) => TypeInfo::Object(*id),
+                        _ => return None,
+                    },
                 };
                 let resolved_args: Vec<TypeInfo> = type_args
                     .iter()
@@ -1304,5 +1350,29 @@ mod tests {
 
         let enum_id = st.declare_enum("Color", st.global_scope, dummy_span());
         assert_eq!(st.enums.get(enum_id.0).name, "Color");
+    }
+
+    /// 枚举可作为类型解析：`TimeMode` 应解析为 TypeInfo::Enum
+    #[test]
+    fn test_resolve_type_enum() {
+        let mut st = SymbolTable::new();
+        let g = st.global_scope;
+        let eid = st.declare_enum("TimeMode", g, dummy_span());
+
+        let tr = crate::frontend::ast::TypeRef::simple("TimeMode", dummy_span());
+        assert_eq!(st.resolve_type(g, &tr), Some(TypeInfo::Enum(eid)));
+    }
+
+    /// 枚举 → Int 隐式转换；Int → 枚举 仅显式可转
+    #[test]
+    fn test_enum_auto_cast_to_int() {
+        let mut st = SymbolTable::new();
+        let g = st.global_scope;
+        let eid = st.declare_enum("TimeMode", g, dummy_span());
+        let enum_ty = TypeInfo::Enum(eid);
+
+        assert!(enum_ty.can_auto_cast_to(&TypeInfo::Int), "枚举应可隐式转为 int");
+        assert!(!TypeInfo::Int.can_auto_cast_to(&enum_ty), "int 不应隐式转为枚举");
+        assert!(TypeInfo::Int.can_cast_to(&enum_ty), "int 应可显式强转为枚举");
     }
 }

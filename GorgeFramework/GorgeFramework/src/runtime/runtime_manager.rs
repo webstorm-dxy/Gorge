@@ -6,8 +6,10 @@
 
 use crate::runtime::environment::global;
 use crate::runtime::environment::GorgeSimulationRuntime;
+use crate::runtime::runtime_form_container::RuntimeFormContainer;
 use crate::runtime::simulation_machine::SimulationMachine;
 use crate::chart::simulation_score::SimulationScore;
+use gorge_core::objective::bytecode::CompiledClass;
 
 /// 运行时状态（对齐 C# `RuntimeState` 枚举）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,16 +44,37 @@ pub struct RuntimeManager {
     pub machine: Option<SimulationMachine>,
     /// 仿真总谱（由 extract_simulation_resources 创建，prepare_score 填充）
     pub score: Option<SimulationScore>,
+    /// 编译类引用（供 prepare_score 中提取谱表/模态使用）
+    compiled_classes: Vec<CompiledClass>,
 }
 
 impl RuntimeManager {
     pub fn new() -> Self {
+        global::init_env_global();
+
         Self {
             state: RuntimeState::Uninitialized,
             simulation_runtime: None,
             machine: None,
             score: None,
+            compiled_classes: Vec::new(),
         }
+    }
+
+    /// 设置编译类上下文（在 extract_simulation_resources 之前调用）
+    ///
+    /// 将编译后的类信息存储到管理器中，供 prepare_score 提取谱表使用。
+    /// 应在状态迁移到 Compiled 后、调用 extract_simulation_resources 前设置。
+    pub fn set_compiled_classes(&mut self, classes: Vec<CompiledClass>) {
+        self.compiled_classes = classes;
+    }
+
+    /// 扫描模态（从编译类中提取 Form 信息）
+    ///
+    /// 遍历已编译类，提取所有带 `@Form` / `@InstantAudio` 注解的方法，
+    /// 填充到指定的 RuntimeFormContainer 中。
+    pub fn scan_forms(&self, form_container: &mut RuntimeFormContainer) {
+        form_container.scan_forms_from_compiled(&self.compiled_classes);
     }
 
     // ==================== R-2a: extract_simulation_resources（C# 104-143） ====================
@@ -79,6 +102,9 @@ impl RuntimeManager {
             let mut backend = crate::adaptor::PlatformAssetBackend::new(crate::adaptor::platform());
             score.add_file_asset(&mut backend);
             score.load_assets();
+            global::sync_assets_from(
+                &score.loaded_assets.iter().map(|(k, v)| (k.clone(), v.handle)).collect()
+            );
         }
     }
 
@@ -108,10 +134,9 @@ impl RuntimeManager {
             &score.loaded_assets.iter().map(|(k, v)| (k.clone(), v.handle)).collect()
         );
 
-        // 提取谱表（遍历运行时类表查找 @AudioStaff/@ElementStaff 注解）
+        // 提取谱表（从编译类注解中查找 @AudioStaff/@ElementStaff）
         // C#: Score.ExtractStaveFromRuntime(LanguageRuntime)
-        // TODO: 传入真实的 class_table（需在 RuntimeManager 中持有 VM/GorgeRuntime 引用）
-        score.extract_stave_from_runtime(&std::collections::HashMap::new());
+        score.extract_staves_from_compiled(&self.compiled_classes);
 
         // 加载即时音频（骨架）
         score.load_instant_audio();
@@ -131,9 +156,6 @@ impl RuntimeManager {
             }
             _ => {}
         }
-
-        // 初始化环境全局数据
-        global::init_env_global();
 
         let rt = GorgeSimulationRuntime::new();
         let mut machine = SimulationMachine::new(begin_chart, terminate_chart, begin_speed);
@@ -170,7 +192,7 @@ impl RuntimeManager {
     ///
     /// 前置条件：State 至少为 SimulationInitialized。
     /// 调用 GorgeSimulationRuntime.LoadScore。
-    pub fn load_score(&mut self) {
+    pub fn load_score(&mut self, vm: &mut gorge_core::virtual_machine::vm::VirtualMachine) {
         match self.state {
             RuntimeState::Uninitialized | RuntimeState::Compiled | RuntimeState::SimulationResourceLoaded => {
                 panic!("尝试在仿真环境准备完成前开始仿真");
@@ -178,8 +200,8 @@ impl RuntimeManager {
             _ => {}
         }
 
-        if let Some(ref mut rt) = self.simulation_runtime {
-            rt.load_score();
+        if let (Some(ref mut rt), Some(ref score)) = (&mut self.simulation_runtime, &self.score) {
+            rt.load_score(score, vm);
         }
         self.state = RuntimeState::ScoreLoaded;
     }
@@ -207,7 +229,7 @@ impl RuntimeManager {
     ///
     /// 前置条件：State 为 ScoreLoaded。
     /// 调用 GorgeSimulationRuntime.StartSimulation。
-    pub fn start_simulation(&mut self) {
+    pub fn start_simulation(&mut self, vm: &mut gorge_core::virtual_machine::vm::VirtualMachine) {
         match self.state {
             RuntimeState::Uninitialized | RuntimeState::Compiled
             | RuntimeState::SimulationResourceLoaded | RuntimeState::SimulationInitialized => {
@@ -229,7 +251,7 @@ impl RuntimeManager {
         }
 
         if let Some(ref mut rt) = self.simulation_runtime {
-            rt.start_simulation();
+            rt.start_simulation(vm);
         }
         self.state = RuntimeState::Simulating;
     }
@@ -281,9 +303,14 @@ mod tests {
     use crate::adaptor::HeadlessPlatform;
 
     fn setup() -> RuntimeManager {
-        crate::runtime::environment::global::init_env_global();
         crate::adaptor::install_platform(Box::new(HeadlessPlatform::new()));
         RuntimeManager::new()
+    }
+
+    #[test]
+    fn test_runtime_manager_new_initializes_environment_global() {
+        let _manager = RuntimeManager::new();
+        global::with_env_global(|_| ());
     }
 
     // ==================== R-2 生命周期测试 ====================
@@ -291,6 +318,7 @@ mod tests {
     #[test]
     fn test_r2_full_lifecycle_chain() {
         let mut mgr = setup();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         assert_eq!(mgr.state, RuntimeState::Uninitialized);
 
         // 跳过编译阶段（Compiled），直接进入资源提取
@@ -307,10 +335,10 @@ mod tests {
         assert!(mgr.machine.is_some());
 
         // load → start → stop → unload → destruct
-        mgr.load_score();
+        mgr.load_score(&mut vm);
         assert_eq!(mgr.state, RuntimeState::ScoreLoaded);
 
-        mgr.start_simulation();
+        mgr.start_simulation(&mut vm);
         assert_eq!(mgr.state, RuntimeState::Simulating);
 
         mgr.stop_simulation();
@@ -335,12 +363,13 @@ mod tests {
     #[test]
     fn test_r2_start_before_load_panics() {
         let mut mgr = setup();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         mgr.state = RuntimeState::Compiled;
         mgr.extract_simulation_resources(0.0, 100.0, 1.0);
         mgr.create_simulation_runtime(0.0, 100.0, 1.0);
         // 跳过 load_score，直接 start 应 panic
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            mgr.start_simulation();
+            mgr.start_simulation(&mut vm);
         }));
         assert!(result.is_err());
     }
@@ -348,23 +377,25 @@ mod tests {
     #[test]
     fn test_r2_load_score_twice_does_not_panic() {
         let mut mgr = setup();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         mgr.state = RuntimeState::Compiled;
         mgr.extract_simulation_resources(0.0, 100.0, 1.0);
         mgr.create_simulation_runtime(0.0, 100.0, 1.0);
-        mgr.load_score();
+        mgr.load_score(&mut vm);
         // 第二次 load 应正常（内部 unload→reload）
-        mgr.load_score();
+        mgr.load_score(&mut vm);
         assert_eq!(mgr.state, RuntimeState::ScoreLoaded);
     }
 
     #[test]
     fn test_r2_destruct_while_simulating_auto_stops() {
         let mut mgr = setup();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         mgr.state = RuntimeState::Compiled;
         mgr.extract_simulation_resources(0.0, 100.0, 1.0);
         mgr.create_simulation_runtime(0.0, 100.0, 1.0);
-        mgr.load_score();
-        mgr.start_simulation();
+        mgr.load_score(&mut vm);
+        mgr.start_simulation(&mut vm);
         assert_eq!(mgr.state, RuntimeState::Simulating);
 
         // destruct 时应自动 stop → unload → null
@@ -376,15 +407,107 @@ mod tests {
     #[test]
     fn test_r2_unload_while_simulating_auto_stops() {
         let mut mgr = setup();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         mgr.state = RuntimeState::Compiled;
         mgr.extract_simulation_resources(0.0, 100.0, 1.0);
         mgr.create_simulation_runtime(0.0, 100.0, 1.0);
-        mgr.load_score();
-        mgr.start_simulation();
+        mgr.load_score(&mut vm);
+        mgr.start_simulation(&mut vm);
         assert_eq!(mgr.state, RuntimeState::Simulating);
 
         // unload 时应自动 stop
         mgr.unload_score();
         assert_eq!(mgr.state, RuntimeState::SimulationInitialized);
+    }
+
+    // ==================== R-3: set_compiled_classes / scan_forms 测试 ====================
+
+    /// 构造一个带 @ElementStaff 注解的测试编译类
+    fn make_test_compiled_class() -> CompiledClass {
+        use gorge_core::objective::bytecode::CompiledAnnotation;
+        use gorge_core::objective::declaration::{MethodAnnotation, AnnotationValue};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::CompiledMethod;
+        use std::collections::HashMap;
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation {
+                name: "Chart".into(),
+                parameters: vec![
+                    ("timeOffset".into(), AnnotationValue::Float(1.5)),
+                    ("minLength".into(), AnnotationValue::Float(20.0)),
+                    ("active".into(), AnnotationValue::Bool(true)),
+                ],
+            },
+        ]);
+
+        CompiledClass {
+            class_type: GorgeType::class("Test.ChartStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod { name: "Period1".into(), codes: vec![], local_count: 0 },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                CompiledAnnotation {
+                    name: "ElementStaff".into(),
+                    generic_type: None,
+                    arguments: vec![("form".into(), "TestForm".into())],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_r3_set_compiled_classes_and_extract() {
+        let mut mgr = setup();
+        mgr.state = RuntimeState::Compiled;
+
+        // 设置编译类
+        mgr.set_compiled_classes(vec![make_test_compiled_class()]);
+
+        // extract_simulation_resources 内部调用 extract_staves_from_compiled
+        mgr.extract_simulation_resources(0.0, 100.0, 1.0);
+        assert_eq!(mgr.state, RuntimeState::SimulationResourceLoaded);
+
+        // 验证谱表被正确提取
+        let score = mgr.score.as_ref().unwrap();
+        assert_eq!(score.stave.len(), 1, "应提取 1 个谱表");
+
+        use crate::chart::staff::ElementStaff;
+        let staff = score.stave[0].as_any().downcast_ref::<ElementStaff>().unwrap();
+        assert_eq!(staff.class_name, "Test.ChartStaff");
+        assert_eq!(staff.form_name, "TestForm");
+        assert_eq!(staff.periods.len(), 1);
+        assert_eq!(staff.periods[0].period_data.method_name, "Period1");
+    }
+
+    #[test]
+    fn test_r3_scan_forms_with_compiled_classes() {
+        let mgr = setup();
+
+        use crate::runtime::runtime_form_container::RuntimeFormContainer;
+        let mut form_container = RuntimeFormContainer::new_empty();
+
+        // 空编译类列表时扫描不 panic
+        mgr.scan_forms(&mut form_container);
+        assert!(form_container.forms.is_empty());
     }
 }

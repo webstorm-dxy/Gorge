@@ -18,27 +18,85 @@
 
 use gorge_macros::{gorge_native_class, gorge_native_impl};
 use gorge_core::objective::native::NativeContext;
+use gorge_core::objective::object::RuntimeObject;
 use crate::stage::Scoring;
+use crate::system::native::asset::Asset;
+use crate::system::native::graph::Graph;
+use crate::system::native::image_asset::ImageAsset;
 
 /// 环境查询类（C# `Environment`）
 ///
 /// 纯静态方法类，无实例字段。所有方法通过全局 `EnvironmentGlobal` 单例
 /// 访问运行时环境数据（assets / alive_elements / scoring 等）。
 #[gorge_native_class(namespace = "GorgeFramework")]
-pub struct EnvironmentNative {}
+pub struct Environment {}
 
 #[gorge_native_impl]
-impl EnvironmentNative {
+impl Environment {
     /// 静态方法 0 号：按名称查找资产
     ///
     /// 对齐 C# `Environment.GetAssetByName(string)`。
-    /// 从全局 EnvironmentGlobal 的资产表中按名称查找并返回对象 ID，
+    /// 从全局 EnvironmentGlobal 的资产表中按名称查找并返回对象 ID。
+    /// 图片资产会延迟包装为 `ImageAsset -> Graph`，平台纹理句柄不会泄漏为 VM 对象 ID。
     /// 未找到返回 0（null 对象 ID）。
     #[gorge_static]
-    pub fn get_asset_by_name(_ctx: &mut NativeContext, asset_name: String) -> usize {
-        crate::runtime::environment::global::with_env_global(|env| {
-            env.assets.get(&asset_name).copied().unwrap_or(0)
-        })
+    pub fn get_asset_by_name(ctx: &mut NativeContext, asset_name: String) -> usize {
+        let texture_handle = crate::runtime::environment::global::with_env_global(|env| {
+            env.assets.get(&asset_name).copied()
+        });
+        let Some(texture_handle) = texture_handle else {
+            return 0;
+        };
+
+        let vm_address = ctx.vm as *mut _ as usize;
+        if let Some(asset_object_id) =
+            crate::runtime::environment::global::get_asset_object(vm_address, &asset_name)
+        {
+            if ctx.vm.objects.contains_key(&asset_object_id) {
+                return asset_object_id;
+            }
+        }
+
+        let asset_object_id = if asset_name.starts_with("image:") {
+            let graph_object_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.Graph".to_string(),
+                &Graph::gorge_field_type_count(),
+            ));
+            let image_asset_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.ImageAsset".to_string(),
+                &ImageAsset::gorge_field_type_count(),
+            ));
+            ctx.set_object_string_field(
+                image_asset_id,
+                ImageAsset::FIELD_INDEX_name,
+                asset_name.clone(),
+            );
+            ctx.set_object_object_field(
+                image_asset_id,
+                ImageAsset::FIELD_INDEX_texture,
+                graph_object_id,
+            );
+            crate::runtime::environment::global::register_graph_handle(
+                vm_address,
+                graph_object_id,
+                texture_handle,
+            );
+            image_asset_id
+        } else {
+            let asset_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.Asset".to_string(),
+                &Asset::gorge_field_type_count(),
+            ));
+            ctx.set_object_string_field(asset_id, Asset::FIELD_INDEX_name, asset_name.clone());
+            asset_id
+        };
+
+        crate::runtime::environment::global::register_asset_object(
+            vm_address,
+            asset_name,
+            asset_object_id,
+        );
+        asset_object_id
     }
 
     /// 静态方法 1 号：视口尺寸
@@ -136,6 +194,9 @@ impl EnvironmentNative {
     }
 }
 
+/// Rust 侧兼容名称；native 注册名始终为 Gorge 声明中的 `Environment`。
+pub type EnvironmentNative = Environment;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,7 +212,7 @@ mod tests {
     #[test]
     fn test_environment_class_exists() {
         let env = EnvironmentNative {};
-        assert_eq!(env.full_name(), "GorgeFramework.EnvironmentNative");
+        assert_eq!(env.full_name(), "GorgeFramework.Environment");
     }
 
     // ==================== R-3 新测试 ====================
@@ -159,17 +220,41 @@ mod tests {
     #[test]
     fn test_r3_get_asset_by_name_found() {
         ensure_global();
-        // 写入资产（使用唯一键避免测试间冲突）
+        // 写入平台纹理句柄（使用唯一键避免测试间冲突）
         global::with_env_global_mut(|env| {
-            env.assets.insert("test_r3_graph".to_string(), 42);
+            env.assets.insert("image:test_r3_graph".to_string(), 42);
         });
 
         let env = EnvironmentNative {};
         let mut vm = VirtualMachine::new();
         vm.register_native_class(env.full_name(), std::sync::Arc::new(EnvironmentNative {}));
-        vm.param_pool.set_string_param(0, "test_r3_graph".to_string());
-        { let mut ctx = NativeContext::new(&mut vm); env.invoke_native_static(&mut ctx, 0); }
-        assert_eq!(vm.param_pool.get_object_return(), 42);
+        vm.param_pool.set_string_param(0, "image:test_r3_graph".to_string());
+        {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.invoke_native_static_on("GorgeFramework.Environment", 0);
+        }
+        let image_asset_id = vm.param_pool.get_object_return();
+        assert_ne!(image_asset_id, 0, "图片资产应包装为 VM 对象");
+        assert_eq!(vm.objects[&image_asset_id].class_name, "GorgeFramework.ImageAsset");
+
+        let graph_id = {
+            let ctx = NativeContext::new(&mut vm);
+            ctx.get_object_object_field(image_asset_id, ImageAsset::FIELD_INDEX_texture)
+        };
+        assert_ne!(graph_id, 0, "ImageAsset.texture 应指向 Graph VM 对象");
+        let vm_address = &mut vm as *mut VirtualMachine as usize;
+        assert_eq!(global::resolve_graph_handle(vm_address, graph_id), 42);
+
+        vm.param_pool.set_string_param(0, "image:test_r3_graph".to_string());
+        {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.invoke_native_static_on("GorgeFramework.Environment", 0);
+        }
+        assert_eq!(
+            vm.param_pool.get_object_return(),
+            image_asset_id,
+            "同一 VM 应复用资产对象"
+        );
     }
 
     #[test]

@@ -517,12 +517,23 @@ impl<'a> NativeContext<'a> {
 
     // ==================== 跨对象方法调用 ====================
 
-    /// 在目标对象上按类名调用 native 实例方法
+    /// 在目标对象上调用 native 实例方法
     ///
-    /// 参数通过 ctx 设置，方法返回值通过 ctx 的 return 位读取。
+    /// 参数通过 ctx 设置，方法返回值通过 ctx 的 return 位读取。优先按目标对象的
+    /// 实际 native 类分派，以保留 `Node.UpdateNode` 等虚调用的派生实现；当目标对象
+    /// 不是 native 对象时再按调用方提供的类名回退。
     pub fn invoke_native_method_on(&mut self, class_name: &str, obj_id: usize, method_id: usize) {
-        if let Some(cls) = self.vm.native_class_table.get(class_name).cloned() {
-            cls.invoke_native_method(self, obj_id, method_id);
+        let native_object_id = self.vm.objects.get(&obj_id)
+            .and_then(|object| object.native_object_id)
+            .unwrap_or(obj_id);
+        let object_class_name = self.vm.objects.get(&native_object_id)
+            .map(|object| object.class_name.clone())
+            .unwrap_or_default();
+        let native_class = self.vm.native_class_table.get(&object_class_name)
+            .or_else(|| self.vm.native_class_table.get(class_name))
+            .cloned();
+        if let Some(cls) = native_class {
+            cls.invoke_native_method(self, native_object_id, method_id);
         }
     }
 
@@ -672,7 +683,11 @@ mod tests {
             &self.field_counts
         }
 
-        fn invoke_native_method(&self, _ctx: &mut NativeContext, _obj_id: usize, _method_id: usize) {}
+        fn invoke_native_method(&self, ctx: &mut NativeContext, _obj_id: usize, method_id: usize) {
+            if method_id == 0 {
+                ctx.set_string_return(self.name.clone());
+            }
+        }
 
         fn invoke_native_static(&self, ctx: &mut NativeContext, method_id: usize) {
             if method_id == 0 {
@@ -737,6 +752,49 @@ mod tests {
 
         assert_eq!(obj_id, 1);
         assert!(vm.objects.contains_key(&obj_id));
+    }
+
+    #[test]
+    fn test_register_native_class_exposes_full_and_simple_names() {
+        let mut vm = make_vm();
+        let cls: Arc<dyn NativeClass> = Arc::new(DoublerClass {
+            name: "Test.Doubler".into(),
+            field_counts: TypeCount::zero(),
+        });
+
+        vm.register_native_class("Doubler", cls);
+
+        assert!(vm.native_class_table.contains_key("Doubler"));
+        assert!(vm.native_class_table.contains_key("Test.Doubler"));
+    }
+
+    #[test]
+    fn test_invoke_native_method_prefers_runtime_object_class() {
+        let mut vm = make_vm();
+        let base: Arc<dyn NativeClass> = Arc::new(DoublerClass {
+            name: "Test.Base".into(),
+            field_counts: TypeCount::zero(),
+        });
+        let derived: Arc<dyn NativeClass> = Arc::new(DoublerClass {
+            name: "Test.Derived".into(),
+            field_counts: TypeCount::zero(),
+        });
+        vm.register_native_class("Base", base);
+        vm.register_native_class("Derived", derived);
+        let object_id = {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.register_object(RuntimeObject::new_simple(
+                "Test.Derived".into(),
+                &TypeCount::zero(),
+            ))
+        };
+
+        {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.invoke_native_method_on("Test.Base", object_id, 0);
+        }
+
+        assert_eq!(vm.param_pool.get_string_return(), "Test.Derived");
     }
 
     #[test]

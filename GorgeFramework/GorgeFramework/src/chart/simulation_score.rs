@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::chart::package::{AssetFile, Package};
-use crate::chart::period::{ElementPeriod, IPeriod};
+use crate::chart::period::{AudioPeriod, ElementPeriod, IPeriod};
 use crate::chart::staff::{AudioStaff, ElementStaff, IStaff};
 
 // ==================== 资产后端抽象 ====================
@@ -47,7 +47,8 @@ impl AssetBackend for MockAssetBackend {
 
 /// 已加载的资产（简化表示）。
 ///
-/// 对应 C# `Asset` 基类，实际类型信息在 `asset_type` 中。
+/// 对应 C# `Asset` 基类。`handle` 是平台资源句柄，不是 VM 对象 ID；
+/// `Environment.GetAssetByName` 会在首次查询时将其包装为对应的 VM 资产对象。
 #[derive(Debug, Clone)]
 pub struct Asset {
     /// 资源名（如 "image:path"、"audio:path"）
@@ -174,7 +175,7 @@ impl SimulationScore {
             match extension {
                 "png" | "jpg" => {
                     if let Ok(handle) = backend.create_graph(path, &asset_file.data) {
-                        let name = format!("image:{}", path.trim_end_matches(&format!(".{}", extension)));
+                        let name = format!("image:{}", normalized_asset_stem(path, extension));
                         asset_set.assets.push(serde_json::json!({
                             "name": name,
                             "texture": handle,
@@ -184,7 +185,7 @@ impl SimulationScore {
                 }
                 "wav" | "mp3" | "ogg" => {
                     if let Ok(handle) = backend.create_audio(path, &asset_file.data) {
-                        let name = format!("audio:{}", path.trim_end_matches(&format!(".{}", extension)));
+                        let name = format!("audio:{}", normalized_asset_stem(path, extension));
                         asset_set.assets.push(serde_json::json!({
                             "name": name,
                             "audio": handle,
@@ -194,7 +195,7 @@ impl SimulationScore {
                 }
                 "mp4" => {
                     if let Ok(handle) = backend.create_video(path, &asset_file.data) {
-                        let name = format!("video:{}", path.trim_end_matches(&format!(".{}", extension)));
+                        let name = format!("video:{}", normalized_asset_stem(path, extension));
                         asset_set.assets.push(serde_json::json!({
                             "name": name,
                             "video": handle,
@@ -298,6 +299,161 @@ impl SimulationScore {
                         self.stave.push(Box::new(staff));
                     }
                     _ => {}
+                }
+            }
+        }
+    }
+
+    /// 从编译类列表中提取谱表（对应 C# `ExtractStaveFromRuntime`，Rust 简化版）。
+    ///
+    /// 扫描带 `@ElementStaff` / `@AudioStaff` 注解的类，
+    /// 进一步扫描类中带 `@Chart` / `@Song` 注解的静态方法，
+    /// 提取乐段（period）配置并生成 ElementStaff / AudioStaff 对象。
+    ///
+    /// # 参数
+    /// - `compiled_classes`: 编译后的类列表，须已包含注解信息（Phase Q3 + S3）
+    ///
+    /// # 提取逻辑
+    /// 1. 遍历所有编译类，检查类级注解
+    /// 2. 对于匹配的类，查找静态方法注解（`@Chart` / `@Song`）
+    /// 3. 从方法注解的 `config` 参数提取 `PeriodConfig`
+    /// 4. 从 `injector_constants` 提取元素/音频注入器数据
+    pub fn extract_staves_from_compiled(
+        &mut self,
+        compiled_classes: &[gorge_core::objective::bytecode::CompiledClass],
+    ) {
+        self.stave.clear();
+
+        for cc in compiled_classes {
+            let class_name = cc.class_type.full_name();
+
+            // 扫描类级注解
+            for ann in &cc.annotations {
+                match ann.name.as_str() {
+                    "AudioStaff" => {
+                        let display_name = ann.find_argument("displayName")
+                            .cloned()
+                            .unwrap_or_else(|| class_name.to_string());
+
+                        let mut staff = AudioStaff::new(
+                            class_name.to_string(),
+                            true, // is_chart_class
+                            display_name,
+                        );
+
+                        // 扫描带 @Song 注解的静态方法，提取音频乐段
+                        self.extract_audio_periods_from_class(cc, &mut staff);
+
+                        self.stave.push(Box::new(staff));
+                        break; // 一个类只对应一个谱表类型
+                    }
+                    "ElementStaff" => {
+                        let form_name = ann.find_argument("form")
+                            .or_else(|| ann.first_positional_argument())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let display_name = ann.find_argument("displayName")
+                            .cloned()
+                            .unwrap_or_else(|| class_name.to_string());
+
+                        let mut staff = ElementStaff::new(
+                            class_name.to_string(),
+                            true, // is_chart_class
+                            display_name,
+                            form_name.clone(),
+                        );
+
+                        // 扫描带 @Chart 注解的静态方法，提取元素乐段
+                        self.extract_element_periods_from_class(cc, &mut staff, &form_name);
+
+                        self.stave.push(Box::new(staff));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// 从编译类中提取 `@Song` 方法的音频乐段
+    fn extract_audio_periods_from_class(
+        &mut self,
+        cc: &gorge_core::objective::bytecode::CompiledClass,
+        staff: &mut AudioStaff,
+    ) {
+        for (method_id, annotations) in &cc.method_annotations {
+            for ann in annotations {
+                if ann.name != "Song" {
+                    continue;
+                }
+                // 从方法注解的 config 参数提取 PeriodConfig 注入器
+                let config_injector = extract_period_config_injector(ann);
+                // 尝试从 injector_constants 查找对应方法的音频常量
+                let audio_injector = cc.injector_constants.iter()
+                    .find(|c| c.class_name == "AudioAsset" || c.class_name.contains("Audio"))
+                    .map(|c| injector_const_to_json(c));
+
+                let period = AudioPeriod::new(
+                    method_name_by_id(cc, *method_id).to_string(),
+                    config_injector,
+                    audio_injector,
+                );
+                staff.periods.push(period);
+            }
+        }
+    }
+
+    /// 从编译类中提取 `@Chart` 方法的元素乐段
+    fn extract_element_periods_from_class(
+        &mut self,
+        cc: &gorge_core::objective::bytecode::CompiledClass,
+        staff: &mut ElementStaff,
+        form_name: &str,
+    ) {
+        for (method_id, annotations) in &cc.method_annotations {
+            for ann in annotations {
+                if ann.name != "Chart" {
+                    continue;
+                }
+                let config_injector = extract_period_config_injector(ann);
+                let mut period = ElementPeriod::new(
+                    form_name.to_string(),
+                    method_name_by_id(cc, *method_id).to_string(),
+                    config_injector,
+                );
+                // 从 injector_constants 提取元素数据
+                // TODO: 完整实现需要注入器实例化系统，当前从常量定义推导
+                self.fill_element_period_from_constants(cc, &mut period);
+
+                staff.periods.push(period);
+            }
+        }
+    }
+
+    /// 从注入器常量中填充元素乐段的元素列表（骨架实现）
+    fn fill_element_period_from_constants(
+        &mut self,
+        cc: &gorge_core::objective::bytecode::CompiledClass,
+        period: &mut ElementPeriod,
+    ) {
+        // 遍历注入器常量，将数组或注入器对象转换为 JSON 元素
+        for constant in &cc.injector_constants {
+            for field in &constant.fields {
+                match field {
+                    gorge_core::objective::bytecode::InjectorConstField::Array(elements) => {
+                        for elem in elements {
+                            if let Some(json) = injector_const_field_to_json(elem) {
+                                period.elements.push(json);
+                            }
+                        }
+                    }
+                    // 单个注入器对象也作为一个元素
+                    _ => {
+                        if let Some(json) = injector_const_field_to_json(field) {
+                            period.elements.push(json);
+                        }
+                    }
                 }
             }
         }
@@ -413,9 +569,187 @@ impl SimulationScore {
     }
 }
 
+/// 生成供 Gorge 代码查询的资源路径。
+///
+/// 部分 zip 包会以包名再包一层目录，例如
+/// `Dremu/Dremu/FormAsset/Tap.png`。源码使用的是逻辑路径
+/// `Dremu/FormAsset/Tap`，因此仅折叠相邻且相同的首级目录；其它层级保持不变。
+fn normalized_asset_stem(path: &str, extension: &str) -> String {
+    let suffix = format!(".{}", extension);
+    let stem = path.strip_suffix(&suffix).unwrap_or(path);
+    let mut segments: Vec<&str> = stem
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() >= 2 && segments[0] == segments[1] {
+        segments.remove(0);
+    }
+    segments.join("/")
+}
+
 impl Default for SimulationScore {
     fn default() -> Self {
         Self::new(0.0, 1.0, 1.0)
+    }
+}
+
+// ==================== 谱表提取辅助函数 ====================
+
+/// 从方法注解中提取 PeriodConfig 注入器的 JSON 表示
+///
+/// 查找 `config` 参数，若不存在则返回默认配置。
+fn extract_period_config_injector(ann: &gorge_core::objective::declaration::MethodAnnotation) -> serde_json::Value {
+    let mut config = serde_json::json!({
+        "timeOffset": 0.0,
+        "minLength": 10.0,
+        "active": true
+    });
+
+    for (key, value) in &ann.parameters {
+        if key == "config" {
+            // cfg 参数为注入器常量引用（InjectObject），此处简化处理
+            // TODO: 完整实现需通过注入器实例化系统解析
+            match value {
+                gorge_core::objective::declaration::AnnotationValue::Float(f) => {
+                    config["timeOffset"] = serde_json::json!(*f as f32);
+                }
+                _ => {}
+            }
+        } else if key == "timeOffset" {
+            if let gorge_core::objective::declaration::AnnotationValue::Float(v) = value {
+                config["timeOffset"] = serde_json::json!(*v as f32);
+            }
+        } else if key == "minLength" {
+            if let gorge_core::objective::declaration::AnnotationValue::Float(v) = value {
+                config["minLength"] = serde_json::json!(*v as f32);
+            }
+        } else if key == "active" {
+            if let gorge_core::objective::declaration::AnnotationValue::Bool(v) = value {
+                config["active"] = serde_json::json!(*v);
+            }
+        }
+    }
+    config
+}
+
+/// 从编译类中查找方法的名称
+fn method_name_by_id(cc: &gorge_core::objective::bytecode::CompiledClass, method_id: usize) -> String {
+    let local_id = if method_id >= cc.method_start_id {
+        method_id - cc.method_start_id
+    } else {
+        method_id
+    };
+    cc.methods.get(local_id)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| format!("Method_{}", method_id))
+}
+
+/// 将注入器常量定义转换为 JSON 值（递归处理嵌套对象）
+fn injector_const_to_json(
+    constant: &gorge_core::objective::bytecode::InjectorConstantDef,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("__type".into(), serde_json::Value::String(constant.class_name.clone()));
+    for field in &constant.fields {
+        let (name, value) = injector_const_field_entry(field);
+        obj.insert(name, value);
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// 将注入器常量字段转换为 JSON 值
+fn injector_const_field_to_json(
+    field: &gorge_core::objective::bytecode::InjectorConstField,
+) -> Option<serde_json::Value> {
+    match field {
+        gorge_core::objective::bytecode::InjectorConstField::Int(name, v) => {
+            let mut obj = serde_json::Map::new();
+            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
+            obj.insert("__type".into(), "int".into());
+            obj.insert("value".into(), (*v).into());
+            Some(serde_json::Value::Object(obj))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Float(name, v) => {
+            let mut obj = serde_json::Map::new();
+            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
+            obj.insert("__type".into(), "float".into());
+            obj.insert("value".into(), (*v).into());
+            Some(serde_json::Value::Object(obj))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Bool(name, v) => {
+            let mut obj = serde_json::Map::new();
+            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
+            obj.insert("__type".into(), "bool".into());
+            obj.insert("value".into(), (*v).into());
+            Some(serde_json::Value::Object(obj))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::String(name, v) => {
+            let mut obj = serde_json::Map::new();
+            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
+            obj.insert("__type".into(), "string".into());
+            obj.insert("value".into(), v.clone().into());
+            Some(serde_json::Value::Object(obj))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::InjectObject(class_name, fields) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("__type".into(), class_name.clone().into());
+            for f in fields {
+                let (n, v) = injector_const_field_entry(f);
+                obj.insert(n, v);
+            }
+            Some(serde_json::Value::Object(obj))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Array(elements) => {
+            let arr: Vec<serde_json::Value> = elements.iter()
+                .filter_map(injector_const_field_to_json)
+                .collect();
+            Some(serde_json::Value::Array(arr))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Object(name, id) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("__type".into(), "object".into());
+            obj.insert("__field".into(), name.clone().into());
+            obj.insert("id".into(), (*id as i64).into());
+            Some(serde_json::Value::Object(obj))
+        }
+    }
+}
+
+/// 提取注入器常量字段的 (字段名, JSON值) 对
+fn injector_const_field_entry(
+    field: &gorge_core::objective::bytecode::InjectorConstField,
+) -> (String, serde_json::Value) {
+    match field {
+        gorge_core::objective::bytecode::InjectorConstField::Int(name, v) => {
+            (name.clone(), (*v).into())
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Float(name, v) => {
+            (name.clone(), (*v).into())
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Bool(name, v) => {
+            (name.clone(), (*v).into())
+        }
+        gorge_core::objective::bytecode::InjectorConstField::String(name, v) => {
+            (name.clone(), v.clone().into())
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Object(name, id) => {
+            (name.clone(), (*id as i64).into())
+        }
+        gorge_core::objective::bytecode::InjectorConstField::InjectObject(class_name, fields) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("__type".into(), class_name.clone().into());
+            for f in fields {
+                let (n, v) = injector_const_field_entry(f);
+                obj.insert(n, v);
+            }
+            (String::new(), serde_json::Value::Object(obj))
+        }
+        gorge_core::objective::bytecode::InjectorConstField::Array(elements) => {
+            let arr: Vec<serde_json::Value> = elements.iter()
+                .map(|e| injector_const_field_to_json(e).unwrap_or(serde_json::Value::Null))
+                .collect();
+            (String::new(), serde_json::Value::Array(arr))
+        }
     }
 }
 
@@ -473,6 +807,22 @@ mod tests {
         let set = &loader.asset_sets[0];
         // png → image asset, wav → audio asset, bin → 忽略
         assert_eq!(set.assets.len(), 2);
+    }
+
+    #[test]
+    fn test_normalized_asset_stem_collapses_duplicate_package_root() {
+        assert_eq!(
+            normalized_asset_stem("Dremu/Dremu/FormAsset/Tap.png", "png"),
+            "Dremu/FormAsset/Tap"
+        );
+        assert_eq!(
+            normalized_asset_stem("Background1.png", "png"),
+            "Background1"
+        );
+        assert_eq!(
+            normalized_asset_stem("Theme/Background1.png", "png"),
+            "Theme/Background1"
+        );
     }
 
     #[test]
@@ -684,5 +1034,219 @@ mod tests {
         // 应不 panic，stave 保持空
         score.extract_stave_from_runtime(&class_table);
         assert!(score.stave.is_empty());
+    }
+
+    // ==================== C-3: extract_staves_from_compiled 测试 ====================
+
+    /// 构造一个带 `@ElementStaff` 注解的编译类
+    fn make_compiled_class_with_element_staff() -> gorge_core::objective::bytecode::CompiledClass {
+        use gorge_core::objective::bytecode::{CompiledAnnotation, CompiledClass, InjectorConstField, InjectorConstantDef};
+        use gorge_core::objective::declaration::{MethodAnnotation, AnnotationValue};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::CompiledMethod;
+        use std::collections::HashMap;
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation {
+                name: "Chart".into(),
+                parameters: vec![
+                    ("timeOffset".into(), AnnotationValue::Float(1.5)),
+                    ("minLength".into(), AnnotationValue::Float(20.0)),
+                    ("active".into(), AnnotationValue::Bool(true)),
+                ],
+            },
+        ]);
+
+        CompiledClass {
+            class_type: GorgeType::class("GorgeFramework.ChartStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod { name: "Period1".into(), codes: vec![], local_count: 0 },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                InjectorConstantDef {
+                    class_name: "TapNote".into(),
+                    fields: vec![
+                        InjectorConstField::Float("hitTime".into(), 0.5),
+                        InjectorConstField::Float("position".into(), 100.0),
+                    ],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                CompiledAnnotation {
+                    name: "ElementStaff".into(),
+                    generic_type: None,
+                    arguments: vec![("form".into(), "NoteForm".into())],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        }
+    }
+
+    /// 构造一个带 `@AudioStaff` 注解的编译类
+    fn make_compiled_class_with_audio_staff() -> gorge_core::objective::bytecode::CompiledClass {
+        use gorge_core::objective::bytecode::{CompiledAnnotation, CompiledClass};
+        use gorge_core::objective::declaration::{MethodAnnotation, AnnotationValue};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::CompiledMethod;
+        use std::collections::HashMap;
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation {
+                name: "Song".into(),
+                parameters: vec![
+                    ("timeOffset".into(), AnnotationValue::Float(0.0)),
+                ],
+            },
+        ]);
+
+        CompiledClass {
+            class_type: GorgeType::class("GorgeFramework.BgmStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod { name: "Bgm".into(), codes: vec![], local_count: 0 },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                CompiledAnnotation {
+                    name: "AudioStaff".into(),
+                    generic_type: None,
+                    arguments: vec![("displayName".into(), "背景音乐".into())],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_c3_extract_staves_from_compiled_element_staff() {
+        let classes = vec![make_compiled_class_with_element_staff()];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        assert_eq!(score.stave.len(), 1, "应提取 1 个谱表");
+
+        let staff = score.stave[0].as_any().downcast_ref::<ElementStaff>().unwrap();
+        assert_eq!(staff.class_name, "GorgeFramework.ChartStaff");
+        assert_eq!(staff.form_name, "NoteForm");
+        // 应有 1 个乐段（Period1）
+        assert_eq!(staff.periods.len(), 1);
+        assert_eq!(staff.periods[0].period_data.method_name, "Period1");
+        // 配置应从注解参数提取
+        assert!((staff.periods[0].period_data.config.time_offset - 1.5).abs() < 0.001);
+        assert!((staff.periods[0].period_data.config.min_length - 20.0).abs() < 0.001);
+        assert!(staff.periods[0].period_data.config.active);
+    }
+
+    #[test]
+    fn test_c3_extract_staves_from_compiled_audio_staff() {
+        let classes = vec![make_compiled_class_with_audio_staff()];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        assert_eq!(score.stave.len(), 1, "应提取 1 个谱表");
+
+        let staff = score.stave[0].as_any().downcast_ref::<AudioStaff>().unwrap();
+        assert_eq!(staff.class_name, "GorgeFramework.BgmStaff");
+        assert_eq!(staff.display_name, "背景音乐");
+        assert_eq!(staff.periods.len(), 1);
+        assert_eq!(staff.periods[0].period_data.method_name, "Bgm");
+    }
+
+    #[test]
+    fn test_c3_extract_staves_from_compiled_empty() {
+        let classes: Vec<gorge_core::objective::bytecode::CompiledClass> = vec![];
+        let mut score = SimulationScore::default();
+        // 应不 panic，stave 保持空
+        score.extract_staves_from_compiled(&classes);
+        assert!(score.stave.is_empty());
+    }
+
+    #[test]
+    fn test_c3_extract_staves_from_compiled_no_staff_class() {
+        // 不含谱表注解的普通类应被忽略
+        use gorge_core::objective::bytecode::{CompiledClass};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use std::collections::HashMap;
+
+        let normal = CompiledClass {
+            class_type: GorgeType::class("SomeUtil", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations: HashMap::new(),
+            constructor_annotations: HashMap::new(),
+        };
+
+        let classes = vec![normal];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+        assert!(score.stave.is_empty());
+    }
+
+    #[test]
+    fn test_c3_extract_staves_from_compiled_multiple_staves() {
+        let classes = vec![
+            make_compiled_class_with_element_staff(),
+            make_compiled_class_with_audio_staff(),
+        ];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        assert_eq!(score.stave.len(), 2, "应提取 2 个谱表");
+
+        let has_element = score.stave.iter()
+            .any(|s| s.as_any().downcast_ref::<ElementStaff>().is_some());
+        let has_audio = score.stave.iter()
+            .any(|s| s.as_any().downcast_ref::<AudioStaff>().is_some());
+        assert!(has_element, "应包含 ElementStaff");
+        assert!(has_audio, "应包含 AudioStaff");
     }
 }

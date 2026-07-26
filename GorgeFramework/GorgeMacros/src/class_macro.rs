@@ -7,7 +7,9 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
+use syn::{
+    parse_macro_input, punctuated::Punctuated, Data, DeriveInput, Fields, LitStr, Token,
+};
 
 use crate::common::ValueKind;
 
@@ -29,8 +31,8 @@ struct FieldSpec {
 
 /// 展开 `#[gorge_native_class]`
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let namespace = match parse_namespace(attr) {
-        Ok(ns) => ns,
+    let (namespace, annotations) = match parse_class_attrs(attr) {
+        Ok(v) => v,
         Err(e) => return e.to_compile_error().into(),
     };
 
@@ -69,6 +71,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // 生成注入器字段初始化方法（native 构造时应用注入器覆写，对齐 C# FieldInitialize）
     let field_initialize = build_field_initialize(&struct_ident, &fields);
 
+    // 生成类注解方法
+    let annotations_method = build_annotations_method(&annotations);
+
     let expanded = quote! {
         #[derive(Debug)]
         #clean_struct
@@ -96,14 +101,15 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#inject_index_consts)*
             #injector_defaults
             #field_initialize
+            #annotations_method
         }
     };
 
     expanded.into()
 }
 
-/// 解析属性参数 `namespace = "..."`
-fn parse_namespace(attr: TokenStream) -> syn::Result<String> {
+/// 解析属性参数 `namespace = "..."` 与可选的 `annotations = [...]`
+fn parse_class_attrs(attr: TokenStream) -> syn::Result<(String, Vec<String>)> {
     let attr2: TokenStream2 = attr.into();
     if attr2.is_empty() {
         return Err(syn::Error::new(
@@ -111,30 +117,56 @@ fn parse_namespace(attr: TokenStream) -> syn::Result<String> {
             "gorge_native_class 需要 namespace 参数，例如 #[gorge_native_class(namespace = \"GorgeFramework\")]",
         ));
     }
-    // 解析形如 `namespace = "GorgeFramework"`
+    // 解析形如 `namespace = "GorgeFramework", annotations = ["Foo", "Bar"]`
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("namespace") {
             let value: LitStr = meta.value()?.parse()?;
-            NAMESPACE_TMP.with(|c| *c.borrow_mut() = Some(value.value()));
+            ATTR_TMP.with(|c| { c.borrow_mut().namespace = Some(value.value()); });
+            Ok(())
+        } else if meta.path.is_ident("annotations") {
+            meta.value()?;
+            let content;
+            syn::bracketed!(content in meta.input);
+            let list: Punctuated<LitStr, Token![,]> = Punctuated::parse_terminated(&content)?;
+            let names: Vec<String> = list.iter().map(|s| s.value()).collect();
+            ATTR_TMP.with(|c| { c.borrow_mut().annotations = Some(names); });
             Ok(())
         } else {
-            Err(meta.error("未知参数，仅支持 namespace"))
+            Err(meta.error("未知参数，仅支持 namespace 与 annotations"))
         }
     });
     syn::parse::Parser::parse2(parser, attr2)?;
-    NAMESPACE_TMP
-        .with(|c| c.borrow_mut().take())
-        .ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "缺少 namespace 参数",
-            )
-        })
+    let tmp = ATTR_TMP.with(|c| c.borrow_mut().take());
+    let namespace = tmp.namespace.ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "缺少 namespace 参数",
+        )
+    })?;
+    let annotations = tmp.annotations.unwrap_or_default();
+    Ok((namespace, annotations))
+}
+
+/// 临时存储解析出的属性参数
+struct AttrTmp {
+    namespace: Option<String>,
+    annotations: Option<Vec<String>>,
 }
 
 thread_local! {
-    /// 临时存放解析出的 namespace（syn::meta::parser 闭包无法直接返回值）
-    static NAMESPACE_TMP: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// 临时存放解析出的属性参数（syn::meta::parser 闭包无法直接返回值）
+    static ATTR_TMP: std::cell::RefCell<AttrTmp> = const {
+        std::cell::RefCell::new(AttrTmp { namespace: None, annotations: None })
+    };
+}
+
+impl AttrTmp {
+    fn take(&mut self) -> Self {
+        AttrTmp {
+            namespace: self.namespace.take(),
+            annotations: self.annotations.take(),
+        }
+    }
 }
 
 /// 解析结构体字段
@@ -438,6 +470,38 @@ fn build_field_initialize(struct_ident: &syn::Ident, fields: &[FieldSpec]) -> To
         #[allow(dead_code)]
         pub fn gorge_field_initialize(ctx: &mut ::gorge_core::objective::native::NativeContext, this: usize) {
             #(#stmts)*
+        }
+    }
+}
+
+/// 生成 `gorge_class_annotations()` 方法
+///
+/// 返回类级别的注解列表（对齐 C# `ClassAnnotations()`）。
+/// `annotations` 参数为注解名字符串列表，每个注解不含泛型参数和构造参数。
+fn build_annotations_method(annotations: &[String]) -> TokenStream2 {
+    if annotations.is_empty() {
+        return quote! {
+            /// 类注解列表（本类无类级别注解）。
+            #[allow(dead_code)]
+            pub fn gorge_class_annotations() -> Vec<::gorge_core::objective::declaration::Annotation> {
+                Vec::new()
+            }
+        };
+    }
+    let ann_items: Vec<TokenStream2> = annotations.iter().map(|name| {
+        quote! {
+            ::gorge_core::objective::declaration::Annotation {
+                name: #name.to_owned(),
+                generic_type: ::core::option::Option::None,
+                arguments: Vec::new(),
+            }
+        }
+    }).collect();
+    quote! {
+        /// 类注解列表。
+        #[allow(dead_code)]
+        pub fn gorge_class_annotations() -> Vec<::gorge_core::objective::declaration::Annotation> {
+            vec![ #(#ann_items),* ]
         }
     }
 }

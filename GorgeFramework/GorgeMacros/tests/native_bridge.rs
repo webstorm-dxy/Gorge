@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use gorge_core::objective::native::{NativeClass, NativeContext};
+use gorge_core::objective::object::GorgeObject;
 use gorge_core::objective::object::RuntimeObject;
 use gorge_core::virtual_machine::vm::VirtualMachine;
 
@@ -331,4 +332,89 @@ fn test_vector2_field_initialize_applies_injector_override() {
     // x 被注入器覆写为 7.0；y 用默认值 0.0
     assert_eq!(vm.objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_x) as f32, 7.0);
     assert_eq!(vm.objects.get(&obj_id).unwrap().get_float_field(Vector2::FIELD_INDEX_y) as f32, 0.0);
+}
+
+// ==================== 注入器构造方法测试（Fix 2）====================
+
+/// 含注入器构造方法与普通构造方法的类
+#[gorge_native_class(namespace = "GorgeFramework")]
+pub struct InjectorCtorTest {
+    #[gorge_field]
+    pub value: i32,
+}
+
+#[gorge_native_impl]
+impl InjectorCtorTest {
+    /// 注入器构造方法 0：从注入器参数初始化
+    #[gorge_injector_ctor]
+    pub fn from_injector(ctx: &mut NativeContext, this: usize, v: i32) {
+        ctx.set_object_int_field(this, InjectorCtorTest::FIELD_INDEX_value, v as i64);
+    }
+
+    /// 普通构造方法 0：标准构造
+    #[gorge_ctor]
+    pub fn new(ctx: &mut NativeContext, this: usize, v: i32) {
+        ctx.set_object_int_field(this, InjectorCtorTest::FIELD_INDEX_value, v as i64);
+    }
+}
+
+#[test]
+fn test_injector_ctor_count() {
+    assert_eq!(InjectorCtorTest::gorge_injector_constructor_count(), 1);
+}
+
+#[test]
+fn test_injector_ctor_dispatch() {
+    let obj = InjectorCtorTest { value: 0 };
+    let mut fx = Fixture::new();
+
+    // 先构造对象框架
+    fx.vm.param_pool.set_int_param(0, 0);
+    let obj_id = {
+        let mut ctx = fx.ctx();
+        obj.do_construct_native(&mut ctx, None, 0) // 调普通构造方法 0
+    };
+    assert!(obj_id > 0);
+
+    // 再通过注入器构造方法覆写字段（模拟 VM 在注入器场景下的调用）
+    fx.vm.param_pool.set_int_param(0, 99);
+    {
+        let mut ctx = fx.ctx();
+        InjectorCtorTest::gorge_invoke_injector_constructor(&mut ctx, obj_id, 0);
+    }
+    assert_eq!(fx.vm.objects.get(&obj_id).unwrap().get_int_field(0), 99);
+}
+
+// ==================== 类注解测试（Fix 3）====================
+
+/// 无注解类：验证默认返回空列表
+#[gorge_native_class(namespace = "GorgeFramework")]
+pub struct NoAnnotationTest {
+    #[gorge_field]
+    pub _placeholder: bool,
+}
+
+/// 含注解类：验证 `annotations = [...]` 语法
+#[gorge_native_class(namespace = "GorgeFramework", annotations = ["Serialize", "Export"])]
+pub struct WithAnnotationTest {
+    #[gorge_field]
+    pub _placeholder: bool,
+}
+
+#[test]
+fn test_no_class_annotations_returns_empty() {
+    let anns = NoAnnotationTest::gorge_class_annotations();
+    assert!(anns.is_empty());
+}
+
+#[test]
+fn test_class_annotations() {
+    let anns = WithAnnotationTest::gorge_class_annotations();
+    assert_eq!(anns.len(), 2);
+    assert_eq!(anns[0].name, "Serialize");
+    assert!(anns[0].generic_type.is_none());
+    assert!(anns[0].arguments.is_empty());
+    assert_eq!(anns[1].name, "Export");
+    assert!(anns[1].generic_type.is_none());
+    assert!(anns[1].arguments.is_empty());
 }

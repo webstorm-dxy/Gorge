@@ -86,7 +86,7 @@ impl InputSignalFilter {
     /// 检测触摸信号（对齐 C# InputSignalFilter.Detect）
     ///
     /// 根据 conditionType 分派：Begin/Keep/End。
-    /// 注意：当前因宏限制不作为 #[gorge_method] 注册，需通过 invoke_native_method_on 手动匹配参数调用。
+    #[gorge_method]
     pub fn detect_touch(
         ctx: &mut NativeContext,
         this: usize,
