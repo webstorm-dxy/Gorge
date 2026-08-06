@@ -17,6 +17,8 @@ use crate::common::ValueKind;
 struct FieldSpec {
     /// 字段名
     name: syn::Ident,
+    /// 注入器字段的 Gorge 声明名（`#[inject(name = "...")]`；缺省与 Rust 字段名一致）
+    gorge_name: String,
     /// 字段的 Rust 类型
     rust_ty: syn::Type,
     /// 值类型
@@ -74,6 +76,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // 生成类注解方法
     let annotations_method = build_annotations_method(&annotations);
 
+    // 生成注入器字段元数据方法
+    let injector_fields_meta = build_injector_fields_meta(&fields);
+
     let expanded = quote! {
         #[derive(Debug)]
         #clean_struct
@@ -102,6 +107,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             #injector_defaults
             #field_initialize
             #annotations_method
+            #injector_fields_meta
         }
     };
 
@@ -195,6 +201,7 @@ fn parse_fields(input: &DeriveInput) -> syn::Result<Vec<FieldSpec>> {
         let name = field.ident.clone().unwrap();
         let mut is_field = false;
         let mut is_inject = false;
+        let mut gorge_name: Option<String> = None;
         let mut default_value = None;
 
         for attr in &field.attrs {
@@ -202,15 +209,19 @@ fn parse_fields(input: &DeriveInput) -> syn::Result<Vec<FieldSpec>> {
                 is_field = true;
             } else if attr.path().is_ident("inject") {
                 is_inject = true;
-                // 解析可选 default = <expr>
+                // 解析可选 `default = <expr>` 与 `name = "..."` 参数
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
                     attr.parse_nested_meta(|meta| {
                         if meta.path.is_ident("default") {
                             let expr: syn::Expr = meta.value()?.parse()?;
                             default_value = Some(quote! { #expr });
                             Ok(())
+                        } else if meta.path.is_ident("name") {
+                            let lit: LitStr = meta.value()?.parse()?;
+                            gorge_name = Some(lit.value());
+                            Ok(())
                         } else {
-                            Err(meta.error("inject 仅支持 default 参数"))
+                            Err(meta.error("inject 仅支持 default 与 name 参数"))
                         }
                     })?;
                 }
@@ -229,6 +240,7 @@ fn parse_fields(input: &DeriveInput) -> syn::Result<Vec<FieldSpec>> {
         })?;
 
         specs.push(FieldSpec {
+            gorge_name: gorge_name.unwrap_or_else(|| name.to_string()),
             name,
             rust_ty: field.ty.clone(),
             kind,
@@ -290,6 +302,35 @@ fn build_type_count(c: &KindCounts) -> TokenStream2 {
             bool_count: #b,
             string_count: #s,
             object_count: #o,
+        }
+    }
+}
+
+/// 生成注入器字段元数据方法 `gorge_injector_fields_meta()`。
+///
+/// 返回静态表：`(Gorge 字段名, 值类型)`，按声明顺序排列，仅含 `#[inject]` 字段。
+/// 字段名取 `#[inject(name = "...")]` 声明的 Gorge 名（缺省为 Rust 字段名），
+/// 供宿主侧（如谱面数据提取）将注入器常量字段与声明按位置对齐。
+fn build_injector_fields_meta(fields: &[FieldSpec]) -> TokenStream2 {
+    let entries: Vec<TokenStream2> = fields
+        .iter()
+        .filter(|f| f.is_inject)
+        .map(|f| {
+            let name = &f.gorge_name;
+            let vt = match f.kind {
+                ValueKind::Int => quote! { ::gorge_core::virtual_machine::ir::ValueType::Int },
+                ValueKind::Float => quote! { ::gorge_core::virtual_machine::ir::ValueType::Float },
+                ValueKind::Bool => quote! { ::gorge_core::virtual_machine::ir::ValueType::Bool },
+                ValueKind::String => quote! { ::gorge_core::virtual_machine::ir::ValueType::String },
+                ValueKind::Object => quote! { ::gorge_core::virtual_machine::ir::ValueType::Object },
+            };
+            quote! { (#name, #vt) }
+        })
+        .collect();
+    quote! {
+        /// 注入器字段元数据（字段名 + 值类型，按声明顺序）
+        pub fn gorge_injector_fields_meta() -> &'static [(&'static str, ::gorge_core::virtual_machine::ir::ValueType)] {
+            &[#(#entries),*]
         }
     }
 }

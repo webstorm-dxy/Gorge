@@ -21,8 +21,12 @@ use gorge_core::objective::native::NativeContext;
 use gorge_core::objective::object::RuntimeObject;
 use crate::stage::Scoring;
 use crate::system::native::asset::Asset;
+use crate::system::native::audio::AudioNative;
 use crate::system::native::graph::Graph;
 use crate::system::native::image_asset::ImageAsset;
+use crate::system::native::native_audio_asset::NativeAudioAsset;
+use crate::system::native::native_video_asset::NativeVideoAsset;
+use crate::system::native::video::VideoNative;
 
 /// 环境查询类（C# `Environment`）
 ///
@@ -37,14 +41,16 @@ impl Environment {
     ///
     /// 对齐 C# `Environment.GetAssetByName(string)`。
     /// 从全局 EnvironmentGlobal 的资产表中按名称查找并返回对象 ID。
-    /// 图片资产会延迟包装为 `ImageAsset -> Graph`，平台纹理句柄不会泄漏为 VM 对象 ID。
+    /// 图片资产延迟包装为 `ImageAsset -> Graph`，音频资产包装为
+    /// `NativeAudioAsset -> Audio`，视频资产包装为 `NativeVideoAsset -> Video`，
+    /// 平台句柄经全局句柄表桥接，不会泄漏为 VM 对象 ID。
     /// 未找到返回 0（null 对象 ID）。
     #[gorge_static]
     pub fn get_asset_by_name(ctx: &mut NativeContext, asset_name: String) -> usize {
-        let texture_handle = crate::runtime::environment::global::with_env_global(|env| {
+        let asset_handle = crate::runtime::environment::global::with_env_global(|env| {
             env.assets.get(&asset_name).copied()
         });
-        let Some(texture_handle) = texture_handle else {
+        let Some(asset_handle) = asset_handle else {
             return 0;
         };
 
@@ -79,9 +85,61 @@ impl Environment {
             crate::runtime::environment::global::register_graph_handle(
                 vm_address,
                 graph_object_id,
-                texture_handle,
+                asset_handle,
             );
             image_asset_id
+        } else if asset_name.starts_with("audio:") {
+            // 音频资产：包装为 NativeAudioAsset -> Audio，平台音频句柄入全局句柄表
+            let audio_object_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.Audio".to_string(),
+                &AudioNative::gorge_field_type_count(),
+            ));
+            let audio_asset_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.NativeAudioAsset".to_string(),
+                &NativeAudioAsset::gorge_field_type_count(),
+            ));
+            ctx.set_object_string_field(
+                audio_asset_id,
+                NativeAudioAsset::FIELD_INDEX_name,
+                asset_name.clone(),
+            );
+            ctx.set_object_object_field(
+                audio_asset_id,
+                NativeAudioAsset::FIELD_INDEX_audio,
+                audio_object_id,
+            );
+            crate::runtime::environment::global::register_audio_handle(
+                vm_address,
+                audio_object_id,
+                asset_handle,
+            );
+            audio_asset_id
+        } else if asset_name.starts_with("video:") {
+            // 视频资产：包装为 NativeVideoAsset -> Video，平台视频句柄入全局句柄表
+            let video_object_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.Video".to_string(),
+                &VideoNative::gorge_field_type_count(),
+            ));
+            let video_asset_id = ctx.register_object(RuntimeObject::new_simple(
+                "GorgeFramework.NativeVideoAsset".to_string(),
+                &NativeVideoAsset::gorge_field_type_count(),
+            ));
+            ctx.set_object_string_field(
+                video_asset_id,
+                NativeVideoAsset::FIELD_INDEX_name,
+                asset_name.clone(),
+            );
+            ctx.set_object_object_field(
+                video_asset_id,
+                NativeVideoAsset::FIELD_INDEX_video,
+                video_object_id,
+            );
+            crate::runtime::environment::global::register_video_handle(
+                vm_address,
+                video_object_id,
+                asset_handle,
+            );
+            video_asset_id
         } else {
             let asset_id = ctx.register_object(RuntimeObject::new_simple(
                 "GorgeFramework.Asset".to_string(),
@@ -255,6 +313,72 @@ mod tests {
             image_asset_id,
             "同一 VM 应复用资产对象"
         );
+    }
+
+    #[test]
+    fn test_p1_2_get_asset_by_name_audio() {
+        ensure_global();
+        global::with_env_global_mut(|env| {
+            env.assets.insert("audio:test_p1_2_env".to_string(), 88);
+        });
+
+        let env = EnvironmentNative {};
+        let mut vm = VirtualMachine::new();
+        vm.register_native_class(env.full_name(), std::sync::Arc::new(EnvironmentNative {}));
+        vm.param_pool.set_string_param(0, "audio:test_p1_2_env".to_string());
+        {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.invoke_native_static_on("GorgeFramework.Environment", 0);
+        }
+        let asset_id = vm.param_pool.get_object_return();
+        assert_ne!(asset_id, 0, "音频资产应包装为 VM 对象");
+        assert_eq!(vm.objects[&asset_id].class_name, "GorgeFramework.NativeAudioAsset");
+
+        let audio_id = {
+            let ctx = NativeContext::new(&mut vm);
+            ctx.get_object_object_field(asset_id, NativeAudioAsset::FIELD_INDEX_audio)
+        };
+        assert_ne!(audio_id, 0, "NativeAudioAsset.audio 应指向 Audio VM 对象");
+        assert_eq!(vm.objects[&audio_id].class_name, "GorgeFramework.Audio");
+        let vm_address = &mut vm as *mut VirtualMachine as usize;
+        assert_eq!(global::resolve_audio_handle(vm_address, audio_id), 88);
+
+        // 同名再查应复用已包装的资产对象
+        vm.param_pool.set_string_param(0, "audio:test_p1_2_env".to_string());
+        {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.invoke_native_static_on("GorgeFramework.Environment", 0);
+        }
+        assert_eq!(vm.param_pool.get_object_return(), asset_id, "同一 VM 应复用资产对象");
+    }
+
+    #[test]
+    fn test_p1_2_get_asset_by_name_video() {
+        ensure_global();
+        global::with_env_global_mut(|env| {
+            env.assets.insert("video:test_p1_2_env".to_string(), 99);
+        });
+
+        let env = EnvironmentNative {};
+        let mut vm = VirtualMachine::new();
+        vm.register_native_class(env.full_name(), std::sync::Arc::new(EnvironmentNative {}));
+        vm.param_pool.set_string_param(0, "video:test_p1_2_env".to_string());
+        {
+            let mut ctx = NativeContext::new(&mut vm);
+            ctx.invoke_native_static_on("GorgeFramework.Environment", 0);
+        }
+        let asset_id = vm.param_pool.get_object_return();
+        assert_ne!(asset_id, 0, "视频资产应包装为 VM 对象");
+        assert_eq!(vm.objects[&asset_id].class_name, "GorgeFramework.NativeVideoAsset");
+
+        let video_id = {
+            let ctx = NativeContext::new(&mut vm);
+            ctx.get_object_object_field(asset_id, NativeVideoAsset::FIELD_INDEX_video)
+        };
+        assert_ne!(video_id, 0, "NativeVideoAsset.video 应指向 Video VM 对象");
+        assert_eq!(vm.objects[&video_id].class_name, "GorgeFramework.Video");
+        let vm_address = &mut vm as *mut VirtualMachine as usize;
+        assert_eq!(global::resolve_video_handle(vm_address, video_id), 99);
     }
 
     #[test]

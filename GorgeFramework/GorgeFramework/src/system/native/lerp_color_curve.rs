@@ -16,13 +16,20 @@ use gorge_macros::{gorge_native_class, gorge_native_impl};
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct LerpColorCurve {
     #[gorge_field]
+    #[inject(name = "colorPoints")]
     pub color_points: usize,
     #[gorge_field]
+    #[inject(name = "progressCurve")]
     pub progress_curve: usize,
 }
 
 #[gorge_native_impl]
 impl LerpColorCurve {
+    /// 构造方法 0：无参构造（字段由注入器提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：以显式参数构造
     #[gorge_ctor]
     pub fn new_ctor(ctx: &mut NativeContext, this: usize, color_points: usize, progress_curve: usize) {
         ctx.set_object_object_field(this, LerpColorCurve::FIELD_INDEX_color_points, color_points);

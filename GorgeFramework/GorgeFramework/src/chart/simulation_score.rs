@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use gorge_core::objective::bytecode::{CompiledClass, InjectorConstField};
+use gorge_core::virtual_machine::ir::{IntermediateOperator, ValueType};
 use crate::chart::package::{AssetFile, Package};
 use crate::chart::period::{AudioPeriod, ElementPeriod, IPeriod};
 use crate::chart::staff::{AudioStaff, ElementStaff, IStaff};
@@ -247,14 +249,50 @@ impl SimulationScore {
         self.loaded_assets.get(asset_name)
     }
 
-    /// 加载响应音效（对应 C# `LoadInstantAudio`）。
+    /// 加载响应音效（对应 C# `LoadInstantAudio`，P0-6 接入 FormContainer）。
     ///
-    /// 骨架实现：需要 `RuntimeStatic.Runtime.FormContainer.InstantAudioMethods`
-    /// 运行时数据，当前仅清空表。F 步接入真实运行时后补齐。
-    pub fn load_instant_audio(&mut self) {
+    /// 遍历 `FormContainer.InstantAudioMethods`（音效名 → 静态方法引用），
+    /// 通过 VM 调用对应静态方法取得 `AudioAsset` 对象，存入 `instant_audio` 表
+    /// （对齐 C# `gorgeClass.InvokeStaticMethod(method, Array.Empty<object>())`）。
+    ///
+    /// 容器保存类全名，而 Demo/loader 以简单名注册编译类到 VM（与
+    /// `ChartManager::resolve_registered_class_name` 相同的双键约定），
+    /// 调用前先做名称解析。方法调用失败（类未注册 / 方法缺失 /
+    /// 返回值非对象）时跳过该项。
+    pub fn load_instant_audio(
+        &mut self,
+        form_container: &crate::runtime::runtime_form_container::RuntimeFormContainer,
+        vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
+    ) {
         self.instant_audio.clear();
-        // 骨架：实际需要从 RuntimeStatic 读取 InstantAudioMethods
-        // F 步需接入 GorgeLanguageRuntime 的 FormContainer
+
+        for (name, method_ref) in &form_container.instant_audio_methods {
+            // 全名未命中时回退末段短名（loader 注册约定）
+            let class_name = if vm.class_table.contains_key(&method_ref.class_name) {
+                method_ref.class_name.clone()
+            } else {
+                let simple = method_ref.class_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&method_ref.class_name);
+                if vm.class_table.contains_key(simple) {
+                    simple.to_string()
+                } else {
+                    continue;
+                }
+            };
+
+            let Ok(()) = vm.invoke_method_by_id(&class_name, None, method_ref.method_id) else {
+                continue;
+            };
+            // 返回值对象 ID（0 表示 null）→ JSON 化保存，供 AudioManager 延迟物化
+            if let Some(obj_id) = vm.return_object.filter(|id| *id != 0) {
+                self.instant_audio.insert(
+                    name.clone(),
+                    serde_json::json!({ "__object_id": obj_id }),
+                );
+            }
+        }
     }
 
     /// 从 Gorge 语言运行时提取谱表（对应 C# `ExtractStaveFromRuntime`）。
@@ -317,12 +355,17 @@ impl SimulationScore {
     /// 1. 遍历所有编译类，检查类级注解
     /// 2. 对于匹配的类，查找静态方法注解（`@Chart` / `@Song`）
     /// 3. 从方法注解的 `config` 参数提取 `PeriodConfig`
-    /// 4. 从 `injector_constants` 提取元素/音频注入器数据
+    /// 4. 定位方法字节码中的 `LoadInjectorConstant`，将该方法返回的注入器常量
+    ///    转换为 JSON 填入 `ElementPeriod.elements` / `AudioPeriod.audio_injector`
     pub fn extract_staves_from_compiled(
         &mut self,
         compiled_classes: &[gorge_core::objective::bytecode::CompiledClass],
     ) {
         self.stave.clear();
+
+        // 构建统一的注入器字段元数据视图（编译类 + native 类，含继承合并），
+        // 供嵌套常量字段按位置对齐恢复字段名
+        let meta = InjectorFieldMetaProvider::build(compiled_classes);
 
         for cc in compiled_classes {
             let class_name = cc.class_type.full_name();
@@ -342,7 +385,7 @@ impl SimulationScore {
                         );
 
                         // 扫描带 @Song 注解的静态方法，提取音频乐段
-                        self.extract_audio_periods_from_class(cc, &mut staff);
+                        Self::extract_audio_periods_from_class(cc, &mut staff, &meta);
 
                         self.stave.push(Box::new(staff));
                         break; // 一个类只对应一个谱表类型
@@ -365,7 +408,7 @@ impl SimulationScore {
                         );
 
                         // 扫描带 @Chart 注解的静态方法，提取元素乐段
-                        self.extract_element_periods_from_class(cc, &mut staff, &form_name);
+                        Self::extract_element_periods_from_class(cc, &mut staff, &form_name, &meta);
 
                         self.stave.push(Box::new(staff));
                         break;
@@ -378,21 +421,22 @@ impl SimulationScore {
 
     /// 从编译类中提取 `@Song` 方法的音频乐段
     fn extract_audio_periods_from_class(
-        &mut self,
         cc: &gorge_core::objective::bytecode::CompiledClass,
         staff: &mut AudioStaff,
+        meta: &InjectorFieldMetaProvider,
     ) {
         for (method_id, annotations) in &cc.method_annotations {
             for ann in annotations {
                 if ann.name != "Song" {
                     continue;
                 }
-                // 从方法注解的 config 参数提取 PeriodConfig 注入器
-                let config_injector = extract_period_config_injector(ann);
-                // 尝试从 injector_constants 查找对应方法的音频常量
-                let audio_injector = cc.injector_constants.iter()
-                    .find(|c| c.class_name == "AudioAsset" || c.class_name.contains("Audio"))
-                    .map(|c| injector_const_to_json(c));
+                // 从方法注解的 config 参数提取 PeriodConfig 注入器（走完整注入器实例化路径）
+                let config_injector = extract_period_config_injector(cc, ann, meta);
+                // @Song 方法返回单个音频资产注入器：定位方法返回的注入器常量并转 JSON
+                let audio_injector = method_injector_constant_index(cc, *method_id)
+                    .and_then(|idx| cc.injector_constants.get(idx))
+                    .filter(|c| c.class_name != "Array")
+                    .map(|c| const_object_to_json(&c.class_name, &c.fields, meta));
 
                 let period = AudioPeriod::new(
                     method_name_by_id(cc, *method_id).to_string(),
@@ -406,55 +450,26 @@ impl SimulationScore {
 
     /// 从编译类中提取 `@Chart` 方法的元素乐段
     fn extract_element_periods_from_class(
-        &mut self,
         cc: &gorge_core::objective::bytecode::CompiledClass,
         staff: &mut ElementStaff,
         form_name: &str,
+        meta: &InjectorFieldMetaProvider,
     ) {
         for (method_id, annotations) in &cc.method_annotations {
             for ann in annotations {
                 if ann.name != "Chart" {
                     continue;
                 }
-                let config_injector = extract_period_config_injector(ann);
+                let config_injector = extract_period_config_injector(cc, ann, meta);
                 let mut period = ElementPeriod::new(
                     form_name.to_string(),
                     method_name_by_id(cc, *method_id).to_string(),
                     config_injector,
                 );
-                // 从 injector_constants 提取元素数据
-                // TODO: 完整实现需要注入器实例化系统，当前从常量定义推导
-                self.fill_element_period_from_constants(cc, &mut period);
+                // 定位方法返回的注入器数组常量，逐元素转 JSON 填入 elements
+                fill_element_period_from_method(cc, *method_id, &mut period, meta);
 
                 staff.periods.push(period);
-            }
-        }
-    }
-
-    /// 从注入器常量中填充元素乐段的元素列表（骨架实现）
-    fn fill_element_period_from_constants(
-        &mut self,
-        cc: &gorge_core::objective::bytecode::CompiledClass,
-        period: &mut ElementPeriod,
-    ) {
-        // 遍历注入器常量，将数组或注入器对象转换为 JSON 元素
-        for constant in &cc.injector_constants {
-            for field in &constant.fields {
-                match field {
-                    gorge_core::objective::bytecode::InjectorConstField::Array(elements) => {
-                        for elem in elements {
-                            if let Some(json) = injector_const_field_to_json(elem) {
-                                period.elements.push(json);
-                            }
-                        }
-                    }
-                    // 单个注入器对象也作为一个元素
-                    _ => {
-                        if let Some(json) = injector_const_field_to_json(field) {
-                            period.elements.push(json);
-                        }
-                    }
-                }
             }
         }
     }
@@ -595,10 +610,21 @@ impl Default for SimulationScore {
 
 // ==================== 谱表提取辅助函数 ====================
 
-/// 从方法注解中提取 PeriodConfig 注入器的 JSON 表示
+/// 从方法注解中提取 PeriodConfig 注入器的 JSON 表示（完整注入器实例化路径）。
 ///
-/// 查找 `config` 参数，若不存在则返回默认配置。
-fn extract_period_config_injector(ann: &gorge_core::objective::declaration::MethodAnnotation) -> serde_json::Value {
+/// 真实谱面的 `config` 参数是 `GorgeFramework.PeriodConfig^` 注入器字面量，
+/// 编译器常量折叠无法处理注入器对象，会为它生成一个隐藏静态方法
+///（`__annotation_<Anno>_config`），注解参数记录为 `AnnotationValue::Delegate(全局方法 ID)`。
+/// 本函数沿 Delegate 找到隐藏方法字节码中的 `LoadInjectorConstant`，从类常量池取出
+/// 该 `PeriodConfig` 注入器常量并转 JSON（与音频/元素注入器同一条完整实例化路径）。
+///
+/// 防御回退：`config` 缺失或不是 Delegate 时返回默认配置，并继续收集注解上的
+/// 直接标量参数（`timeOffset`/`minLength`/`active`）。
+fn extract_period_config_injector(
+    cc: &gorge_core::objective::bytecode::CompiledClass,
+    ann: &gorge_core::objective::declaration::MethodAnnotation,
+    meta: &InjectorFieldMetaProvider,
+) -> serde_json::Value {
     let mut config = serde_json::json!({
         "timeOffset": 0.0,
         "minLength": 10.0,
@@ -607,14 +633,13 @@ fn extract_period_config_injector(ann: &gorge_core::objective::declaration::Meth
 
     for (key, value) in &ann.parameters {
         if key == "config" {
-            // cfg 参数为注入器常量引用（InjectObject），此处简化处理
-            // TODO: 完整实现需通过注入器实例化系统解析
-            match value {
-                gorge_core::objective::declaration::AnnotationValue::Float(f) => {
-                    config["timeOffset"] = serde_json::json!(*f as f32);
+            // config 参数为注入器常量引用：Delegate 指向返回该注入器的隐藏方法
+            if let gorge_core::objective::declaration::AnnotationValue::Delegate(hidden_id) = value {
+                if let Some(cfg_json) = resolve_delegate_injector_json(cc, *hidden_id, meta) {
+                    return cfg_json;
                 }
-                _ => {}
             }
+            // 解析失败（如注入器非常量）则回退默认配置，继续尝试直接参数
         } else if key == "timeOffset" {
             if let gorge_core::objective::declaration::AnnotationValue::Float(v) = value {
                 config["timeOffset"] = serde_json::json!(*v as f32);
@@ -644,113 +669,279 @@ fn method_name_by_id(cc: &gorge_core::objective::bytecode::CompiledClass, method
         .unwrap_or_else(|| format!("Method_{}", method_id))
 }
 
-/// 将注入器常量定义转换为 JSON 值（递归处理嵌套对象）
-fn injector_const_to_json(
-    constant: &gorge_core::objective::bytecode::InjectorConstantDef,
+// ==================== 注入器常量提取与 JSON 转换 ====================
+
+/// 注入器字段元数据提供者。
+///
+/// 统一编译类（`CompiledClass.injector_fields`）与 native 类
+///（`NativeClass::injector_fields_meta`）的注入器字段声明视图，
+/// 供注入器常量转 JSON 时将嵌套字段与声明按位置对齐以恢复字段名。
+struct InjectorFieldMetaProvider {
+    /// 类名 → 注入器字段（名, 值类型）有序表（含继承合并，父类字段在前）
+    fields_by_class: HashMap<String, Vec<(String, ValueType)>>,
+}
+
+impl InjectorFieldMetaProvider {
+    /// 从编译类列表构建元数据视图（native 类元数据来自 `crate::native_classes()`）
+    fn build(compiled_classes: &[CompiledClass]) -> Self {
+        let mut fields_by_class: HashMap<String, Vec<(String, ValueType)>> = HashMap::new();
+
+        // native 类元数据（宏生成的字段表）
+        for cls in crate::native_classes() {
+            let meta: Vec<(String, ValueType)> = cls
+                .injector_fields_meta()
+                .iter()
+                .map(|(name, vt)| (name.to_string(), *vt))
+                .collect();
+            fields_by_class.insert(cls.full_name().to_string(), meta);
+        }
+
+        // 编译类元数据（含继承链合并，父类字段在前）
+        let compiled_map: HashMap<String, &CompiledClass> = compiled_classes
+            .iter()
+            .map(|c| (c.class_type.full_name(), c))
+            .collect();
+        // 克隆 native 表供继承解析使用，避免与后续插入产生借用冲突
+        let native_snapshot = fields_by_class.clone();
+        for cc in compiled_classes {
+            let name = cc.class_type.full_name();
+            let fields = Self::collect_compiled_fields(cc, &compiled_map, &native_snapshot, 0);
+            fields_by_class.insert(name, fields);
+        }
+
+        Self { fields_by_class }
+    }
+
+    /// 递归收集编译类的注入器字段（父类字段在前，本类字段在后）。
+    ///
+    /// 父类为编译类时递归合并；父类为 native 类时查 native 元数据表。
+    /// `depth` 防止继承环导致无限递归。
+    fn collect_compiled_fields(
+        cc: &CompiledClass,
+        compiled_map: &HashMap<String, &CompiledClass>,
+        native_map: &HashMap<String, Vec<(String, ValueType)>>,
+        depth: usize,
+    ) -> Vec<(String, ValueType)> {
+        const MAX_INHERIT_DEPTH: usize = 32;
+        let mut fields = Vec::new();
+        if depth < MAX_INHERIT_DEPTH {
+            if let Some(super_name) = &cc.super_class_name {
+                if let Some(parent) = compiled_map.get(super_name) {
+                    fields = Self::collect_compiled_fields(parent, compiled_map, native_map, depth + 1);
+                } else if let Some(native_fields) = native_map.get(super_name) {
+                    fields = native_fields.clone();
+                }
+            }
+        }
+        fields.extend(
+            cc.injector_fields
+                .iter()
+                .map(|f| (f.name.clone(), f.value_type)),
+        );
+        fields
+    }
+
+    /// 按类名查找注入器字段声明（全名未命中时回退末段短名）
+    fn lookup(&self, class_name: &str) -> Option<&Vec<(String, ValueType)>> {
+        if let Some(fields) = self.fields_by_class.get(class_name) {
+            return Some(fields);
+        }
+        let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+        self.fields_by_class.get(simple)
+    }
+}
+
+/// 解析注解参数中的隐藏方法引用（`AnnotationValue::Delegate`），取得其返回的
+/// 注入器常量的 JSON 表示（完整注入器实例化路径）。
+///
+/// 注解参数为注入器字面量时，编译器生成返回该注入器的隐藏静态方法
+///（S3b，如 `__annotation_Song_config`），参数值为该方法的全局方法 ID。
+/// 本函数沿字节码定位隐藏方法体内的 `LoadInjectorConstant` 指令，从类常量池
+/// 取出常量并转换；`config` 参数等注入器引用均走此路径。
+///
+/// 解析失败（方法不存在 / 无注入器常量 / 常量缺失）时返回 None。
+fn resolve_delegate_injector_json(
+    cc: &CompiledClass,
+    global_id: usize,
+    meta: &InjectorFieldMetaProvider,
+) -> Option<serde_json::Value> {
+    let idx = method_injector_constant_index(cc, global_id)?;
+    let constant = cc.injector_constants.get(idx)?;
+    Some(const_object_to_json(&constant.class_name, &constant.fields, meta))
+}
+
+/// 在方法字节码中定位返回值对应的注入器常量索引。
+///
+/// `@Chart`/`@Song` 方法体为 `return <注入器字面量>;`，编译后由一条
+/// `LoadInjectorConstant` 指令加载常量池条目。若方法中有多条（如局部注入器
+/// 变量），取最后一条（最接近 return 的赋值）。方法无注入器常量时返回 None。
+fn method_injector_constant_index(cc: &CompiledClass, method_global_id: usize) -> Option<usize> {
+    let local_id = if method_global_id >= cc.method_start_id {
+        method_global_id - cc.method_start_id
+    } else {
+        method_global_id
+    };
+    let method = cc.methods.get(local_id)?;
+    method.codes.iter().rev().find_map(|code| match code.code.operator {
+        IntermediateOperator::LoadInjectorConstant(idx) => Some(idx),
+        _ => None,
+    })
+}
+
+/// 从 `@Chart` 方法返回的注入器数组常量填充元素乐段的元素列表。
+///
+/// 方法字节码中的 `LoadInjectorConstant` 指向类常量池中该方法返回的常量：
+/// - `class_name == "Array"`：注入器数组，每个字段是一个元素注入器对象常量
+/// - 其他：单个注入器对象（防御路径，视作单元素数组）
+fn fill_element_period_from_method(
+    cc: &CompiledClass,
+    method_global_id: usize,
+    period: &mut ElementPeriod,
+    meta: &InjectorFieldMetaProvider,
+) {
+    let Some(idx) = method_injector_constant_index(cc, method_global_id) else {
+        return;
+    };
+    let Some(constant) = cc.injector_constants.get(idx) else {
+        return;
+    };
+    if constant.class_name == "Array" {
+        for element in &constant.fields {
+            if let InjectorConstField::InjectObject(class_name, fields) = element {
+                period.elements.push(const_object_to_json(class_name, fields, meta));
+            }
+        }
+    } else {
+        period.elements.push(const_object_to_json(&constant.class_name, &constant.fields, meta));
+    }
+}
+
+/// 将注入器对象常量递归转换为 JSON。
+///
+/// 输出格式与 `ChartManager::materialize_injector` 的输入约定一致：
+/// `{ "__type": 类名, 字段名: 值, ... }`。
+///
+/// 嵌套 `InjectObject`/`Array` 常量不含字段名（编译期常量表示中对象字段的
+/// 槽位用于保留类名），此处通过 `meta` 中父类的注入器字段声明按位置对齐恢复：
+/// 命名标量字段钉住游标，未命名的对象/数组字段依次取下一个 Object 类型声明字段。
+/// 该对齐假设源文件中字段按声明顺序给出（制谱器生成的谱面满足此约定）；
+/// 声明缺失的类（未注册/未知类）退化为 `__unnamed_N` 键保留数据。
+fn const_object_to_json(
+    class_name: &str,
+    fields: &[InjectorConstField],
+    meta: &InjectorFieldMetaProvider,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
-    obj.insert("__type".into(), serde_json::Value::String(constant.class_name.clone()));
-    for field in &constant.fields {
-        let (name, value) = injector_const_field_entry(field);
-        obj.insert(name, value);
+    obj.insert("__type".into(), class_name.into());
+
+    let declared = meta.lookup(class_name);
+    let mut cursor = 0usize;
+    let mut unnamed_count = 0usize;
+
+    for field in fields {
+        match field {
+            InjectorConstField::Int(name, v) => {
+                cursor = advance_past(declared, cursor, name);
+                obj.insert(name.clone(), (*v).into());
+            }
+            InjectorConstField::Float(name, v) => {
+                cursor = advance_past(declared, cursor, name);
+                obj.insert(name.clone(), (*v).into());
+            }
+            InjectorConstField::Bool(name, v) => {
+                cursor = advance_past(declared, cursor, name);
+                obj.insert(name.clone(), (*v).into());
+            }
+            InjectorConstField::String(name, v) => {
+                cursor = advance_past(declared, cursor, name);
+                obj.insert(name.clone(), v.clone().into());
+            }
+            InjectorConstField::Object(name, id) => {
+                cursor = advance_past(declared, cursor, name);
+                obj.insert(name.clone(), (*id as i64).into());
+            }
+            InjectorConstField::InjectObject(nested_class, nested_fields) => {
+                let field_name = next_object_field_name(declared, &mut cursor)
+                    .unwrap_or_else(|| {
+                        unnamed_count += 1;
+                        format!("__unnamed_{}", unnamed_count)
+                    });
+                obj.insert(
+                    field_name,
+                    const_object_to_json(nested_class, nested_fields, meta),
+                );
+            }
+            InjectorConstField::Array(elements) => {
+                let field_name = next_object_field_name(declared, &mut cursor)
+                    .unwrap_or_else(|| {
+                        unnamed_count += 1;
+                        format!("__unnamed_{}", unnamed_count)
+                    });
+                let arr: Vec<serde_json::Value> = elements
+                    .iter()
+                    .map(|e| const_element_to_json(e, meta))
+                    .collect();
+                obj.insert(field_name, serde_json::Value::Array(arr));
+            }
+        }
     }
     serde_json::Value::Object(obj)
 }
 
-/// 将注入器常量字段转换为 JSON 值
-fn injector_const_field_to_json(
-    field: &gorge_core::objective::bytecode::InjectorConstField,
-) -> Option<serde_json::Value> {
+/// 转换数组元素（元素类名在常量中保留，无需恢复字段名）
+fn const_element_to_json(
+    field: &InjectorConstField,
+    meta: &InjectorFieldMetaProvider,
+) -> serde_json::Value {
     match field {
-        gorge_core::objective::bytecode::InjectorConstField::Int(name, v) => {
-            let mut obj = serde_json::Map::new();
-            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
-            obj.insert("__type".into(), "int".into());
-            obj.insert("value".into(), (*v).into());
-            Some(serde_json::Value::Object(obj))
+        InjectorConstField::InjectObject(class_name, fields) => {
+            const_object_to_json(class_name, fields, meta)
         }
-        gorge_core::objective::bytecode::InjectorConstField::Float(name, v) => {
-            let mut obj = serde_json::Map::new();
-            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
-            obj.insert("__type".into(), "float".into());
-            obj.insert("value".into(), (*v).into());
-            Some(serde_json::Value::Object(obj))
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Bool(name, v) => {
-            let mut obj = serde_json::Map::new();
-            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
-            obj.insert("__type".into(), "bool".into());
-            obj.insert("value".into(), (*v).into());
-            Some(serde_json::Value::Object(obj))
-        }
-        gorge_core::objective::bytecode::InjectorConstField::String(name, v) => {
-            let mut obj = serde_json::Map::new();
-            if !name.is_empty() { obj.insert("__field".into(), name.clone().into()); }
-            obj.insert("__type".into(), "string".into());
-            obj.insert("value".into(), v.clone().into());
-            Some(serde_json::Value::Object(obj))
-        }
-        gorge_core::objective::bytecode::InjectorConstField::InjectObject(class_name, fields) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("__type".into(), class_name.clone().into());
-            for f in fields {
-                let (n, v) = injector_const_field_entry(f);
-                obj.insert(n, v);
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Array(elements) => {
-            let arr: Vec<serde_json::Value> = elements.iter()
-                .filter_map(injector_const_field_to_json)
-                .collect();
-            Some(serde_json::Value::Array(arr))
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Object(name, id) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("__type".into(), "object".into());
-            obj.insert("__field".into(), name.clone().into());
-            obj.insert("id".into(), (*id as i64).into());
-            Some(serde_json::Value::Object(obj))
-        }
+        InjectorConstField::Int(_, v) => (*v).into(),
+        InjectorConstField::Float(_, v) => (*v).into(),
+        InjectorConstField::Bool(_, v) => (*v).into(),
+        InjectorConstField::String(_, v) => v.clone().into(),
+        InjectorConstField::Object(_, id) => (*id as i64).into(),
+        InjectorConstField::Array(elements) => serde_json::Value::Array(
+            elements.iter().map(|e| const_element_to_json(e, meta)).collect(),
+        ),
     }
 }
 
-/// 提取注入器常量字段的 (字段名, JSON值) 对
-fn injector_const_field_entry(
-    field: &gorge_core::objective::bytecode::InjectorConstField,
-) -> (String, serde_json::Value) {
-    match field {
-        gorge_core::objective::bytecode::InjectorConstField::Int(name, v) => {
-            (name.clone(), (*v).into())
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Float(name, v) => {
-            (name.clone(), (*v).into())
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Bool(name, v) => {
-            (name.clone(), (*v).into())
-        }
-        gorge_core::objective::bytecode::InjectorConstField::String(name, v) => {
-            (name.clone(), v.clone().into())
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Object(name, id) => {
-            (name.clone(), (*id as i64).into())
-        }
-        gorge_core::objective::bytecode::InjectorConstField::InjectObject(class_name, fields) => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("__type".into(), class_name.clone().into());
-            for f in fields {
-                let (n, v) = injector_const_field_entry(f);
-                obj.insert(n, v);
+/// 游标推进到越过名为 `name` 的声明字段（命名字段钉住位置）。
+///
+/// 返回推进后的游标；声明缺失或未找到时游标不变。
+fn advance_past(
+    declared: Option<&Vec<(String, ValueType)>>,
+    cursor: usize,
+    name: &str,
+) -> usize {
+    if let Some(fields) = declared {
+        for (i, (field_name, _)) in fields.iter().enumerate().skip(cursor) {
+            if field_name == name {
+                return i + 1;
             }
-            (String::new(), serde_json::Value::Object(obj))
-        }
-        gorge_core::objective::bytecode::InjectorConstField::Array(elements) => {
-            let arr: Vec<serde_json::Value> = elements.iter()
-                .map(|e| injector_const_field_to_json(e).unwrap_or(serde_json::Value::Null))
-                .collect();
-            (String::new(), serde_json::Value::Array(arr))
         }
     }
+    cursor
+}
+
+/// 取游标后第一个 Object 类型的声明字段名并推进游标。
+///
+/// 用于为未命名的嵌套对象/数组常量恢复字段名；声明缺失或没有剩余
+/// Object 字段时返回 None。
+fn next_object_field_name(
+    declared: Option<&Vec<(String, ValueType)>>,
+    cursor: &mut usize,
+) -> Option<String> {
+    let fields = declared?;
+    for (i, (field_name, vt)) in fields.iter().enumerate().skip(*cursor) {
+        if *vt == ValueType::Object {
+            *cursor = i + 1;
+            return Some(field_name.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -953,7 +1144,293 @@ mod tests {
     fn test_load_instant_audio_clears() {
         let mut score = SimulationScore::default();
         score.instant_audio.insert("hit".to_string(), serde_json::json!({}));
-        score.load_instant_audio();
+        // 空容器 + 空 VM：表被清空且无条目写入
+        let container = crate::runtime::runtime_form_container::RuntimeFormContainer::new_empty();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        score.load_instant_audio(&container, &mut vm);
+        assert!(score.instant_audio.is_empty());
+    }
+
+    // ==================== P0-6: load_instant_audio 读取 FormContainer ====================
+
+    /// 构造带 `@InstantAudio` 注解的编译类：方法 0 返回注入器常量对象。
+    fn make_instant_audio_class() -> CompiledClass {
+        use gorge_core::objective::bytecode::{
+            CompiledClass, InjectorConstField, InjectorConstantDef,
+        };
+        use gorge_core::objective::declaration::{AnnotationValue, MethodAnnotation};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::{
+            Address, CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand,
+        };
+        use std::collections::HashMap;
+
+        let load_constant = CodeWithSpan::new(
+            IntermediateCode {
+                result: Some(Address::new(ValueType::Object, 0)),
+                operator: IntermediateOperator::LoadInjectorConstant(0),
+                left: Operand::int(0),
+                right: None,
+            },
+            Span::dummy(),
+        );
+        let return_object = CodeWithSpan::new(
+            IntermediateCode {
+                result: None,
+                operator: IntermediateOperator::ReturnObject,
+                left: Operand::addr(Address::new(ValueType::Object, 0)),
+                right: None,
+            },
+            Span::dummy(),
+        );
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation {
+                name: "InstantAudio".into(),
+                parameters: vec![
+                    ("name".into(), AnnotationValue::String("RespondA".into())),
+                ],
+            },
+        ]);
+
+        CompiledClass {
+            class_type: GorgeType::class("Dremu.DremuNativeResources", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod {
+                    name: "GetRespondA".into(),
+                    codes: vec![load_constant, return_object],
+                    local_count: 1,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                InjectorConstantDef {
+                    class_name: "GorgeFramework.AudioAsset".into(),
+                    fields: vec![InjectorConstField::String("name".into(), "audio:Hit".into())],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_p0_6_load_instant_audio_invokes_methods_from_container() {
+        // 容器扫描出方法表 → VM 调用静态方法 → 注入器对象 ID 入库
+        let classes = vec![make_instant_audio_class()];
+        let mut container = crate::runtime::runtime_form_container::RuntimeFormContainer::new_empty();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        container.scan_forms_from_compiled(&classes, &mut vm);
+        assert_eq!(container.instant_audio_methods.len(), 1);
+
+        // 按 loader 约定以简单名注册编译类到 VM
+        use gorge_core::objective::class::RuntimeClass;
+        use gorge_core::objective::declaration::ClassDeclaration;
+        for cc in &classes {
+            let name = cc.class_type.full_name().rsplit('.').next().unwrap().to_string();
+            let decl = ClassDeclaration {
+                class_type: cc.class_type.clone(),
+                method_start_id: cc.method_start_id,
+                method_count: cc.methods.len(),
+                method_annotations: cc.method_annotations.clone(),
+                ..ClassDeclaration::dummy(cc.class_type.full_name())
+            };
+            let mut rc = RuntimeClass::new(decl, None);
+            for (i, m) in cc.methods.iter().enumerate() {
+                rc.register_method(i, m.clone());
+            }
+            vm.register_runtime_class(&name, std::sync::Arc::new(rc));
+            // 注入器常量池注册（P0-7 前 VM 执行路径的测试侧填充）
+            vm.injector_constants = cc.injector_constants.clone();
+        }
+
+        let mut score = SimulationScore::default();
+        score.load_instant_audio(&container, &mut vm);
+
+        assert_eq!(score.instant_audio.len(), 1);
+        let entry = score.instant_audio.get("RespondA").expect("RespondA 应存在");
+        let obj_id = entry["__object_id"].as_u64().unwrap() as usize;
+        assert!(obj_id > 0);
+        assert!(vm.injectors.contains_key(&obj_id));
+    }
+
+    // ==================== P0-7: VM 执行路径嵌套常量物化 ====================
+
+    /// `@InstantAudio` 方法返回的常量含嵌套注入器 + 数组：经 VM 执行路径
+    /// 完整物化（嵌套注入器递归 + 数组 native 载荷）。
+    ///
+    /// 回归：常量池未注册或嵌套字段只占槽填 0 时，返回对象的 object 字段
+    /// 为 0、数组无数据。
+    #[test]
+    fn test_p0_7_instant_audio_nested_constant_materialized() {
+        use gorge_core::objective::bytecode::{
+            CompiledClass, InjectorConstField, InjectorConstantDef,
+        };
+        use gorge_core::objective::class::RuntimeClass;
+        use gorge_core::objective::declaration::{AnnotationValue, ClassDeclaration, MethodAnnotation};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::{
+            Address, CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand,
+        };
+        use gorge_core::system::native::injector::Injector;
+        use std::collections::HashMap;
+
+        // AudioAsset 类声明：string(0) + object(0) 两个注入器字段
+        let asset_decl = ClassDeclaration {
+            class_type: GorgeType::class("GorgeFramework.AudioAsset", None),
+            injector_field_type_count: TypeCount {
+                string_count: 1, object_count: 1, ..TypeCount::zero()
+            },
+            method_count: 1,
+            ..ClassDeclaration::dummy("GorgeFramework.AudioAsset".into())
+        };
+
+        // 常量：name + 嵌套注入器对象（数组字段）
+        let load_constant = CodeWithSpan::new(
+            IntermediateCode {
+                result: Some(Address::new(ValueType::Object, 0)),
+                operator: IntermediateOperator::LoadInjectorConstant(0),
+                left: Operand::int(0),
+                right: None,
+            },
+            Span::dummy(),
+        );
+        let return_object = CodeWithSpan::new(
+            IntermediateCode {
+                result: None,
+                operator: IntermediateOperator::ReturnObject,
+                left: Operand::addr(Address::new(ValueType::Object, 0)),
+                right: None,
+            },
+            Span::dummy(),
+        );
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation {
+                name: "InstantAudio".into(),
+                parameters: vec![
+                    ("name".into(), AnnotationValue::String("Nested".into())),
+                ],
+            },
+        ]);
+
+        let cc = CompiledClass {
+            class_type: GorgeType::class("Dremu.DremuNativeResources", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod {
+                    name: "GetNested".into(),
+                    codes: vec![load_constant, return_object],
+                    local_count: 1,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![InjectorConstantDef {
+                class_name: "GorgeFramework.AudioAsset".into(),
+                fields: vec![
+                    InjectorConstField::String("name".into(), "audio:Hit".into()),
+                    // 嵌套注入器（含数组字段）：AudioAsset 声明的 object 槽位
+                    InjectorConstField::InjectObject(
+                        "GorgeFramework.Inner".into(),
+                        vec![InjectorConstField::Array(vec![
+                            InjectorConstField::Int("".into(), 11),
+                            InjectorConstField::Int("".into(), 22),
+                        ])],
+                    ),
+                ],
+            }],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let mut container = crate::runtime::runtime_form_container::RuntimeFormContainer::new_empty();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        container.scan_forms_from_compiled(&[cc.clone()], &mut vm);
+
+        // 按 loader 约定注册类（注入器声明用含注入器字段的 AudioAsset）
+        let name = cc.class_type.full_name().rsplit('.').next().unwrap().to_string();
+        let mut rc = RuntimeClass::new(asset_decl, None);
+        for (i, m) in cc.methods.iter().enumerate() {
+            rc.register_method(i, m.clone());
+        }
+        vm.register_runtime_class(&name, std::sync::Arc::new(rc));
+        // 常量池注册（P0-7：loader 合并顺序与类注册顺序一致）
+        vm.injector_constants = cc.injector_constants.clone();
+
+        let mut score = SimulationScore::default();
+        score.load_instant_audio(&container, &mut vm);
+
+        let entry = score.instant_audio.get("Nested").expect("Nested 应存在");
+        let obj_id = entry["__object_id"].as_u64().unwrap() as usize;
+
+        // 外层注入器：string 字段 + object 字段均非默认且有效
+        let inj = vm.injectors.get(&obj_id).expect("应为注入器");
+        assert_eq!(inj.get_injector_string(0), "audio:Hit");
+        assert!(!inj.get_injector_string_default_value(0));
+        let nested_id = inj.get_injector_object(0);
+        assert!(nested_id > 0, "嵌套注入器应被递归物化（不再填 0）");
+        assert!(!inj.get_injector_object_default_value(0));
+
+        // 嵌套注入器的数组字段：IntArray 载荷元素完整
+        let nested = vm.injectors.get(&nested_id).expect("嵌套应为注入器");
+        let wrapper_id = nested.get_injector_object(0);
+        assert!(wrapper_id > 0, "数组字段应被物化");
+        let wrapper = vm.objects.get(&wrapper_id).expect("应为编译层包装对象");
+        use gorge_core::objective::object::GorgeObject;
+        assert_eq!(wrapper.get_int_field(0), 2, "包装对象 length 字段应为 2");
+        let native_id = wrapper.native_object_id.expect("应链接 native 载荷");
+        use gorge_core::system::native::array::IntArray;
+        let payload = vm.native_payloads.get(&native_id)
+            .and_then(|p| p.downcast_ref::<IntArray>())
+            .expect("标量 int 元素数组应为 IntArray");
+        assert_eq!(payload.items, vec![11, 22], "数组元素值应完整写入");
+    }
+
+    #[test]
+    fn test_p0_6_load_instant_audio_skips_unregistered_class() {
+        // 方法表指向未注册到 VM 的类：invoke 失败，条目被跳过（不 panic）
+        use crate::runtime::runtime_form_container::{RuntimeFormContainer, StaticMethodRef};
+
+        let mut container = RuntimeFormContainer::new_empty();
+        container.instant_audio_methods.insert(
+            "Missing".into(),
+            StaticMethodRef::new("No.Such.Class".into(), 0),
+        );
+
+        let mut score = SimulationScore::default();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        score.load_instant_audio(&container, &mut vm);
         assert!(score.instant_audio.is_empty());
     }
 
@@ -1248,5 +1725,577 @@ mod tests {
             .any(|s| s.as_any().downcast_ref::<AudioStaff>().is_some());
         assert!(has_element, "应包含 ElementStaff");
         assert!(has_audio, "应包含 AudioStaff");
+    }
+
+    // ==================== P0-2: 按方法提取注入器常量测试 ====================
+
+    use gorge_core::diagnostics::Span;
+    use gorge_core::objective::bytecode::{CompiledClass, InjectorConstField, InjectorConstantDef};
+    use gorge_core::objective::declaration::MethodAnnotation;
+    use gorge_core::objective::types::{GorgeType, TypeCount};
+    use gorge_core::virtual_machine::ir::{
+        CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand,
+    };
+
+    /// 构造 `LoadInjectorConstant(idx)` 指令
+    fn load_injector_constant_code(idx: usize) -> CodeWithSpan {
+        CodeWithSpan::new(
+            IntermediateCode {
+                result: None,
+                operator: IntermediateOperator::LoadInjectorConstant(idx),
+                left: Operand::int(0),
+                right: None,
+            },
+            Span::dummy(),
+        )
+    }
+
+    /// 构造带 @Chart 方法（返回注入器数组常量）的元素谱表编译类
+    fn make_chart_staff_with_method_constant() -> CompiledClass {
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation { name: "Chart".into(), parameters: vec![] },
+        ]);
+
+        CompiledClass {
+            class_type: GorgeType::class("Test.ChartStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod {
+                    name: "Period".into(),
+                    codes: vec![load_injector_constant_code(0)],
+                    local_count: 0,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                // @Chart 方法返回的注入器数组常量
+                InjectorConstantDef {
+                    class_name: "Array".into(),
+                    fields: vec![
+                        InjectorConstField::InjectObject(
+                            "Test.TapNote".into(),
+                            vec![
+                                InjectorConstField::Float("hitTime".into(), 0.5),
+                                InjectorConstField::Float("keepTime".into(), 1.0),
+                            ],
+                        ),
+                        InjectorConstField::InjectObject(
+                            "Test.TapNote".into(),
+                            vec![
+                                InjectorConstField::Float("hitTime".into(), 1.5),
+                                InjectorConstField::Float("keepTime".into(), 2.0),
+                            ],
+                        ),
+                    ],
+                },
+                // 干扰项：其他方法的常量不应被提取到本乐段
+                InjectorConstantDef {
+                    class_name: "Test.Unrelated".into(),
+                    fields: vec![InjectorConstField::Int("x".into(), 99)],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                gorge_core::objective::bytecode::CompiledAnnotation {
+                    name: "ElementStaff".into(),
+                    generic_type: None,
+                    arguments: vec![("form".into(), "NoteForm".into())],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_p02_chart_method_elements_extracted_from_method_constant() {
+        let classes = vec![make_chart_staff_with_method_constant()];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        let staff = score.stave[0].as_any().downcast_ref::<ElementStaff>().unwrap();
+        assert_eq!(staff.periods.len(), 1);
+        let period = &staff.periods[0];
+
+        // 应提取 2 个元素（而非旧实现的全类常量混填）
+        assert_eq!(period.elements.len(), 2, "应按方法常量提取 2 个元素");
+        assert_eq!(period.elements[0]["__type"], "Test.TapNote");
+        assert!((period.elements[0]["hitTime"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        assert!((period.elements[0]["keepTime"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert!((period.elements[1]["hitTime"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_p02_song_method_audio_injector_extracted() {
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation { name: "Song".into(), parameters: vec![] },
+        ]);
+
+        let cc = CompiledClass {
+            class_type: GorgeType::class("Test.SongStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod {
+                    name: "GetSong".into(),
+                    codes: vec![load_injector_constant_code(0)],
+                    local_count: 0,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                InjectorConstantDef {
+                    class_name: "GorgeFramework.AudioAsset".into(),
+                    fields: vec![InjectorConstField::String("name".into(), "audio:Song".into())],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                gorge_core::objective::bytecode::CompiledAnnotation {
+                    name: "AudioStaff".into(),
+                    generic_type: None,
+                    arguments: vec![],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let classes = vec![cc];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        let staff = score.stave[0].as_any().downcast_ref::<AudioStaff>().unwrap();
+        assert_eq!(staff.periods.len(), 1);
+        let audio = staff.periods[0].audio_injector.as_ref().expect("应提取音频注入器");
+        assert_eq!(audio["__type"], "GorgeFramework.AudioAsset");
+        assert_eq!(audio["name"], "audio:Song");
+    }
+
+    #[test]
+    fn test_p02_nested_inject_object_field_name_recovered_by_position() {
+        // 父类声明：name(String) + drawStartX(Object) + drawEndX(Object)
+        let lane_cc = CompiledClass {
+            class_type: GorgeType::class("Test.Lane", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![],
+            constructors: vec![],
+            injector_fields: vec![
+                gorge_core::objective::bytecode::InjectorFieldDef {
+                    name: "name".into(),
+                    value_type: ValueType::String,
+                    has_default: false,
+                    default_value: None,
+                },
+                gorge_core::objective::bytecode::InjectorFieldDef {
+                    name: "drawStartX".into(),
+                    value_type: ValueType::Object,
+                    has_default: false,
+                    default_value: None,
+                },
+                gorge_core::objective::bytecode::InjectorFieldDef {
+                    name: "drawEndX".into(),
+                    value_type: ValueType::Object,
+                    has_default: false,
+                    default_value: None,
+                },
+            ],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 0,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations: HashMap::new(),
+            constructor_annotations: HashMap::new(),
+        };
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation { name: "Chart".into(), parameters: vec![] },
+        ]);
+        let staff_cc = CompiledClass {
+            class_type: GorgeType::class("Test.LaneStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod {
+                    name: "Period".into(),
+                    codes: vec![load_injector_constant_code(0)],
+                    local_count: 0,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                InjectorConstantDef {
+                    class_name: "Array".into(),
+                    fields: vec![
+                        InjectorConstField::InjectObject(
+                            "Test.Lane".into(),
+                            vec![
+                                InjectorConstField::String("name".into(), "L1".into()),
+                                InjectorConstField::InjectObject(
+                                    "GorgeFramework.VariableFloat".into(),
+                                    vec![InjectorConstField::Float("baseValue".into(), 1.0)],
+                                ),
+                                InjectorConstField::InjectObject(
+                                    "GorgeFramework.VariableFloat".into(),
+                                    vec![InjectorConstField::Float("baseValue".into(), 2.0)],
+                                ),
+                            ],
+                        ),
+                    ],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                gorge_core::objective::bytecode::CompiledAnnotation {
+                    name: "ElementStaff".into(),
+                    generic_type: None,
+                    arguments: vec![("form".into(), "F".into())],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let classes = vec![lane_cc, staff_cc];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        let staff = score.stave[0].as_any().downcast_ref::<ElementStaff>().unwrap();
+        let lane = &staff.periods[0].elements[0];
+        assert_eq!(lane["__type"], "Test.Lane");
+        assert_eq!(lane["name"], "L1");
+        // 嵌套注入器按声明位置恢复字段名：drawStartX / drawEndX
+        assert_eq!(lane["drawStartX"]["__type"], "GorgeFramework.VariableFloat");
+        assert!((lane["drawStartX"]["baseValue"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(lane["drawEndX"]["__type"], "GorgeFramework.VariableFloat");
+        assert!((lane["drawEndX"]["baseValue"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_p02_native_injector_fields_meta_available() {
+        // 宏生成的 native 注入器字段元数据应可用于声明查询
+        let provider = InjectorFieldMetaProvider::build(&[]);
+        // P0-8：注入器字段名对齐谱面存根的 Gorge 名（baseValue/variationCurve）
+        let variable_float = provider
+            .lookup("GorgeFramework.VariableFloat")
+            .expect("VariableFloat 应有元数据");
+        let vf_names: Vec<&str> = variable_float.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(vf_names, ["baseValue", "variationCurve"]);
+        assert!(variable_float.iter().any(|(name, vt)|
+            name == "baseValue" && *vt == ValueType::Float));
+        assert!(variable_float.iter().any(|(name, vt)|
+            name == "variationCurve" && *vt == ValueType::Object));
+        let vector2 = provider
+            .lookup("GorgeFramework.Vector2")
+            .expect("Vector2 应有元数据");
+        assert!(vector2.iter().any(|(name, _)| name == "x"));
+        assert!(vector2.iter().any(|(name, _)| name == "y"));
+    }
+
+    #[test]
+    fn test_p08_curve_family_injector_fields_meta() {
+        // P0-8：曲线/向量族 native 类的注入器字段元数据对齐谱面存根
+        let provider = InjectorFieldMetaProvider::build(&[]);
+
+        // CubicHermiteSpline：6 个注入器字段，声明序与 Gorge 名对齐存根
+        let spline = provider
+            .lookup("GorgeFramework.CubicHermiteSpline")
+            .expect("CubicHermiteSpline 应有元数据");
+        let spline_names: Vec<&str> = spline.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            spline_names,
+            ["startPoint", "startTangent", "startWeight", "endPoint", "endTangent", "endWeight"]
+        );
+        assert_eq!(spline[0].1, ValueType::Object);
+        assert_eq!(spline[3].1, ValueType::Object);
+        assert_eq!(spline[1].1, ValueType::Float);
+
+        // LerpColorCurve：两个对象注入器字段
+        let lerp = provider
+            .lookup("GorgeFramework.LerpColorCurve")
+            .expect("LerpColorCurve 应有元数据");
+        let lerp_names: Vec<&str> = lerp.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(lerp_names, ["colorPoints", "progressCurve"]);
+        assert!(lerp.iter().all(|(_, vt)| *vt == ValueType::Object));
+
+        // PeriodicFunctionCurve：leftClosed 默认值 true（直接查宏生成的默认值方法）
+        let periodic = provider
+            .lookup("GorgeFramework.PeriodicFunctionCurve")
+            .expect("PeriodicFunctionCurve 应有元数据");
+        let periodic_names: Vec<&str> = periodic.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(periodic_names, ["functionCurve", "startX", "endX", "leftClosed"]);
+        assert!(
+            crate::system::native::function_curve_combinators::PeriodicFunctionCurve::gorge_injector_default_left_closed(),
+            "PeriodicFunctionCurve.leftClosed 默认值应为 true"
+        );
+    }
+
+    #[test]
+    fn test_p02_method_without_injector_constant_yields_empty_elements() {
+        // 方法字节码中无 LoadInjectorConstant（如纯计算动态生成）时，元素列表为空
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation { name: "Chart".into(), parameters: vec![] },
+        ]);
+        let cc = CompiledClass {
+            class_type: GorgeType::class("Test.DynamicStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod { name: "Period".into(), codes: vec![], local_count: 0 },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                gorge_core::objective::bytecode::CompiledAnnotation {
+                    name: "ElementStaff".into(),
+                    generic_type: None,
+                    arguments: vec![],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let classes = vec![cc];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        let staff = score.stave[0].as_any().downcast_ref::<ElementStaff>().unwrap();
+        assert_eq!(staff.periods.len(), 1);
+        assert!(staff.periods[0].elements.is_empty(),
+            "无注入器常量的方法应得到空元素列表");
+    }
+
+    // ==================== P0-3: config 注入器完整实例化测试 ====================
+
+    /// 真实谱面的 `@Song` 注解形态：`config` 参数是 `PeriodConfig^` 注入器字面量，
+    /// 编译器将其生成为隐藏方法（`__annotation_Song_config`，全局 ID = method_start_id + 1），
+    /// 注解参数记录为 `Delegate(hidden_id)`。音频乐段的 config 必须沿该路径完整实例化，
+    /// 而不是回退默认配置或近似推导。
+    #[test]
+    fn test_p03_song_config_resolved_from_hidden_method_delegate() {
+        use gorge_core::objective::declaration::AnnotationValue;
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            // @Song 的 config 参数指向隐藏方法 __annotation_Song_config（全局 ID 1）
+            MethodAnnotation {
+                name: "Song".into(),
+                parameters: vec![("config".into(), AnnotationValue::Delegate(1))],
+            },
+        ]);
+
+        let cc = CompiledClass {
+            class_type: GorgeType::class("Test.SongStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            // methods[0]=GetSong；methods[1]=隐藏方法 __annotation_Song_config（S3b 插入）
+            methods: vec![
+                CompiledMethod {
+                    name: "GetSong".into(),
+                    codes: vec![load_injector_constant_code(0)],
+                    local_count: 0,
+                },
+                CompiledMethod {
+                    name: "__annotation_Song_config".into(),
+                    codes: vec![load_injector_constant_code(1)],
+                    local_count: 0,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 2,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                // constants[0]：@Song 方法返回的音频资产注入器
+                InjectorConstantDef {
+                    class_name: "GorgeFramework.AudioAsset".into(),
+                    fields: vec![InjectorConstField::String("name".into(), "audio:Song".into())],
+                },
+                // constants[1]：隐藏方法返回的 PeriodConfig 注入器
+                InjectorConstantDef {
+                    class_name: "GorgeFramework.PeriodConfig".into(),
+                    fields: vec![
+                        InjectorConstField::Float("timeOffset".into(), 0.373),
+                        InjectorConstField::Float("minLength".into(), 30.0),
+                        InjectorConstField::Bool("active".into(), false),
+                    ],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                gorge_core::objective::bytecode::CompiledAnnotation {
+                    name: "AudioStaff".into(),
+                    generic_type: None,
+                    arguments: vec![],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let classes = vec![cc];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        let staff = score.stave[0].as_any().downcast_ref::<AudioStaff>().unwrap();
+        assert_eq!(staff.periods.len(), 1);
+        let period = &staff.periods[0];
+
+        // config 应来自隐藏方法返回的 PeriodConfig 注入器常量（完整实例化路径）
+        assert!((period.period_data.config.time_offset - 0.373).abs() < 1e-6,
+            "config 应从注入器常量解析 timeOffset，实际 {:?}", period.period_data.config);
+        assert!((period.period_data.config.min_length - 30.0).abs() < 1e-6);
+        assert!(!period.period_data.config.active);
+        assert_eq!(period.period_data.config_injector["__type"], "GorgeFramework.PeriodConfig");
+        // config_injector 保留完整注入器 JSON（含嵌套结构可扩展性）
+        assert_eq!(period.period_data.config_injector["timeOffset"], 0.373);
+
+        // 音频注入器不受影响
+        let audio = period.audio_injector.as_ref().expect("应提取音频注入器");
+        assert_eq!(audio["__type"], "GorgeFramework.AudioAsset");
+        assert_eq!(audio["name"], "audio:Song");
+    }
+
+    /// 防御回退：`config` 参数不是 Delegate（无法解析）时，回退默认配置并保留
+    /// 注解上的直接标量参数（旧行为）。
+    #[test]
+    fn test_p03_config_delegate_unresolvable_falls_back_to_direct_params() {
+        use gorge_core::objective::declaration::AnnotationValue;
+
+        let mut method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        method_annotations.insert(0, vec![
+            MethodAnnotation {
+                name: "Song".into(),
+                parameters: vec![
+                    // 指向不存在的隐藏方法（方法表仅 1 个，ID 99 越界）
+                    ("config".into(), AnnotationValue::Delegate(99)),
+                    // 直接标量参数（旧路径）
+                    ("timeOffset".into(), AnnotationValue::Float(2.0)),
+                ],
+            },
+        ]);
+
+        let cc = CompiledClass {
+            class_type: GorgeType::class("Test.SongStaff", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![
+                CompiledMethod {
+                    name: "GetSong".into(),
+                    codes: vec![load_injector_constant_code(0)],
+                    local_count: 0,
+                },
+            ],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![
+                InjectorConstantDef {
+                    class_name: "GorgeFramework.AudioAsset".into(),
+                    fields: vec![InjectorConstField::String("name".into(), "audio:Song".into())],
+                },
+            ],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![
+                gorge_core::objective::bytecode::CompiledAnnotation {
+                    name: "AudioStaff".into(),
+                    generic_type: None,
+                    arguments: vec![],
+                },
+            ],
+            method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let classes = vec![cc];
+        let mut score = SimulationScore::default();
+        score.extract_staves_from_compiled(&classes);
+
+        let staff = score.stave[0].as_any().downcast_ref::<AudioStaff>().unwrap();
+        let period = &staff.periods[0];
+        // 回退路径：直接标量参数生效，其余为默认值
+        assert!((period.period_data.config.time_offset - 2.0).abs() < 1e-6);
+        assert!((period.period_data.config.min_length - 10.0).abs() < 1e-6);
+        assert!(period.period_data.config.active);
+        // 音频注入器仍应提取
+        assert!(period.audio_injector.is_some());
     }
 }

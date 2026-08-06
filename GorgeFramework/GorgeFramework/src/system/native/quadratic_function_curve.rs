@@ -8,10 +8,13 @@ use super::function_curve::FunctionCurve;
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct QuadraticFunctionCurve {
     #[gorge_field]
+    #[inject(default = 0.0)]
     pub a: f32,
     #[gorge_field]
+    #[inject(default = 0.0)]
     pub b: f32,
     #[gorge_field]
+    #[inject(default = 0.0)]
     pub c: f32,
 }
 
@@ -21,6 +24,11 @@ impl QuadraticFunctionCurve {
 
 #[gorge_native_impl]
 impl QuadraticFunctionCurve {
+    /// 构造方法 0：无参构造（a/b/c 取注入器字段默认值 0.0）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：以显式参数构造
     #[gorge_ctor]
     pub fn new_ctor(ctx: &mut NativeContext, this: usize, a: f32, b: f32, c: f32) {
         ctx.set_object_float_field(this, QuadraticFunctionCurve::FIELD_INDEX_a, a as f64);

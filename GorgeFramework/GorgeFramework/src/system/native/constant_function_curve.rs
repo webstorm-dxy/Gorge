@@ -8,6 +8,7 @@ use super::function_curve::FunctionCurve;
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct ConstantFunctionCurve {
     #[gorge_field]
+    #[inject(default = 0.0)]
     pub value: f32,
 }
 
@@ -17,6 +18,11 @@ impl ConstantFunctionCurve {
 
 #[gorge_native_impl]
 impl ConstantFunctionCurve {
+    /// 构造方法 0：无参构造（value 取注入器字段默认值 0.0）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：以显式值构造
     #[gorge_ctor]
     pub fn new_ctor(ctx: &mut NativeContext, this: usize, value: f32) {
         ctx.set_object_float_field(this, ConstantFunctionCurve::FIELD_INDEX_value, value as f64);

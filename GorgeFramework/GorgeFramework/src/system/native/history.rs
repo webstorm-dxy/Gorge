@@ -5,7 +5,8 @@
 //! HistoryItem 以枚举表达 C# 中多种 IHistoryItem 实现。
 
 use gorge_macros::{gorge_native_class, gorge_native_impl};
-use gorge_core::objective::native::NativeContext;
+use gorge_core::objective::native::{NativeClass, NativeContext};
+use gorge_core::system::native::array::ObjectArrayClass;
 
 // ==================== HistoryItem 枚举 ====================
 
@@ -143,7 +144,9 @@ impl HistoryStack {
     ///
     /// 对齐 C# `PopUntil`。从栈顶弹出 chart_time >= target_chart_time 的历史项，
     /// 依次调用对应的 revert 方法（InputGraph.revert_go_edge / TimeStack.revert_push / TimeStack.revert_pop）。
-    /// 返回受影响的动作对象 ID 列表（目前仅占位，S7 完善 automaton 相关逻辑）。
+    /// 每当弹出一个 TimeStackPopHistory，就记录受影响的自动机 ID（对齐 C#：弹栈产生
+    /// `UpdatePendingDetectionCondition(automaton, direction)` 动作，作用于该 automaton）。
+    /// 返回装有所受影响自动机 ID 的 ObjectArray 对象 ID（列表为空返回 0）。
     #[gorge_method]
     pub fn pop_until(
         ctx: &mut NativeContext,
@@ -178,13 +181,13 @@ impl HistoryStack {
             p.stack.truncate(keep_idx);
         });
 
-        // 对 TimeStackPopHistory 变体，创建 UpdatePendingDetectionCondition 动作
-        // 对齐 C# HistoryStack.PopUntil：弹栈时若为 TimeStackPopHistory 则产生更新动作
-        let mut actions: Vec<usize> = Vec::new();
+        // 对 TimeStackPopHistory 变体，记录受影响的自动机 ID
+        // 对齐 C# HistoryStack.PopUntil：弹栈时若为 TimeStackPopHistory 则产生
+        // UpdatePendingDetectionCondition(automaton, direction) 动作，作用于该 automaton
+        let mut affected_automata: Vec<usize> = Vec::new();
         for item in &items_to_revert {
             if matches!(item, HistoryItem::TimeStackPop { .. }) {
-                // 用特殊标记（automaton_id 的高位标记）表示 UpdatePendingDetectionCondition
-                actions.push(automaton_id | 0x8000_0000);
+                affected_automata.push(automaton_id);
             }
         }
 
@@ -225,8 +228,19 @@ impl HistoryStack {
             }
         }
 
-        // 返回动作计数（调用方可通过 actions 列表了解需要更新待决条件的自动机）
-        actions.len()
+        // 将受影响的自动机 ID 列表封装为 ObjectArray 返回（空列表返回 0）
+        if affected_automata.is_empty() {
+            0
+        } else {
+            let arr_id = ObjectArrayClass.do_construct_native(ctx, None, 0);
+            if let Some(payload) = ctx.vm.native_payloads.get_mut(&arr_id) {
+                use gorge_core::system::native::array::ObjectArray;
+                if let Some(arr) = payload.downcast_mut::<ObjectArray>() {
+                    arr.items = affected_automata;
+                }
+            }
+            arr_id
+        }
     }
 
     /// 栈深度
@@ -336,10 +350,39 @@ mod tests {
         fx.vm.param_pool.set_object_param(1, 0); // input_graph_id
         fx.vm.param_pool.set_object_param(2, 0); // time_stack_id
         { let mut ctx = fx.ctx(); hs.invoke_native_method(&mut ctx, id, 4); }
+        // 弹出的 3 项均为 TimeStackPush（非 TimeStackPop），受影响自动机列表应为空 → 返回 0
+        assert_eq!(fx.vm.param_pool.get_object_return(), 0);
         { let mut ctx = fx.ctx(); hs.invoke_native_method(&mut ctx, id, 5); }
         assert_eq!(fx.vm.param_pool.get_int_return(), 1); // 剩余 1 项
 
         // revert_time = 1.0
         { let mut ctx = fx.ctx(); hs.invoke_native_method(&mut ctx, id, 0); }
+    }
+
+    #[test]
+    fn test_history_stack_pop_until_affected_time_stack_pop() {
+        let hs = HistoryStack { _placeholder: false };
+        let mut fx = Fixture::new();
+        let id = { let mut ctx = fx.ctx(); hs.do_construct_native(&mut ctx, None, 0) };
+        // push 2 个 TimeStackPop 历史项（弹栈历史），时间为 1.0、2.0
+        for (t, item) in [(1.0f32, 100usize), (2.0, 200)] {
+            fx.vm.param_pool.set_float_param(0, t as f64);
+            fx.vm.param_pool.set_object_param(0, item);
+            fx.vm.param_pool.set_bool_param(0, false);
+            fx.vm.param_pool.set_string_param(0, "mode".to_string());
+            { let mut ctx = fx.ctx(); hs.invoke_native_method(&mut ctx, id, 3); } // push_time_stack_pop
+        }
+        // pop_until(1.5) 弹出 time >= 1.5 的项（仅 time=2.0 的 TimeStackPop），
+        // 每个 TimeStackPop 记录一次受影响自动机 → 列表含 1 个 automaton_id=77
+        fx.vm.param_pool.set_float_param(0, 1.5);
+        fx.vm.param_pool.set_object_param(0, 77); // automaton_id
+        fx.vm.param_pool.set_int_param(0, 0); // direction
+        fx.vm.param_pool.set_object_param(1, 0); // input_graph_id
+        fx.vm.param_pool.set_object_param(2, 0); // time_stack_id
+        { let mut ctx = fx.ctx(); hs.invoke_native_method(&mut ctx, id, 4); }
+        let arr_id = fx.vm.param_pool.get_object_return();
+        assert_ne!(arr_id, 0, "含 TimeStackPop 时 pop_until 应返回非空受影响数组 ID");
+        let items = fx.ctx().object_array_items(arr_id);
+        assert_eq!(items, vec![77], "受影响自动机列表应包含 1 个 automaton_id=77（纯 ID，无标志位）");
     }
 }

@@ -37,13 +37,13 @@ pub struct SignalDetectionCondition {
 /// S7 扩展：增加 `vm: &mut VirtualMachine` 参数以支持 ElementSimulator 等原生类模拟器。
 pub trait ISimulator: Send + Sync {
     /// 计算前向异步模拟的目标谱面时间
-    fn forward_async_simulation_target(&self, chart_time: f32, runtime: &GorgeSimulationRuntime) -> f32;
+    fn forward_async_simulation_target(&self, chart_time: f32, runtime: &GorgeSimulationRuntime, vm: &mut VirtualMachine) -> f32;
 
     /// 计算后向异步模拟的目标谱面时间
-    fn backward_async_simulation_target(&self, chart_time: f32, runtime: &GorgeSimulationRuntime) -> f32;
+    fn backward_async_simulation_target(&self, chart_time: f32, runtime: &GorgeSimulationRuntime, vm: &mut VirtualMachine) -> f32;
 
     /// 计算零速异步模拟的目标模拟时间
-    fn infinitesimal_async_simulation_target(&self, chart_time: f32, runtime: &GorgeSimulationRuntime) -> f32;
+    fn infinitesimal_async_simulation_target(&self, chart_time: f32, runtime: &GorgeSimulationRuntime, vm: &mut VirtualMachine) -> f32;
 
     /// 前向模拟：从 chart_time_from 到 chart_time_to
     fn forward_simulate(

@@ -8,10 +8,14 @@ use super::function_curve::FunctionCurve;
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct ArcFunctionCurve {
     #[gorge_field]
+    #[inject(name = "chordStart", default = 0.0)]
     pub chord_start: f32,
     #[gorge_field]
+    #[inject(name = "chordEnd", default = 1.0)]
     pub chord_end: f32,
+    /// 圆心角（弧度制），默认 π（对齐 C# 的 180°）
     #[gorge_field]
+    #[inject(name = "angle", default = std::f32::consts::PI)]
     pub angle: f32,
 }
 
@@ -23,6 +27,11 @@ impl ArcFunctionCurve {
 
 #[gorge_native_impl]
 impl ArcFunctionCurve {
+    /// 构造方法 0：无参构造（字段取注入器默认值）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：以显式参数构造
     #[gorge_ctor]
     pub fn new_ctor(ctx: &mut NativeContext, this: usize, cs: f32, ce: f32, angle: f32) {
         ctx.set_object_float_field(this, ArcFunctionCurve::FIELD_INDEX_chord_start, cs as f64);

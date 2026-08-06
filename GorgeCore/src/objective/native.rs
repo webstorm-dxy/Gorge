@@ -661,6 +661,56 @@ pub trait NativeClass: Debug + Send + Sync {
     fn make_empty_object(self: Arc<Self>) -> RuntimeObject {
         RuntimeObject::new_simple(self.full_name().to_string(), self.field_type_count())
     }
+
+    /// 注入器字段元数据（字段名 + 值类型，按声明顺序）。
+    ///
+    /// 宏生成的 native 类会覆盖本方法；手写实现默认返回空表。
+    /// 供谱面数据提取等宿主侧场景将注入器常量字段与声明按位置对齐。
+    fn injector_fields_meta(&self) -> &'static [(&'static str, crate::virtual_machine::ir::ValueType)] {
+        &[]
+    }
+
+    /// 构造本 native 类的 `ClassDeclaration`（供宿主侧按名解析注入器字段）。
+    ///
+    /// `injector_fields` 与 `injector_field_type_count` 由 `injector_fields_meta()`
+    /// 推导（P0-8）：宿主侧（如 `ChartManager::materialize_injector`）在谱面
+    /// JSON 物化时以「字段名」逐字段匹配声明，native 类注册进 `class_table`
+    /// 的声明因此必须包含与 Gorge 谱面一致的字段名与类型计数。
+    fn declaration(&self) -> crate::objective::declaration::ClassDeclaration {
+        use crate::objective::types::TypeCount;
+        use crate::virtual_machine::ir::ValueType;
+
+        let meta = self.injector_fields_meta();
+        let mut type_count = TypeCount::zero();
+        let injector_fields: Vec<crate::objective::declaration::InjectorFieldInfo> = meta.iter()
+            .map(|(name, vt)| {
+                let basic = match vt {
+                    ValueType::Int => crate::objective::types::BasicType::Int,
+                    ValueType::Float => crate::objective::types::BasicType::Float,
+                    ValueType::Bool => crate::objective::types::BasicType::Bool,
+                    ValueType::String => crate::objective::types::BasicType::String,
+                    ValueType::Object => crate::objective::types::BasicType::Object,
+                };
+                match vt {
+                    ValueType::Int => type_count.int_count += 1,
+                    ValueType::Float => type_count.float_count += 1,
+                    ValueType::Bool => type_count.bool_count += 1,
+                    ValueType::String => type_count.string_count += 1,
+                    ValueType::Object => type_count.object_count += 1,
+                }
+                crate::objective::declaration::InjectorFieldInfo {
+                    name: name.to_string(),
+                    field_type: crate::objective::types::GorgeType::new(basic),
+                    has_default_value: false,
+                }
+            })
+            .collect();
+
+        let mut decl = crate::objective::declaration::ClassDeclaration::dummy(self.full_name().to_string());
+        decl.injector_fields = injector_fields;
+        decl.injector_field_type_count = type_count;
+        decl
+    }
 }
 
 #[cfg(test)]

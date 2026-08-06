@@ -132,14 +132,16 @@ impl RuntimeFormContainer {
     ///
     /// 遍历编译类，检查静态方法的注解：
     /// 1. **`@Form` 注解** — 标记模态入口方法，提取 `name`、`version` 参数
-    ///    和返回的元素类型列表（`String[]`）
+    ///    并通过 VM 调用静态方法获取返回的元素类型列表（`String[]`）
     /// 2. **`@InstantAudio` 注解** — 标记即时音效方法，提取 `name` 参数
     ///
     /// # 参数
     /// - `compiled_classes`: 编译后的类列表，须已包含方法注解信息
+    /// - `vm`: 虚拟机实例，须已注册目标类；用于调用 `@Form` 静态方法
     pub fn scan_forms_from_compiled(
         &mut self,
         compiled_classes: &[gorge_core::objective::bytecode::CompiledClass],
+        vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
     ) {
         for cc in compiled_classes {
             let class_name = cc.class_type.full_name().to_string();
@@ -160,10 +162,12 @@ impl RuntimeFormContainer {
                                 .unwrap_or_else(|| "1.0".to_string());
 
                             // 元素类型列表：
-                            // C# 中通过调用该静态方法获取 String[] 返回值
-                            // Rust 侧从方法的 injector_constants 推导
-                            // TODO: 完整实现需注入器实例化系统调用静态方法
-                            let element_types = extract_element_types_from_method(cc, *method_id);
+                            // 通过 VM 调用该静态方法获取 String[] 返回值
+                            let element_types = extract_element_types_from_method(
+                                vm,
+                                &class_name,
+                                *method_id,
+                            );
 
                             let form_info = FormInformation::new(
                                 form_name,
@@ -196,8 +200,10 @@ impl RuntimeFormContainer {
             }
 
             // 扫描构造方法注解（为 Element 子类）
-            // TODO: 检测类是否继承自 GorgeFramework.Element
-            self.scan_element_container_from_class(cc, &class_name);
+            // P0-5：检测类是否继承自 GorgeFramework.Element，防止非元素类混入
+            if is_element_subclass(&class_name, vm) {
+                self.scan_element_container_from_class(cc, &class_name);
+            }
         }
     }
 
@@ -207,12 +213,17 @@ impl RuntimeFormContainer {
         cc: &gorge_core::objective::bytecode::CompiledClass,
         class_name: &str,
     ) {
-        // 检查是否存在任何 Element 相关的构造方法注解
+        // 检查是否存在任何 Element 相关的构造方法/静态方法注解：
+        // 生成方式注解（@InitializeGenerate/@ForwardTimedGenerate/@BackwardTimedGenerate）
+        // 位于构造注解表；@PeriodModifier 位于静态方法注解表（C# 中两者
+        // 分别来自 Constructors/StaticMethods 的注解，等价判定）。
         let has_element_annotations = cc.constructor_annotations.values()
             .any(|anns| anns.iter().any(|a| matches!(
                 a.name.as_str(),
-                "PeriodModifier" | "InitializeGenerate" | "ForwardTimedGenerate" | "BackwardTimedGenerate"
-            )));
+                "InitializeGenerate" | "ForwardTimedGenerate" | "BackwardTimedGenerate"
+            )))
+            || cc.method_annotations.values()
+                .any(|anns| anns.iter().any(|a| a.name == "PeriodModifier"));
 
         if !has_element_annotations {
             return;
@@ -271,6 +282,47 @@ impl RuntimeFormContainer {
 
 // ==================== 辅助函数 ====================
 
+/// 判定类是否为 `GorgeFramework.Element` 的子类（P0-5，对齐 C# `ClassDeclaration.Is`）。
+///
+/// C# 的声明链包含 native 父类（`Note : Element`）；Rust 侧 native 类注册表
+/// （`native_class_table`）不含继承信息，且 loader 只把编译类父类注册进
+/// `class_super_name`（native 父类的父类断链）。因此除沿注册链上溯外，
+/// 将框架固定的两个 native 根类 `Element` 与 `Note`（`Note : Element`）
+/// 作为硬编码终点判定。
+pub fn is_element_subclass(
+    class_name: &str,
+    vm: &gorge_core::virtual_machine::vm::VirtualMachine,
+) -> bool {
+    let is_root = |name: &str| {
+        let simple = name.rsplit('.').next().unwrap_or(name);
+        simple == "Element" || simple == "Note"
+    };
+    // 自身就是根（防御：native 类本身不会出现在编译类/注入器路径中）
+    if is_root(class_name) {
+        return true;
+    }
+
+    // 沿 class_super_name 链上溯。注册方约定不一：loader 以短类名注册
+    // （类 → 父类短名），测试/部分路径可能以全名注册，因此对每一层
+    // 都同时尝试「全名 + 简单名」两种形式。
+    let mut current = class_name.to_string();
+    let mut guard = 0;
+    while guard <= 1000 {
+        let simple_current = current.rsplit('.').next().unwrap_or(&current).to_string();
+        let parent = vm.class_super_name.get(&current)
+            .or_else(|| vm.class_super_name.get(&simple_current))
+            .cloned();
+        let Some(parent) = parent else { return false };
+
+        if is_root(&parent) {
+            return true;
+        }
+        current = parent;
+        guard += 1;
+    }
+    false
+}
+
 /// 将注解参数值转换为字符串
 fn annotation_value_to_string(value: &gorge_core::objective::declaration::AnnotationValue) -> Option<String> {
     match value {
@@ -282,17 +334,40 @@ fn annotation_value_to_string(value: &gorge_core::objective::declaration::Annota
     }
 }
 
-/// 从编译类中提取 @Form 方法返回的元素类型列表（骨架实现）
+/// 从编译类中提取 @Form 方法返回的元素类型列表
 ///
-/// 完整实现需调用静态方法获取 `String[]` 返回值，
-/// 当前从方法签名和注入器常量推导。
+/// 通过 VM 调用对应的静态方法，获取 `String[]` 返回值并转换为 `Vec<String>`。
+/// 若方法不存在、执行失败或返回值不是字符串数组，则返回空列表。
+///
+/// # 参数
+/// - `vm`: 虚拟机实例，须已注册目标类
+/// - `class_name`: 目标类全名
+/// - `method_global_id`: 方法全局 ID（`method_annotations` 的键）
+///
+/// # 返回值
+/// 元素类型名字符串列表；失败时返回空 Vec
 fn extract_element_types_from_method(
-    _cc: &gorge_core::objective::bytecode::CompiledClass,
-    _method_id: usize,
+    vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
+    class_name: &str,
+    method_global_id: usize,
 ) -> Vec<String> {
-    // TODO: 完整实现需通过 VM 调用该方法获取 String[] 返回值
-    // 当前返回空列表作为占位
-    Vec::new()
+    // 1. 调用静态方法（无参数、无 this）
+    if vm.invoke_method_by_id(class_name, None, method_global_id).is_err() {
+        return Vec::new();
+    }
+
+    // 2. 读取返回值对象 ID（0 表示 null）
+    let array_obj_id = match vm.return_object {
+        Some(id) if id != 0 => id,
+        _ => return Vec::new(),
+    };
+
+    // 3. 从 native 载荷表 downcast 为 StringArray 并克隆元素
+    vm.native_payloads
+        .get(&array_obj_id)
+        .and_then(|p| p.downcast_ref::<gorge_core::system::native::array::StringArray>())
+        .map(|arr| arr.items.clone())
+        .unwrap_or_default()
 }
 
 impl Default for RuntimeFormContainer {
@@ -416,23 +491,26 @@ mod tests {
     fn test_f3_scan_forms_from_compiled_form_extracted() {
         let classes = vec![make_compiled_class_with_forms()];
         let mut container = RuntimeFormContainer::new_empty();
-        container.scan_forms_from_compiled(&classes);
+        // 测试类未注册到 VM，invoke_method_by_id 会失败，element_types 为空
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        container.scan_forms_from_compiled(&classes, &mut vm);
 
         // 验证 Form 提取
         assert_eq!(container.forms.len(), 1, "应提取 1 个 Form");
         let form = container.forms.get("NoteForm").unwrap();
         assert_eq!(form.name, "NoteForm");
         assert_eq!(form.version, "2.0");
-        // 元素类型列表当前为空（TODO: 需 VM 调用）
+        // 类未注册到 VM，静态方法调用失败，元素类型列表为空
         assert!(form.element_types.is_empty(),
-            "当前为骨架实现，元素类型列表应为空");
+            "未注册 VM 时元素类型列表应为空");
     }
 
     #[test]
     fn test_f3_scan_forms_from_compiled_instant_audio() {
         let classes = vec![make_compiled_class_with_forms()];
         let mut container = RuntimeFormContainer::new_empty();
-        container.scan_forms_from_compiled(&classes);
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        container.scan_forms_from_compiled(&classes, &mut vm);
 
         // 验证 InstantAudio 提取
         assert_eq!(container.instant_audio_methods.len(), 1,
@@ -446,9 +524,112 @@ mod tests {
     fn test_f3_scan_forms_from_compiled_empty_classes() {
         let classes: Vec<gorge_core::objective::bytecode::CompiledClass> = vec![];
         let mut container = RuntimeFormContainer::new_empty();
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
         // 应不 panic
-        container.scan_forms_from_compiled(&classes);
+        container.scan_forms_from_compiled(&classes, &mut vm);
         assert!(container.forms.is_empty());
         assert!(container.instant_audio_methods.is_empty());
+    }
+
+    // ==================== P0-5: Element 继承判定测试 ====================
+
+    #[test]
+    fn test_p0_5_is_element_subclass_along_registered_chain() {
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        // 短类名注册（loader 约定）：类 → 父类
+        vm.register_class_super("DremuNote", "Note");
+        vm.register_class_super("DremuLane", "Element");
+        // 全名注册（部分测试路径约定）
+        vm.register_class_super("Demo.ChildElement", "Demo.BaseElement");
+        vm.register_class_super("Demo.BaseElement", "GorgeFramework.Element");
+
+        // 直接/间接继承 Element 的类均判定为元素
+        assert!(is_element_subclass("DremuLane", &vm));
+        assert!(is_element_subclass("DremuNote", &vm), "Note 是 Element 子类（native 根）");
+        assert!(is_element_subclass("Demo.ChildElement", &vm), "沿多级全名链上溯");
+        // 非元素类
+        assert!(!is_element_subclass("Song", &vm));
+        assert!(!is_element_subclass("GorgeFramework.FormDef", &vm));
+        // 断链类（父类不在注册表）
+        assert!(!is_element_subclass("MysteryClass", &vm));
+    }
+
+    #[test]
+    fn test_p0_5_scan_element_container_filters_non_element_classes() {
+        use gorge_core::objective::bytecode::CompiledClass;
+        use gorge_core::objective::declaration::MethodAnnotation;
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::CompiledMethod;
+        use std::collections::HashMap;
+
+        // 元素子类：带 @PeriodModifier 静态方法
+        let mut elem_method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        elem_method_annotations.insert(0, vec![
+            MethodAnnotation { name: "PeriodModifier".into(), parameters: vec![] },
+        ]);
+        let elem_class = CompiledClass {
+            class_type: GorgeType::class("Dremu.DremuTap", None),
+            is_native: false,
+            super_class_name: Some("Note".into()),
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![CompiledMethod { name: "PeriodModifier".into(), codes: vec![], local_count: 0 }],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations: elem_method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+        // 非元素类：同样带 @PeriodModifier，应被过滤
+        let mut non_elem_method_annotations: HashMap<usize, Vec<MethodAnnotation>> = HashMap::new();
+        non_elem_method_annotations.insert(0, vec![
+            MethodAnnotation { name: "PeriodModifier".into(), parameters: vec![] },
+        ]);
+        let non_elem_class = CompiledClass {
+            class_type: GorgeType::class("Dremu.Song", None),
+            is_native: false,
+            super_class_name: None,
+            super_interfaces: vec![],
+            field_counts: TypeCount::zero(),
+            methods: vec![CompiledMethod { name: "PeriodModifier".into(), codes: vec![], local_count: 0 }],
+            constructors: vec![],
+            injector_fields: vec![],
+            delegate_impls: vec![],
+            method_start_id: 0,
+            method_count_total: 1,
+            constructor_start_id: 0,
+            method_override_id: vec![],
+            field_start_counts: [0; 5],
+            interface_method_impl_id: vec![],
+            injector_constants: vec![],
+            injector_constructor_impl_id: vec![],
+            field_initializers: vec![],
+            annotations: vec![],
+            method_annotations: non_elem_method_annotations,
+            constructor_annotations: HashMap::new(),
+        };
+
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        vm.register_class_super("Dremu.DremuTap", "Note");
+        vm.register_class_super("Dremu.Song", "GorgeFramework.AudioAsset");
+
+        let mut container = RuntimeFormContainer::new_empty();
+        container.scan_forms_from_compiled(&[elem_class, non_elem_class], &mut vm);
+
+        // 仅元素子类进入 element_modifiers 表
+        assert!(container.element_modifiers.contains_key("Dremu.DremuTap"),
+            "元素子类应进入修改器表");
+        assert!(!container.element_modifiers.contains_key("Dremu.Song"),
+            "非元素类不应进入修改器表");
     }
 }

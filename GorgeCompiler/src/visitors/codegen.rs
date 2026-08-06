@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use gorge_core::diagnostics::{Diagnostics, Span};
 use gorge_core::virtual_machine::ir::*;
 use gorge_core::objective::bytecode::{DelegateImpl, InjectorConstField, InjectorConstantDef};
+use crate::compiler::InjectorFieldDef;
 
 use crate::frontend::ast::*;
 use crate::compile_context::symbol::*;
@@ -46,6 +47,9 @@ pub struct CodeGenerator<'a> {
     pub diagnostics: &'a mut Diagnostics,
     /// 委托实现列表（Lambda 编译产生）
     pub delegate_impls: &'a mut Vec<DelegateImpl>,
+    /// 各类注入器字段定义（类名 → 字段列表），供 `obj.^field` 按对象类型解析
+    /// （对齐 C# 按对象声明类型查找注入器字段，而非仅当前类）
+    pub injector_fields: &'a HashMap<String, Vec<InjectorFieldDef>>,
     /// 生成的 IR 指令序列
     pub codes: Vec<CodeWithSpan>,
 
@@ -78,6 +82,9 @@ pub struct CodeGenerator<'a> {
     block_stack: Vec<BlockCtx>,
     pending_leaves: Vec<PendingLeave>,
     pub injector_constants: Vec<InjectorConstantDef>,
+    /// 构造时注入的种子常量数（类级池既有条目），`take_injector_constants`
+    /// 只回收该长度之后的**新增**条目，避免把种子重复合并进类级池
+    seed_injector_constants_len: usize,
 
     /// 当前代码块上下文（B-4），影响注入器字段读写权限校验
     pub current_block_context: BlockContext,
@@ -85,10 +92,18 @@ pub struct CodeGenerator<'a> {
 
 impl<'a> CodeGenerator<'a> {
     /// 创建新的代码生成器实例
+    ///
+    /// `seed_injector_constants` 为该类此前代码生成单元（方法/构造/字段初始化器/
+    /// 隐藏方法）已积累的注入器常量，新单元从该长度续写索引——注入器常量的
+    /// 索引在**类内**连续分配，保证类内各方法的 `LoadInjectorConstant` 引用
+    /// 与最终合并进 `CompiledClass.injector_constants` 的条目一一对应
+    /// （P0-7 按类持有）。
     pub fn new(
         symbol_table: &'a SymbolTable,
         diagnostics: &'a mut Diagnostics,
         delegate_impls: &'a mut Vec<DelegateImpl>,
+        injector_fields: &'a HashMap<String, Vec<InjectorFieldDef>>,
+        seed_injector_constants: Vec<InjectorConstantDef>,
     ) -> Self {
         let mut next_local = HashMap::new();
         next_local.insert(ValueType::Int, 0);
@@ -97,10 +112,12 @@ impl<'a> CodeGenerator<'a> {
         next_local.insert(ValueType::String, 0);
         next_local.insert(ValueType::Object, 1); // 0 保留给 this 指针
 
+        let seed_injector_constants_len = seed_injector_constants.len();
         Self {
             symbol_table,
             diagnostics,
             delegate_impls,
+            injector_fields,
             codes: Vec::new(),
             local_vars: HashMap::new(),
             param_vars: HashMap::new(),
@@ -120,9 +137,23 @@ impl<'a> CodeGenerator<'a> {
             generic_substitutions: HashMap::new(),
             block_stack: Vec::new(),
             pending_leaves: Vec::new(),
-            injector_constants: Vec::new(),
+            injector_constants: seed_injector_constants,
+            seed_injector_constants_len,
             current_block_context: BlockContext::Instance,
         }
+    }
+
+    /// 取出本代码生成单元**新增**的注入器常量（供调用方合并进类级常量池）。
+    ///
+    /// 构造时注入的种子常量（类级池既有条目）不取出，只回收本单元新分配的
+    /// 尾部条目，避免种子被重复合并进类级池；与 `into_codes` 配合使用：
+    /// 先取常量、再 `into_codes` 消费自身（P0-7 按类持有）。
+    pub fn take_injector_constants(&mut self) -> Vec<InjectorConstantDef> {
+        let seed_len = self.seed_injector_constants_len;
+        if self.injector_constants.len() <= seed_len {
+            return Vec::new();
+        }
+        self.injector_constants.split_off(seed_len)
     }
 
     /// 获取类类型查找的作用域
@@ -752,15 +783,22 @@ impl<'a> CodeGenerator<'a> {
             Expression::Literal(Literal::Float(v), _) => Some(InjectorConstField::Float(String::new(), *v)),
             Expression::Literal(Literal::Bool(v), _) => Some(InjectorConstField::Bool(String::new(), *v)),
             Expression::Literal(Literal::String(v), _) => Some(InjectorConstField::String(String::new(), v.clone())),
+            Expression::Null(_) => {
+                // null 是编译时常量，映射为 Object 引用 ID 0（VM 约定 0 表示 null），
+                // 使含 null 字段的注入器对象/数组整体可折叠（H3A 真实谱面
+                // `progressCurve : null` 场景）
+                Some(InjectorConstField::Object(String::new(), 0))
+            }
             Expression::InjectorObject { class_name, fields, .. } => {
                 let nested: Vec<InjectorConstField> = fields.iter()
                     .filter_map(|(name, val_expr)| {
                         self.try_eval_const(val_expr).map(|mut cf| {
-                            // 将字段名写入常量字段
+                            // 将字段名写入常量字段（标量变体的首槽位即字段名）；
+                            // InjectObject 首槽位是类名，不可覆写，否则嵌套类型信息丢失
                             match &mut cf {
                                 InjectorConstField::Int(n, _) | InjectorConstField::Float(n, _)
                                 | InjectorConstField::Bool(n, _) | InjectorConstField::String(n, _)
-                                | InjectorConstField::Object(n, _) | InjectorConstField::InjectObject(n, _) => *n = name.clone(),
+                                | InjectorConstField::Object(n, _) => *n = name.clone(),
                                 _ => {}
                             }
                             cf
@@ -912,8 +950,13 @@ impl<'a> CodeGenerator<'a> {
                 self.generate_method_call(receiver, method, arguments, *span)
             }
             Expression::StaticMethodCall { class_name, method, arguments, span } => {
-                // 数组构造 `new int[size]` 或 `new injVar[size]` (H3)
+                // 数组构造 `new int[size]` / `new injVar[size]` (H3) 或
+                // `new Type^[N]{ elem1, ... }` (H3A，带内联注入器元素)
                 if method == "new_array" {
+                    if arguments.len() > 1 {
+                        // 带内联元素：要么折叠为常量数组，要么逐元素写回，绝不静默丢弃
+                        return self.generate_array_constructor_with_elements(class_name, arguments, *span);
+                    }
                     let size_op = if let Some(arg) = arguments.get(0) { self.generate_expression(arg) } else { Operand::int(0) };
                     let temp = self.alloc_temp(ValueType::Object);
                     // 若 class_name 是注入器数组变量，解析其元素类型（如 listB → int）
@@ -975,11 +1018,11 @@ impl<'a> CodeGenerator<'a> {
                     .iter()
                     .filter_map(|(name, val_expr)| {
                         self.try_eval_const(val_expr).map(|mut cf| {
-                            // 将字段名写入常量字段
+                            // 将字段名写入常量字段（InjectObject 保留类名，见 try_eval_const）
                             match &mut cf {
                                 InjectorConstField::Int(n, _) | InjectorConstField::Float(n, _)
                                 | InjectorConstField::Bool(n, _) | InjectorConstField::String(n, _)
-                                | InjectorConstField::Object(n, _) | InjectorConstField::InjectObject(n, _) => *n = name.clone(),
+                                | InjectorConstField::Object(n, _) => *n = name.clone(),
                                 _ => {}
                             }
                             cf
@@ -1064,7 +1107,9 @@ impl<'a> CodeGenerator<'a> {
                 // 3. 创建子生成器，注册 Lambda 参数与捕获变量
                 let mut sub_diags = Diagnostics::new();
                 let mut dummy_delegates = Vec::new();
-                let mut sub_cg = CodeGenerator::new(self.symbol_table, &mut sub_diags, &mut dummy_delegates);
+                // Lambda 方法体是独立的执行单元，不从父上下文的注入器常量池
+                // 续写索引（Lambda 内不允许出现注入器字面量）
+                let mut sub_cg = CodeGenerator::new(self.symbol_table, &mut sub_diags, &mut dummy_delegates, self.injector_fields, Vec::new());
 
                 for param in parameters {
                     let vt = Self::type_ref_to_value_type(&param.param_type);
@@ -1253,6 +1298,76 @@ impl<'a> CodeGenerator<'a> {
                 Operand::Address(this_temp)
             }
         }
+    }
+
+    /// 处理 `new Type^[N]{ elem1, elem2, ... }` 数组构造（带内联元素，H3A）。
+    ///
+    /// 修复真实谱面 `@Chart` 方法 `return new Element^[8]{ ... };` 内联元素被
+    /// 静默丢弃、导致 `score_elements=0` 的 bug：
+    /// - **全部元素可折叠为编译期常量**：生成 `class_name="Array"` 的元素注入器
+    ///   数组常量（对齐 `Expression::InjectorArray` 分支），发射 `LoadInjectorConstant`
+    ///   返回常量数组地址——框架 `fill_element_period_from_method` 据此从常量池
+    ///   恢复每个元素，`@Chart` 不再返回空数组。
+    /// - **元素含运行时会变表达式**：退化为逐元素 `SetArrayElement` 写入，保证
+    ///   任何元素都不丢失（不静默丢弃）。
+    fn generate_array_constructor_with_elements(
+        &mut self,
+        class_name: &str,
+        arguments: &[Expression],
+        span: Span,
+    ) -> Operand {
+        // 尝试将所有内联元素折叠为编译期常量
+        let const_fields: Vec<InjectorConstField> = arguments[1..]
+            .iter()
+            .filter_map(|e| self.try_eval_const(e))
+            .collect();
+        if const_fields.len() == arguments.len() - 1 {
+            // 全部可折叠：生成常量数组，对齐 Expression::InjectorArray 路径
+            let idx = self.injector_constants.len();
+            self.injector_constants.push(InjectorConstantDef {
+                class_name: "Array".to_string(),
+                fields: const_fields,
+            });
+            let temp = self.alloc_temp(ValueType::Object);
+            self.emit(IntermediateCode::new(
+                IntermediateOperator::LoadInjectorConstant(idx),
+                Operand::int(0),
+                None,
+                Some(temp),
+            ), span);
+            return Operand::Address(temp);
+        }
+
+        // 部分元素无法折叠：退化为逐元素写入，保证元素不丢失
+        let size_op = if let Some(arg) = arguments.get(0) {
+            self.generate_expression(arg)
+        } else {
+            Operand::int(0)
+        };
+        let elem_type = if class_name.is_empty() { "Object" } else { class_name };
+        let temp = self.alloc_temp(ValueType::Object);
+        self.emit(IntermediateCode::new(
+            IntermediateOperator::InvokeArrayConstructor,
+            size_op,
+            Some(Operand::string(elem_type.to_string())),
+            Some(temp),
+        ), span);
+        for (i, elem) in arguments[1..].iter().enumerate() {
+            let elem_op = self.generate_expression(elem);
+            self.param_counters.reset();
+            self.emit_set_param(Operand::int(i as i64), span);
+            self.emit_set_param(elem_op, span);
+            self.emit(
+                IntermediateCode::new(
+                    IntermediateOperator::InvokeInstance(1), // array set 方法
+                    Operand::Address(temp),
+                    None,
+                    None,
+                ),
+                span,
+            );
+        }
+        Operand::Address(temp)
     }
 
     /// 生成二元运算代码
@@ -1688,6 +1803,18 @@ impl<'a> CodeGenerator<'a> {
                     ), span);
                     return result_op;
                 }
+                // 字段不在当前类注入器字段中：按对象声明类型解析（同读取路径，
+                // 支持 `@PeriodModifier` 的 `laneInjector.^generateTime = ...`）
+                if let Some((field_idx, vt)) = self.resolve_object_injector_field(object, field) {
+                    let set_op = Self::set_injector_field_op(vt, field_idx);
+                    self.emit(IntermediateCode::new(
+                        set_op,
+                        result_op.clone(),
+                        Some(obj_op),
+                        None,
+                    ), span);
+                    return result_op;
+                }
                 self.diagnostics.emit_error(span, &format!("未定义的注入器字段 `^{}`", field));
                 result_op
             }
@@ -1852,6 +1979,20 @@ impl<'a> CodeGenerator<'a> {
                 );
                 return Operand::Address(temp);
             }
+            // 字段不在当前类注入器字段中：按对象的声明类型解析（对齐 C# 按
+            // 对象声明类型查找注入器字段）。如 `@PeriodModifier` 的
+            // `laneInjector.^generateTime` 中 laneInjector 是 `DremuLane^` 参数，
+            // 字段 `generateTime` 属于 DremuLane 而非当前类。
+            if let Some(field_info) = self.resolve_object_injector_field(object, field_name) {
+                let (field_idx, vt) = field_info;
+                let temp = self.alloc_temp(vt);
+                let load_op = Self::load_injector_field_op(vt, field_idx);
+                self.emit(
+                    IntermediateCode::new(load_op, obj_op, None, Some(temp)),
+                    object.span(),
+                );
+                return Operand::Address(temp);
+            }
             self.diagnostics.emit_error(object.span(), &format!("未定义的注入器字段 `^{}`", field_name));
             return Operand::Address(Address::new(ValueType::Int, 0));
         }
@@ -1913,6 +2054,48 @@ impl<'a> CodeGenerator<'a> {
         }
         self.diagnostics.emit_error(object.span(), format!("未定义的字段 `{}`", member));
         Operand::Address(Address::new(ValueType::Int, 0))
+    }
+
+    /// 按对象的声明类型解析注入器字段（对齐 C# 按对象声明类型查找注入器字段）。
+    ///
+    /// 用于 `obj.^field`（非 this）且字段不属于当前类注入器字段的场景，如
+    /// `@PeriodModifier` 的 `laneInjector.^generateTime`（laneInjector 是
+    /// `DremuLane^` 参数）。运行时注入器字段布局 = 祖先类字段 + 自有字段，
+    /// 故字段索引须沿继承链从根类开始累加偏移。
+    fn resolve_object_injector_field(&self, object: &Expression, field_name: &str) -> Option<(usize, ValueType)> {
+        // 解析对象声明的类名（参数/局部变量经 var_class 记录）
+        let class_name = match object {
+            Expression::Identifier(name, _) => self.var_class.get(name).cloned(),
+            Expression::This(_) => self.current_class_name.clone(),
+            _ => None,
+        }?;
+        // 收集 类 → 祖先 链（本类在前，根类在后）
+        let mut chain: Vec<String> = vec![class_name.clone()];
+        loop {
+            let scope = self.class_lookup_scope();
+            let next = self.symbol_table
+                .lookup_class(scope, chain.last().unwrap())
+                .map(|cid| self.symbol_table.classes.get(cid.0).super_class)
+                .flatten()
+                .map(|cid| self.symbol_table.classes.get(cid.0).name.clone());
+            match next {
+                Some(n) => chain.push(n),
+                None => break,
+            }
+        }
+        // 从根类向下累加注入器字段偏移（运行时布局 = 祖先字段 + 自有字段）
+        let mut offset = 0usize;
+        for cls in chain.iter().rev() {
+            if let Some(fields) = self.injector_fields.get(cls) {
+                for (i, f) in fields.iter().enumerate() {
+                    if f.name == field_name {
+                        return Some((offset + i, f.value_type));
+                    }
+                }
+                offset += fields.len();
+            }
+        }
+        None
     }
 
     /// 生成方法调用代码
@@ -2244,10 +2427,11 @@ impl<'a> CodeGenerator<'a> {
                 .iter()
                 .filter_map(|(name, val_expr)| {
                     self.try_eval_const(val_expr).map(|mut cf| {
+                        // 将字段名写入常量字段（InjectObject 保留类名，见 try_eval_const）
                         match &mut cf {
                             InjectorConstField::Int(n, _) | InjectorConstField::Float(n, _)
                             | InjectorConstField::Bool(n, _) | InjectorConstField::String(n, _)
-                            | InjectorConstField::Object(n, _) | InjectorConstField::InjectObject(n, _) => *n = name.clone(),
+                            | InjectorConstField::Object(n, _) => *n = name.clone(),
                             _ => {}
                         }
                         cf
@@ -2880,12 +3064,17 @@ mod tests {
         Span::new(0, 1, 1, 1, 0)
     }
 
+    /// 测试用空注入器字段表（泄漏以匹配 CodeGenerator 的借用生命周期）
+    fn empty_injector_fields<'a>() -> &'a HashMap<String, Vec<InjectorFieldDef>> {
+        Box::leak(Box::new(HashMap::new()))
+    }
+
     fn make_codegen<'a>(
         st: &'a SymbolTable,
         diags: &'a mut Diagnostics,
         delegates: &'a mut Vec<DelegateImpl>,
     ) -> CodeGenerator<'a> {
-        CodeGenerator::new(st, diags, delegates)
+        CodeGenerator::new(st, diags, delegates, empty_injector_fields(), Vec::new())
     }
 
     #[test]
@@ -3103,7 +3292,7 @@ mod tests {
         -> (ValueType, Vec<IntermediateOperator>) {
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let expr = Expression::Binary {
             left: Box::new(Expression::Literal(l, dummy_span())),
             operator: op,
@@ -3211,7 +3400,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let expr = Expression::Binary {
             left: Box::new(Expression::Null(dummy_span())),
             operator: BinaryOp::Equal,
@@ -3229,7 +3418,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
 
         let result = cg.generate_expression(&Expression::Null(dummy_span()));
 
@@ -3246,7 +3435,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let expr = Expression::Binary {
             left: Box::new(Expression::Null(dummy_span())),
             operator: BinaryOp::NotEqual,
@@ -3265,7 +3454,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let expr = Expression::Binary {
             left: Box::new(Expression::Literal(Literal::String("a".into()), dummy_span())),
             operator: BinaryOp::Subtract,
@@ -3284,7 +3473,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let stmt = Statement::Switch {
             expression: Expression::Literal(Literal::Int(1), dummy_span()),
             cases: vec![CaseBlock {
@@ -3305,7 +3494,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let stmt = Statement::Switch {
             expression: Expression::Literal(Literal::Int(1), dummy_span()),
             cases: vec![CaseBlock {
@@ -3326,7 +3515,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         let stmt = Statement::Switch {
             expression: Expression::Literal(Literal::Float(1.5), dummy_span()),
             cases: vec![CaseBlock {
@@ -3365,7 +3554,7 @@ mod tests {
 
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         cg.set_class_context("Widget");
 
         // Widget.make(1, 2) —— 期望 1 个参数，实际 2 个
@@ -3911,6 +4100,54 @@ mod tests {
     }
 
     #[test]
+    fn test_try_eval_const_nested_inject_object_preserves_class_name() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // Point:{pos: Vector2:{x:1.0, y:2.0}, label: "A"}
+        // 嵌套 InjectObject 首槽位必须保留类名（供下游按类型恢复注入器），
+        // 字段名由父级常量字段的位置对齐恢复。
+        let inner = Expression::InjectorObject {
+            class_name: "Vector2".into(),
+            fields: vec![
+                ("x".into(), Expression::Literal(Literal::Float(1.0), dummy_span())),
+                ("y".into(), Expression::Literal(Literal::Float(2.0), dummy_span())),
+            ],
+            span: dummy_span(),
+        };
+        let expr = Expression::InjectorObject {
+            class_name: "Point".into(),
+            fields: vec![
+                ("pos".into(), inner),
+                ("label".into(), Expression::Literal(Literal::String("A".into()), dummy_span())),
+            ],
+            span: dummy_span(),
+        };
+        let result = cg.try_eval_const(&expr).expect("应成功常量化");
+        let InjectorConstField::InjectObject(class_name, fields) = result else {
+            panic!("应为 InjectObject");
+        };
+        assert_eq!(class_name, "Point");
+        assert_eq!(fields.len(), 2);
+
+        // 嵌套注入器对象：首槽位保留类名 Vector2，而不是被覆写为字段名 pos
+        match &fields[0] {
+            InjectorConstField::InjectObject(nested_class, nested_fields) => {
+                assert_eq!(nested_class, "Vector2", "嵌套注入器必须保留类名");
+                assert_eq!(nested_fields.len(), 2);
+                // 内层标量字段仍带字段名
+                assert!(matches!(&nested_fields[0], InjectorConstField::Float(n, _) if n == "x"));
+                assert!(matches!(&nested_fields[1], InjectorConstField::Float(n, _) if n == "y"));
+            }
+            other => panic!("fields[0] 应为 InjectObject，实际为 {:?}", other),
+        }
+        // 标量字段名保持不变
+        assert!(matches!(&fields[1], InjectorConstField::String(n, _) if n == "label"));
+    }
+
+    #[test]
     fn test_generate_injector_object_with_nested() {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
@@ -3966,6 +4203,126 @@ mod tests {
         assert_eq!(cg.injector_constants.len(), 1);
         assert_eq!(cg.injector_constants[0].class_name, "Array");
         assert_eq!(cg.injector_constants[0].fields.len(), 3);
+    }
+
+    /// `new Element^[N]{ ... }` 且内联元素为常量字面量时，应折叠为
+    /// `class_name="Array"` 的常量并发射 `LoadInjectorConstant`（H3A 修复）。
+    #[test]
+    fn test_new_array_inline_literal_elements_build_constant_array() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // `new int^[3]{ 10, 20, 30 }` → arguments = [size, elem1, elem2, elem3]
+        let expr = Expression::StaticMethodCall {
+            class_name: "array".into(),
+            method: "new_array".into(),
+            arguments: vec![
+                Expression::Literal(Literal::Int(3), dummy_span()),
+                Expression::Literal(Literal::Int(10), dummy_span()),
+                Expression::Literal(Literal::Int(20), dummy_span()),
+                Expression::Literal(Literal::Int(30), dummy_span()),
+            ],
+            span: dummy_span(),
+        };
+
+        let result = cg.generate_expression(&expr);
+        // 应生成一条 LoadInjectorConstant 指令
+        assert_eq!(cg.codes.len(), 1);
+        assert!(matches!(cg.codes[0].code.operator, IntermediateOperator::LoadInjectorConstant(0)));
+        // 常量池应有一个 Array 条目，含全部 3 个元素
+        assert_eq!(cg.injector_constants.len(), 1);
+        assert_eq!(cg.injector_constants[0].class_name, "Array");
+        assert_eq!(cg.injector_constants[0].fields.len(), 3);
+        assert!(matches!(result, Operand::Address(_)));
+        assert!(!diags.has_errors(), "H3A 常量数组路径不应报错");
+    }
+
+    /// `new Element^[N]{ ... }` 且内联元素为注入器对象时，应保留每个元素的
+    /// 注入器字段数据（嵌套 InjectObject），使框架能按元素类型逐字段恢复。
+    #[test]
+    fn test_new_array_inline_injector_objects_build_constant_array() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // 两个 Element 注入器对象元素
+        let make_elem = |label: &str| Expression::InjectorObject {
+            class_name: "Element".into(),
+            fields: vec![("label".into(), Expression::Literal(Literal::String(label.into()), dummy_span()))],
+            span: dummy_span(),
+        };
+        let expr = Expression::StaticMethodCall {
+            class_name: "array".into(),
+            method: "new_array".into(),
+            arguments: vec![
+                Expression::Literal(Literal::Int(2), dummy_span()),
+                make_elem("A"),
+                make_elem("B"),
+            ],
+            span: dummy_span(),
+        };
+
+        let _result = cg.generate_expression(&expr);
+        assert_eq!(cg.codes.len(), 1);
+        assert!(matches!(cg.codes[0].code.operator, IntermediateOperator::LoadInjectorConstant(0)));
+        assert_eq!(cg.injector_constants.len(), 1);
+        assert_eq!(cg.injector_constants[0].class_name, "Array");
+        let fields = &cg.injector_constants[0].fields;
+        assert_eq!(fields.len(), 2);
+        // 每个元素都是 InjectObject，类名保留为 Element，字段数据完整
+        for (i, f) in fields.iter().enumerate() {
+            let expected = if i == 0 { "A" } else { "B" };
+            match f {
+                InjectorConstField::InjectObject(class_name, nested) => {
+                    assert_eq!(class_name, "Element");
+                    assert!(matches!(&nested[0], InjectorConstField::String(n, v) if n == "label" && v == expected));
+                }
+                other => panic!("元素 {} 应为 InjectObject，实际为 {:?}", i, other),
+            }
+        }
+        assert!(!diags.has_errors(), "H3A 常量数组路径不应报错");
+    }
+
+    /// `new Element^[N]{ ... }` 且内联元素含运行时会变表达式时，应退化为
+    /// 逐元素写入（InvokeArrayConstructor + SetArrayElement），不静默丢弃。
+    #[test]
+    fn test_new_array_inline_runtime_elements_are_not_dropped() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // 元素含运行时会变表达式（二元运算非编译期常量）→ 走逐元素写回路径
+        let runtime_elem = Expression::Binary {
+            left: Box::new(Expression::Literal(Literal::Int(10), dummy_span())),
+            operator: BinaryOp::Add,
+            right: Box::new(Expression::Literal(Literal::Int(20), dummy_span())),
+            span: dummy_span(),
+        };
+        let expr = Expression::StaticMethodCall {
+            class_name: "array".into(),
+            method: "new_array".into(),
+            arguments: vec![
+                Expression::Literal(Literal::Int(2), dummy_span()),
+                runtime_elem,
+                Expression::Literal(Literal::Int(30), dummy_span()),
+            ],
+            span: dummy_span(),
+        };
+
+        let _result = cg.generate_expression(&expr);
+        let emitted = cg.codes.iter().map(|c| c.code.operator.clone()).collect::<Vec<_>>();
+        // 首条为 InvokeArrayConstructor，随后每个元素一条 InvokeInstance(1)（array set）
+        assert!(matches!(emitted[0], IntermediateOperator::InvokeArrayConstructor));
+        let set_count = emitted.iter().filter(|op| matches!(op, IntermediateOperator::InvokeInstance(1))).count();
+        assert_eq!(set_count, 2, "两个内联元素都应被写入，不得静默丢弃");
+        // 常量数组路径不应被使用（无 LoadInjectorConstant）
+        assert!(!emitted.iter().any(|op| matches!(op, IntermediateOperator::LoadInjectorConstant(_))));
+        assert!(cg.injector_constants.is_empty());
+        assert!(!diags.has_errors(), "H3A 逐元素写回路径不应报错");
     }
 
     #[test]
@@ -4122,7 +4479,7 @@ mod tests {
         let st = SymbolTable::new();
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         cg.set_injector_context(&[("speed".to_string(), ValueType::Float)]);
 
         // 设置为 FieldInjecting 上下文
@@ -4171,7 +4528,7 @@ mod tests {
 
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         cg.current_class_name = Some("Foo".into());
 
         // 使用 new 表达式
@@ -4213,7 +4570,7 @@ mod tests {
 
         let mut diags = Diagnostics::new();
         let mut delegates = Vec::new();
-        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates);
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, empty_injector_fields(), Vec::new());
         cg.current_class_name = Some("Foo".into());
 
         let new_expr = Expression::New {

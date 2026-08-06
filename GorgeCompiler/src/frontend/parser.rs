@@ -45,6 +45,8 @@ pub struct Parser {
     diagnostics: Diagnostics,
     /// 抑制 `:` 预检（用于 `?:` 表达式的真/假分支解析，防止 `:` 被误认为 Lambda/注入器中缀）
     suppress_colon_precheck: bool,
+    /// 顶层解析循环保护计数（诊断死循环用，临时）
+    top_loop_guard: u32,
 }
 
 impl Parser {
@@ -55,6 +57,7 @@ impl Parser {
             pos: 0,
             diagnostics: Diagnostics::new(),
             suppress_colon_precheck: false,
+            top_loop_guard: 0,
         }
     }
 
@@ -223,6 +226,13 @@ impl Parser {
         let mut members: Vec<TopLevelMember> = Vec::new();
 
         while !self.is_at_end() {
+            self.top_loop_guard += 1;
+            if self.top_loop_guard > 100000 {
+                panic!("[GORGE] 顶层解析疑似死循环 pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+            }
+            if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+                eprintln!("[PARSE] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+            }
             // namespace 声明（可多次出现，后声明的覆盖前面的）
             if self.match_token(&Token::KwNamespace) {
                 if let Ok(ns) = self.parse_qualified_name() {
@@ -492,6 +502,9 @@ impl Parser {
     /// 通过 lookahead 区分三种成员声明：字段、方法和构造函数。
     /// 构造函数由类名标识符后跟 `(` 开头，而字段和方法都由类型引用开头。
     fn parse_class_member(&mut self) -> Result<ClassMember, ()> {
+        if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+            eprintln!("[CMEM] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+        }
         let annotations = self.parse_annotations();
         let modifiers = self.parse_modifiers();
 
@@ -770,6 +783,9 @@ impl Parser {
             members.push(self.parse_class_member()?);
         }
         self.expect_token(&Token::RBrace)?;
+        if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+            eprintln!("[CLS_END] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+        }
 
         Ok(ClassDeclaration {
             annotations,
@@ -965,6 +981,9 @@ impl Parser {
         let mut entries = Vec::new();
         if !self.match_token(&Token::LBracket) { return entries; }
         while !self.is_at_end() && !self.check(&Token::RBracket) {
+            if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+                eprintln!("[META] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+            }
             // 用 parse_type_ref() 替代硬编码类型匹配，支持复杂类型名
             // 如 delegate<float:DremuLane^>、ColorArgb^、FunctionCurve^[]^
             let saved = self.pos;
@@ -1047,6 +1066,9 @@ impl Parser {
 
     /// 解析一条语句
     fn parse_statement(&mut self) -> Result<Statement, ()> {
+        if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+            eprintln!("[STMT] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+        }
         match self.peek() {
             Some(TokenSpan { token: Token::LBrace, .. }) => {
                 let statements = self.parse_block()?;
@@ -1112,9 +1134,15 @@ impl Parser {
         self.expect_token(&Token::LBrace)?;
         let mut statements = Vec::new();
         while !self.check(&Token::RBrace) && !self.is_at_end() {
+            if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+                eprintln!("[BLOCK] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+            }
             statements.push(self.parse_statement()?);
         }
         self.expect_token(&Token::RBrace)?;
+        if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+            eprintln!("[BLOCK_END] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+        }
         Ok(statements)
     }
 
@@ -1288,6 +1316,9 @@ impl Parser {
             Some(self.parse_expression()?)
         };
         self.expect_semicolon()?;
+        if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+            eprintln!("[RET] pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+        }
         Ok(Statement::Return { value, span })
     }
 
@@ -1399,7 +1430,15 @@ impl Parser {
     fn parse_expression_with_precedence(&mut self, min_precedence: u8) -> Result<Expression, ()> {
         let mut left = self.parse_prefix()?;
 
+        let mut loop_guard: u32 = 0;
         while !self.is_at_end() {
+            loop_guard += 1;
+            if loop_guard > 100000 {
+                panic!("[GORGE] 表达式解析疑似死循环于 pos={} token={:?}", self.pos, self.peek().map(|t| &t.token));
+            }
+            if std::env::var("GORGE_DEBUG_PARSE").is_ok() {
+                eprintln!("[EXPR] pos={} token={:?} minprec={}", self.pos, self.peek().map(|t| &t.token), min_precedence);
+            }
             // `:` 只在后跟 `{`（注入器）或 `(`（Lambda）时作为中缀操作符
             // 否则留给条件表达式 `?:` 的 else 分支消费
             // 但当 suppress_colon_precheck 为 true 时跳过，避免在 `?:` 内部误消费 `:`
@@ -2231,10 +2270,7 @@ impl Parser {
                 // 注入器字面量: expr : { key: value } 或 expr : { elem, elem }
                 if self.check(&Token::LBrace) {
                     self.advance(); // 消费 '{'
-                    let class_name = match &left {
-                        Expression::Identifier(name, _) => name.clone(),
-                        _ => String::new(),
-                    };
+                    let class_name = expr_as_dotted_name(&left);
                     let result = self.parse_injector_literal_content(span)?;
                     match result {
                         Expression::InjectorObject { fields, span, .. } => {
@@ -2256,6 +2292,26 @@ impl Parser {
                 Err(())
             }
         }
+    }
+}
+
+/// 将表达式还原为点分限定类名（如 `GorgeFramework.Element` / `Dremu.DremuMainLane`）。
+///
+/// 用于注入器字面量 `TypeName : { ... }` 的类名提取：左操作数既可能是简单
+/// `Identifier`，也可能是点分 `MemberAccess`（限定名）。非标识符/成员访问形态
+/// 返回空字符串（调用方视为无类型注入器字面量）。
+fn expr_as_dotted_name(expr: &Expression) -> String {
+    match expr {
+        Expression::Identifier(name, _) => name.clone(),
+        Expression::MemberAccess { object, member, .. } => {
+            let base = expr_as_dotted_name(object);
+            if base.is_empty() {
+                member.clone()
+            } else {
+                format!("{}.{}", base, member)
+            }
+        }
+        _ => String::new(),
     }
 }
 

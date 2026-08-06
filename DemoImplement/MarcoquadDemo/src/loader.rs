@@ -168,6 +168,12 @@ fn register_module_to_vm(vm: &mut VirtualMachine, module: &CompiledModule) {
     for cc in ordered {
         let name = simple_name(&cc.class_type.full_name());
 
+        // 注入器常量池注册（P0-7）：编译器把常量索引按类连续分配
+        // （`CompiledClass.injector_constants`），VM 的 LoadInjectorConstant
+        // 按全局索引寻址。合并顺序必须与注册顺序一致（按继承深度排序，
+        // 基类常量在前），否则索引错位。
+        vm.injector_constants.extend(cc.injector_constants.clone());
+
         // 注册方法实现
         let mut mp: Vec<(CompiledMethod, Vec<ValueType>)> = Vec::new();
         for m in &cc.methods {
@@ -346,13 +352,16 @@ impl GameLoader {
         self.runtime_manager.set_compiled_classes(module.classes.clone());
         eprintln!("[Gorge] 注册完成");
 
-        // 5. 走到 Compiled 状态
+        // 5. 走到 Compiled 状态，扫描模态进自持 FormContainer（P0-6：
+        //    模态表 / Element 修改器表 / 即时音效方法表，供 prepare_score
+        //    与 ChartManager 读取）
         self.runtime_manager.state = RuntimeState::Compiled;
         eprintln!("[Gorge] 5/7 提取仿真资源...");
+        self.runtime_manager.scan_forms_into_owned(&mut self.vm);
 
         // 6. 提取仿真资源
         self.runtime_manager
-            .extract_simulation_resources(0.0, 100.0, 1.0);
+            .extract_simulation_resources(0.0, 100.0, 1.0, &mut self.vm);
 
         // 7. 资产加载
         eprintln!("[Gorge] 6/7 加载资产...");
@@ -361,12 +370,12 @@ impl GameLoader {
                 score.extract_assets_from_package(pkg);
             }
         }
-        self.runtime_manager.reload_assets();
+        self.runtime_manager.reload_assets(&mut self.vm);
 
         // 8. 初始化并启动仿真
         eprintln!("[Gorge] 7/7 启动仿真...");
         self.runtime_manager
-            .create_simulation_runtime(0.0, 100.0, 1.0);
+            .create_simulation_runtime(0.0, 100.0, 1.0, None);
         self.runtime_manager.load_score(&mut self.vm);
         self.runtime_manager.start_simulation(&mut self.vm);
         let score_element_count = self

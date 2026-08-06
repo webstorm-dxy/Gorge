@@ -125,11 +125,23 @@ impl RuntimeInjector {
         injector
     }
 
-    /// 从注入器常量定义构造注入器（G2）
+    /// 从注入器常量定义构造注入器的标量部分（G2）
     ///
     /// 常量中的所有字段值都是显式设置的（非默认）。字段按类型分组存储，
     /// 索引基于常量定义中该类型字段出现的顺序。
-    pub fn from_constant(constant: &crate::objective::bytecode::InjectorConstantDef) -> Self {
+    ///
+    /// 嵌套的 `InjectObject`/`Array` 字段在常量中占 object 槽位，本方法
+    /// 无法在无 VM 上下文时物化（需要分配对象 ID 并注册到对象表），因此
+    /// 只按 (0, 非默认) 占槽；由 VM 的 `LoadInjectorConstant` 处理器
+    /// （`VirtualMachine::materialize_injector_constant`）在标量填充完成后
+    /// 沿常量定义二次遍历，递归物化嵌套对象并写入 object 槽位。
+    ///
+    /// `class_decl` 为注入器所属类的声明（调用方负责按常量中的类名解析，
+    /// 未注册类可传哑声明）。
+    pub fn from_constant(
+        constant: &crate::objective::bytecode::InjectorConstantDef,
+        class_decl: Arc<ClassDeclaration>,
+    ) -> Self {
         // 统计各类型字段数
         let mut int_count = 0; let mut float_count = 0; let mut bool_count = 0;
         let mut str_count = 0; let mut obj_count = 0;
@@ -145,7 +157,7 @@ impl RuntimeInjector {
             }
         }
         let mut result = Self {
-            class_decl: Arc::new(crate::objective::declaration::ClassDeclaration::dummy(constant.class_name.clone())),
+            class_decl,
             int_fields: vec![(0, true); int_count],
             float_fields: vec![(0.0, true); float_count],
             bool_fields: vec![(false, true); bool_count],
@@ -175,7 +187,8 @@ impl RuntimeInjector {
                     result.object_fields[oi] = (*v, false);
                     oi += 1;
                 }
-                // 嵌套注入器和数组在常量中占 object 槽位，值由运行时填充
+                // 嵌套注入器和数组在常量中占 object 槽位，值由 VM 在
+                // 物化阶段递归填充（本方法只按 0 占槽）
                 crate::objective::bytecode::InjectorConstField::InjectObject(..) => {
                     result.object_fields[oi] = (0, false);
                     oi += 1;

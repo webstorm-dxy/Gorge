@@ -100,6 +100,9 @@ fn main() {
     let mut rc_map: HashMap<String, Arc<RuntimeClass>> = HashMap::new();
     for cc in ordered {
         let name = simple_name(&cc.class_type.full_name());
+        // 注入器常量池注册（P0-7）：合并顺序与类注册顺序一致（按继承深度
+        // 排序），保证方法内 LoadInjectorConstant 的全局索引与类级常量池对应
+        vm.injector_constants.extend(cc.injector_constants.clone());
         let mut mp: Vec<(gorge_core::virtual_machine::ir::CompiledMethod, Vec<gorge_core::virtual_machine::ir::ValueType>)> = Vec::new();
         for m in &cc.methods { mp.push((m.clone(), vec![])); }
         vm.register_class_methods(&name, mp);

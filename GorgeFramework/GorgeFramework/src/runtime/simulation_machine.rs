@@ -74,7 +74,7 @@ impl SimulationMachine {
 
         let mut remaining = simulation_time;
         while remaining > 0.0 && !self.target_stack.is_empty() {
-            let task = self.get_or_calc_task(runtime);
+            let task = self.get_or_calc_task(runtime, vm);
             let (chart_to, sim_to, rem) = self.calculate_step_time(
                 remaining, runtime, &task,
             );
@@ -261,15 +261,15 @@ impl SimulationMachine {
 
     // ==================== 任务管理 ====================
 
-    fn get_or_calc_task(&mut self, runtime: &GorgeSimulationRuntime) -> SimulationTask {
+    fn get_or_calc_task(&mut self, runtime: &GorgeSimulationRuntime, vm: &mut VirtualMachine) -> SimulationTask {
         if self.current_task.is_none() {
-            self.current_task = Some(self.calculate_simulation_task(runtime));
+            self.current_task = Some(self.calculate_simulation_task(runtime, vm));
         }
         self.current_task.clone().unwrap()
     }
 
     /// 计算仿真任务（S4d：调用 ISimulator 方法获取异步目标）
-    fn calculate_simulation_task(&self, runtime: &GorgeSimulationRuntime) -> SimulationTask {
+    fn calculate_simulation_task(&self, runtime: &GorgeSimulationRuntime, vm: &mut VirtualMachine) -> SimulationTask {
         let target = match self.target_stack.back() {
             Some(t) => t,
             None => return SimulationTask { simulate_time: self.simulate_time, chart_time: None },
@@ -280,7 +280,7 @@ impl SimulationMachine {
             let mut min_target = f32::MAX;
             for (_pri, sim_id) in runtime.simulation.simulators.iter() {
                 if let Some(sim) = runtime.sim_registry.get(*sim_id) {
-                    let t = sim.forward_async_simulation_target(self.chart_time, runtime);
+                    let t = sim.forward_async_simulation_target(self.chart_time, runtime, vm);
                     if t < min_target { min_target = t; }
                 }
             }
@@ -295,7 +295,7 @@ impl SimulationMachine {
             let mut max_target = f32::MIN;
             for (_pri, sim_id) in runtime.simulation.simulators.iter() {
                 if let Some(sim) = runtime.sim_registry.get(*sim_id) {
-                    let t = sim.backward_async_simulation_target(self.chart_time, runtime);
+                    let t = sim.backward_async_simulation_target(self.chart_time, runtime, vm);
                     if t > max_target { max_target = t; }
                 }
             }
@@ -309,7 +309,7 @@ impl SimulationMachine {
             let mut min_target = f32::MAX;
             for (_pri, sim_id) in runtime.simulation.simulators.iter() {
                 if let Some(sim) = runtime.sim_registry.get(*sim_id) {
-                    let t = sim.infinitesimal_async_simulation_target(self.chart_time, runtime);
+                    let t = sim.infinitesimal_async_simulation_target(self.chart_time, runtime, vm);
                     if t < min_target { min_target = t; }
                 }
             }

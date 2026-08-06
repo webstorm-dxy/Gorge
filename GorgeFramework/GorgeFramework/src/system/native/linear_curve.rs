@@ -8,12 +8,16 @@ use super::function_curve::FunctionCurve;
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct LinearCurve {
     #[gorge_field]
+    #[inject(name = "timeStart", default = 0.0)]
     pub time_start: f32,
     #[gorge_field]
+    #[inject(name = "valueStart", default = 0.0)]
     pub value_start: f32,
     #[gorge_field]
+    #[inject(name = "timeEnd", default = 1.0)]
     pub time_end: f32,
     #[gorge_field]
+    #[inject(name = "valueEnd", default = 1.0)]
     pub value_end: f32,
 }
 
@@ -25,6 +29,11 @@ impl LinearCurve {
 
 #[gorge_native_impl]
 impl LinearCurve {
+    /// 构造方法 0：无参构造（字段取注入器默认值）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：以显式参数构造
     #[gorge_ctor]
     pub fn new_ctor(ctx: &mut NativeContext, this: usize, ts: f32, vs: f32, te: f32, ve: f32) {
         ctx.set_object_float_field(this, LinearCurve::FIELD_INDEX_time_start, ts as f64);

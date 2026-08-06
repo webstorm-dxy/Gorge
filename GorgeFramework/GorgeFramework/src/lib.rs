@@ -121,14 +121,19 @@ pub fn native_classes() -> Vec<Arc<dyn NativeClass>> {
         Arc::new(QuadraticFunctionCurve { a: 0.0, b: 0.0, c: 0.0 }),
         Arc::new(LinearCurve { time_start: 0.0, value_start: 0.0, time_end: 0.0, value_end: 0.0 }),
         Arc::new(ArcFunctionCurve { chord_start: 0.0, chord_end: 0.0, angle: 0.0 }),
-        Arc::new(CubicHermiteSpline { time_start: 0.0, value_start: 0.0, m0: 0.0, w0: 0.0, time_end: 0.0, value_end: 0.0, m1: 0.0, w1: 0.0 }),
+        Arc::new(CubicHermiteSpline {
+            start_point: 0, start_tangent: 0.0, start_weight: 0.33333,
+            end_point: 0, end_tangent: 0.0, end_weight: 0.33333,
+        }),
         // 函数曲线组合器
         Arc::new(AdditionFunctionCurve { first: 0, second: 0 }),
         Arc::new(MultiplicationFunctionCurve { first: 0, second: 0 }),
         Arc::new(CompositeFunctionCurve { outer: 0, inner: 0 }),
-        Arc::new(PeriodicFunctionCurve { curve: 0, start_x: 0.0, end_x: 0.0 }),
-        Arc::new(AxialSymmetricFunctionCurve { curve: 0, axis_center: 0.0, axis_amplitude: 0.0 }),
-        Arc::new(FunctionPiece { curve: 0, start_x: 0.0, end_x: 0.0 }),
+        Arc::new(PeriodicFunctionCurve { curve: 0, start_x: 0.0, end_x: 0.0, left_closed: true }),
+        Arc::new(AxialSymmetricFunctionCurve { curve: 0, axis: 0.0, keep_left: true }),
+        Arc::new(FunctionPiece {
+            curve: 0, start_x: 0.0, end_x: 0.0, left_closed: true, right_closed: false,
+        }),
         Arc::new(PiecewiseFunctionCurve { pieces: 0 }),
         Arc::new(TimeItem { time: 0, accept: false, respond_mode: String::new() }),
         Arc::new(FloatSignalFilter { priority: 0, condition_types: 0, end_time: 0, time_mode: 0, accept_consume: true, deny_consume: false, channel_name: String::new(), filter_range: 0 }),
@@ -426,7 +431,7 @@ mod tests {
         let lcc = LerpColorCurve { color_points: 0, progress_curve: 0 };
         fx.vm.param_pool.set_object_param(0, arr);
         fx.vm.param_pool.set_object_param(1, pc);
-        let lcc_id = { let mut ctx = fx.ctx(); lcc.do_construct_native(&mut ctx, None, 0) };
+        let lcc_id = { let mut ctx = fx.ctx(); lcc.do_construct_native(&mut ctx, None, 1) };
 
         // evaluate(0.5)
         fx.vm.param_pool.set_float_param(0, 0.5f64);
@@ -575,7 +580,7 @@ mod tests {
         let lcc = LerpColorCurve { color_points: 0, progress_curve: 0 };
         fx.vm.param_pool.set_object_param(0, arr);
         fx.vm.param_pool.set_object_param(1, pc);
-        let lcc_id = { let mut ctx = fx.ctx(); lcc.do_construct_native(&mut ctx, None, 0) };
+        let lcc_id = { let mut ctx = fx.ctx(); lcc.do_construct_native(&mut ctx, None, 1) };
 
         // 验证外部可通过 evaluate(0.0) 拿到对象 ID
         fx.vm.param_pool.set_float_param(0, 0.0f64);
@@ -704,12 +709,12 @@ mod tests {
             fcn.do_construct_native(&mut ctx, None, 0)
         };
 
-        // 构造子类 ConstantFunctionCurve 对象（value=42.0）
+        // 构造子类 ConstantFunctionCurve 对象（value=42.0，值参 ctor 为 1 号）
         fx.vm.param_pool.set_float_param(0, 42.0);
         let const_id = {
             let cfc = ConstantFunctionCurve { value: 0.0 };
             let mut ctx = fx.ctx();
-            cfc.do_construct_native(&mut ctx, None, 0)
+            cfc.do_construct_native(&mut ctx, None, 1)
         };
 
         // 验证：基类 evaluate 返回 0.0

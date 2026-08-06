@@ -1,14 +1,15 @@
 //! `GorgeFramework.Audio` —— 音频句柄 native 类。
 //!
 //! 移植自 C# 参考实现 `Audio.cs`。
-//! 无公开字段，平台音频句柄通过 payload 存储。
+//! 无公开字段；平台音频句柄经 `EnvironmentGlobal.audio_handles` 全局句柄表桥接
+//! （由 `Environment.GetAssetByName` 包装音频资产时登记，`global::resolve_audio_handle` 解析）。
 
 use gorge_macros::{gorge_native_class, gorge_native_impl};
 
 /// 音频句柄（C# `Audio`）
 ///
 /// 对应 C# 中由 `Base.Instance.CreateAudio()` 返回的 Audio 对象。
-/// 平台播放器句柄通过 payload 存储。
+/// 平台音频句柄经全局句柄表桥接（见 `runtime::environment::global`）。
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct AudioNative {}
 

@@ -19,15 +19,21 @@ use gorge_macros::{gorge_native_class, gorge_native_impl};
 pub struct AdditionFunctionCurve {
     /// 第一个加数曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "firstFunctionCurve")]
     pub first: usize,
     /// 第二个加数曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "secondFunctionCurve")]
     pub second: usize,
 }
 
 #[gorge_native_impl]
 impl AdditionFunctionCurve {
-    /// 构造加法组合曲线
+    /// 构造方法 0：无参构造（子曲线由注入器字段提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造加法组合曲线
     #[gorge_ctor]
     pub fn new(ctx: &mut NativeContext, this: usize, first: usize, second: usize) {
         ctx.set_object_object_field(this, Self::FIELD_INDEX_first, first);
@@ -62,15 +68,21 @@ impl AdditionFunctionCurve {
 pub struct MultiplicationFunctionCurve {
     /// 第一个乘数曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "firstFunctionCurve")]
     pub first: usize,
     /// 第二个乘数曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "secondFunctionCurve")]
     pub second: usize,
 }
 
 #[gorge_native_impl]
 impl MultiplicationFunctionCurve {
-    /// 构造乘法组合曲线
+    /// 构造方法 0：无参构造（子曲线由注入器字段提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造乘法组合曲线
     #[gorge_ctor]
     pub fn new(ctx: &mut NativeContext, this: usize, first: usize, second: usize) {
         ctx.set_object_object_field(this, Self::FIELD_INDEX_first, first);
@@ -105,15 +117,21 @@ impl MultiplicationFunctionCurve {
 pub struct CompositeFunctionCurve {
     /// 外层函数（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "outerFunctionCurve")]
     pub outer: usize,
     /// 内层函数（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "innerFunctionCurve")]
     pub inner: usize,
 }
 
 #[gorge_native_impl]
 impl CompositeFunctionCurve {
-    /// 构造复合曲线
+    /// 构造方法 0：无参构造（子曲线由注入器字段提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造复合曲线
     #[gorge_ctor]
     pub fn new(ctx: &mut NativeContext, this: usize, outer: usize, inner: usize) {
         ctx.set_object_object_field(this, Self::FIELD_INDEX_outer, outer);
@@ -139,26 +157,37 @@ impl CompositeFunctionCurve {
 
 // ==================== PeriodicFunctionCurve —— 周期映射 ====================
 
-/// 周期映射曲线：将 x 映射到 [start_x, end_x] 区间后再求值
+/// 周期映射曲线：将 x 折叠到 [start_x, end_x] 周期区间后再求值
 ///
-/// 用于将任意 x 值折叠到定义区间内，实现周期性函数。
-/// curve_id 为 0 时返回 0。
+/// `left_closed` 为 true 时区间左包含（缺省，对齐 C# 默认），
+/// 否则右包含。curve_id 为 0 时返回 0。
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct PeriodicFunctionCurve {
     /// 被重复的曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "functionCurve")]
     pub curve: usize,
-    /// 区间起点
+    /// 周期左边界
     #[gorge_field]
+    #[inject(name = "startX", default = 0.0)]
     pub start_x: f32,
-    /// 区间终点
+    /// 周期右边界
     #[gorge_field]
+    #[inject(name = "endX", default = 1.0)]
     pub end_x: f32,
+    /// 左包含（否则为右包含）
+    #[gorge_field]
+    #[inject(name = "leftClosed", default = true)]
+    pub left_closed: bool,
 }
 
 #[gorge_native_impl]
 impl PeriodicFunctionCurve {
-    /// 构造周期映射曲线
+    /// 构造方法 0：无参构造（字段由注入器提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造周期映射曲线（left_closed 取注入器默认值 true）
     #[gorge_ctor]
     pub fn new(
         ctx: &mut NativeContext,
@@ -172,7 +201,7 @@ impl PeriodicFunctionCurve {
         ctx.set_object_float_field(this, Self::FIELD_INDEX_end_x, end_x as f64);
     }
 
-    /// 将 x 折叠到 [start_x, end_x] 区间后求值
+    /// 将 x 折叠到周期区间后求值（对齐 C#：leftClosed 决定左包含/右包含）
     #[gorge_method]
     pub fn evaluate(ctx: &mut NativeContext, this: usize, x: f32) -> f32 {
         let curve_id = ctx.get_object_object_field(this, Self::FIELD_INDEX_curve);
@@ -181,96 +210,113 @@ impl PeriodicFunctionCurve {
         }
         let start_x = ctx.get_object_float_field(this, Self::FIELD_INDEX_start_x) as f32;
         let end_x = ctx.get_object_float_field(this, Self::FIELD_INDEX_end_x) as f32;
-        let period = end_x - start_x;
-        if period.abs() < 1e-10 {
+        let left_closed = ctx.get_object_bool_field(this, Self::FIELD_INDEX_left_closed);
+        let range = end_x - start_x;
+        // f32 对 0 取余得到 NaN，周期退化为 0 时直接在左边界求值（C# 未处理该边界）
+        if range.abs() < 1e-10 {
             return ctx.call_native_method_float_f(curve_id, 0, start_x as f64) as f32;
         }
-        let mut t = (x - start_x) % period;
-        if t < 0.0 {
-            t += period;
+        let mut real_x = (x - start_x) % range + start_x;
+        if left_closed {
+            if real_x < start_x {
+                real_x += range;
+            }
+        } else if real_x <= start_x {
+            real_x += range;
         }
-        ctx.call_native_method_float_f(curve_id, 0, (start_x + t) as f64) as f32
+        ctx.call_native_method_float_f(curve_id, 0, real_x as f64) as f32
     }
 }
 
 // ==================== AxialSymmetricFunctionCurve —— 轴对称 ====================
 
-/// 轴对称曲线：f(x) = curve.evaluate(axis_center + axis_amplitude - x)
+/// 轴对称曲线（对齐 C# `AxialSymmetricFunctionCurve`）
 ///
-/// 以 (axis_center + axis_amplitude / 2) 为轴对曲线进行镜像。
-/// curve_id 为 0 时返回 0。
+/// `keep_left` 为 true 时保留 axis 左侧、镜像到右侧，反之保留右侧镜像到左侧：
+/// 对称侧取 `curve.evaluate(2 * axis - x)`。curve_id 为 0 时返回 0。
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct AxialSymmetricFunctionCurve {
     /// 原始曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "functionCurve")]
     pub curve: usize,
-    /// 轴参数 center
+    /// 对称轴
     #[gorge_field]
-    pub axis_center: f32,
-    /// 轴参数 amplitude
+    #[inject(name = "axis", default = 0.0)]
+    pub axis: f32,
+    /// 是否保留左侧而对称到右侧
     #[gorge_field]
-    pub axis_amplitude: f32,
+    #[inject(name = "keepLeft", default = true)]
+    pub keep_left: bool,
 }
 
 #[gorge_native_impl]
 impl AxialSymmetricFunctionCurve {
-    /// 构造轴对称曲线
+    /// 构造方法 0：无参构造（字段由注入器提供）
     #[gorge_ctor]
-    pub fn new(
-        ctx: &mut NativeContext,
-        this: usize,
-        curve: usize,
-        axis_center: f32,
-        axis_amplitude: f32,
-    ) {
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造轴对称曲线
+    #[gorge_ctor]
+    pub fn new(ctx: &mut NativeContext, this: usize, curve: usize, axis: f32, keep_left: bool) {
         ctx.set_object_object_field(this, Self::FIELD_INDEX_curve, curve);
-        ctx.set_object_float_field(
-            this,
-            Self::FIELD_INDEX_axis_center,
-            axis_center as f64,
-        );
-        ctx.set_object_float_field(
-            this,
-            Self::FIELD_INDEX_axis_amplitude,
-            axis_amplitude as f64,
-        );
+        ctx.set_object_float_field(this, Self::FIELD_INDEX_axis, axis as f64);
+        ctx.set_object_bool_field(this, Self::FIELD_INDEX_keep_left, keep_left);
     }
 
-    /// 计算 f(x) = curve.evaluate(axis_center + axis_amplitude - x)
+    /// 计算轴对称后的曲线值（对齐 C#：keepLeft 决定保留侧）
     #[gorge_method]
     pub fn evaluate(ctx: &mut NativeContext, this: usize, x: f32) -> f32 {
         let curve_id = ctx.get_object_object_field(this, Self::FIELD_INDEX_curve);
         if curve_id == 0 {
             return 0.0;
         }
-        let center = ctx.get_object_float_field(this, Self::FIELD_INDEX_axis_center) as f32;
-        let amplitude = ctx.get_object_float_field(this, Self::FIELD_INDEX_axis_amplitude) as f32;
-        let mapped = center + amplitude - x;
+        let axis = ctx.get_object_float_field(this, Self::FIELD_INDEX_axis) as f32;
+        let keep_left = ctx.get_object_bool_field(this, Self::FIELD_INDEX_keep_left);
+        let on_kept_side = if keep_left { x <= axis } else { x >= axis };
+        let mapped = if on_kept_side { x } else { axis - x + axis };
         ctx.call_native_method_float_f(curve_id, 0, mapped as f64) as f32
     }
 }
 
 // ==================== FunctionPiece —— 分段 ====================
 
-/// 函数分段：仅在 [start_x, end_x] 区间内求值，否则返回 0
+/// 函数分段：仅在区间内求值，否则返回 0
 ///
+/// 区间包含性由 `left_closed`/`right_closed` 决定
+/// （默认左包含、右不包含，对齐 C# 注入器默认值）。
 /// curve_id 为 0 时返回 0。
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct FunctionPiece {
     /// 分段内的曲线（FunctionCurve 对象 ID）
     #[gorge_field]
+    #[inject(name = "functionCurve")]
     pub curve: usize,
     /// 分段左边界
     #[gorge_field]
+    #[inject(name = "startX", default = 0.0)]
     pub start_x: f32,
     /// 分段右边界
     #[gorge_field]
+    #[inject(name = "endX", default = 1.0)]
     pub end_x: f32,
+    /// 左边界包含
+    #[gorge_field]
+    #[inject(name = "leftClosed", default = true)]
+    pub left_closed: bool,
+    /// 右边界包含
+    #[gorge_field]
+    #[inject(name = "rightClosed", default = false)]
+    pub right_closed: bool,
 }
 
 #[gorge_native_impl]
 impl FunctionPiece {
-    /// 构造函数分段
+    /// 构造方法 0：无参构造（字段由注入器提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造函数分段（left_closed/right_closed 取注入器默认值）
     #[gorge_ctor]
     pub fn new(
         ctx: &mut NativeContext,
@@ -284,15 +330,24 @@ impl FunctionPiece {
         ctx.set_object_float_field(this, Self::FIELD_INDEX_end_x, end_x as f64);
     }
 
-    /// 若 x 在 [start_x, end_x] 内则返回曲线值，否则返回 0
+    /// 判断 x 是否落在分段区间内（按 left_closed/right_closed 决定边界包含性）
+    fn contains_x(ctx: &mut NativeContext, piece_id: usize, x: f32) -> bool {
+        let start_x = ctx.get_object_float_field(piece_id, Self::FIELD_INDEX_start_x) as f32;
+        let end_x = ctx.get_object_float_field(piece_id, Self::FIELD_INDEX_end_x) as f32;
+        let left_closed = ctx.get_object_bool_field(piece_id, Self::FIELD_INDEX_left_closed);
+        let right_closed = ctx.get_object_bool_field(piece_id, Self::FIELD_INDEX_right_closed);
+        let after_left = if left_closed { x >= start_x } else { x > start_x };
+        let before_right = if right_closed { x <= end_x } else { x < end_x };
+        after_left && before_right
+    }
+
+    /// 若 x 在分段区间内则返回曲线值，否则返回 0
     #[gorge_method]
     pub fn evaluate(ctx: &mut NativeContext, this: usize, x: f32) -> f32 {
-        let curve_id = ctx.get_object_object_field(this, Self::FIELD_INDEX_curve);
-        let start_x = ctx.get_object_float_field(this, Self::FIELD_INDEX_start_x) as f32;
-        let end_x = ctx.get_object_float_field(this, Self::FIELD_INDEX_end_x) as f32;
-        if x < start_x || x > end_x {
+        if !Self::contains_x(ctx, this, x) {
             return 0.0;
         }
+        let curve_id = ctx.get_object_object_field(this, Self::FIELD_INDEX_curve);
         if curve_id == 0 {
             return 0.0;
         }
@@ -305,17 +360,23 @@ impl FunctionPiece {
 /// 分段函数曲线：由多个 FunctionPiece 组成，按区间匹配求值
 ///
 /// pieces 为 ObjectArray 对象 ID，存储 FunctionPiece 对象 ID 列表。
-/// 遍历所有分段，在第一个匹配的区间内求值并返回，无匹配则返回 0。
+/// 遍历所有分段，在第一个匹配的区间内求值并返回，无匹配则返回 0；
+/// 遇到空分段（对象 ID 为 0）时直接返回 0（对齐 C#）。
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct PiecewiseFunctionCurve {
     /// 分段列表（ObjectArray 对象 ID）
     #[gorge_field]
+    #[inject(name = "functionPieces")]
     pub pieces: usize,
 }
 
 #[gorge_native_impl]
 impl PiecewiseFunctionCurve {
-    /// 构造分段函数曲线
+    /// 构造方法 0：无参构造（分段列表由注入器字段提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：构造分段函数曲线
     #[gorge_ctor]
     pub fn new(ctx: &mut NativeContext, this: usize, pieces: usize) {
         ctx.set_object_object_field(this, Self::FIELD_INDEX_pieces, pieces);
@@ -330,15 +391,17 @@ impl PiecewiseFunctionCurve {
         }
         let items = ctx.object_array_items(pieces_id);
         for piece_id in &items {
+            // 对齐 C#：空分段直接返回 0
             if *piece_id == 0 {
-                continue;
+                return 0.0;
             }
-            let start_x =
-                ctx.get_object_float_field(*piece_id, FunctionPiece::FIELD_INDEX_start_x) as f32;
-            let end_x =
-                ctx.get_object_float_field(*piece_id, FunctionPiece::FIELD_INDEX_end_x) as f32;
-            if x >= start_x && x <= end_x {
-                return ctx.call_native_method_float_f(*piece_id, 0, x as f64) as f32;
+            if FunctionPiece::contains_x(ctx, *piece_id, x) {
+                let curve_id =
+                    ctx.get_object_object_field(*piece_id, FunctionPiece::FIELD_INDEX_curve);
+                if curve_id == 0 {
+                    return 0.0;
+                }
+                return ctx.call_native_method_float_f(curve_id, 0, x as f64) as f32;
             }
         }
         0.0
@@ -355,6 +418,7 @@ mod tests {
     use gorge_core::system::native::array::ObjectArrayClass;
     use gorge_core::virtual_machine::vm::VirtualMachine;
     use crate::system::native::constant_function_curve::ConstantFunctionCurve;
+    use crate::system::native::linear_function_curve::LinearFunctionCurve;
 
     struct Fixture {
         vm: VirtualMachine,
@@ -395,7 +459,22 @@ mod tests {
         id
     }
 
-    /// 创建一个 FunctionPiece 对象并返回其 ID（手动方式）
+    /// 创建一个 LinearFunctionCurve(k, 0) 对象并返回其 ID（手动方式）
+    fn make_linear_curve(fx: &mut Fixture, k: f32) -> usize {
+        let obj = RuntimeObject::new_simple(
+            LinearFunctionCurve::GORGE_FULL_NAME.to_string(),
+            &LinearFunctionCurve::gorge_field_type_count(),
+        );
+        let id = { let mut ctx = fx.ctx(); ctx.register_object(obj) };
+        {
+            let mut ctx = fx.ctx();
+            ctx.set_object_float_field(id, LinearFunctionCurve::FIELD_INDEX_k, k as f64);
+            ctx.set_object_float_field(id, LinearFunctionCurve::FIELD_INDEX_b, 0.0);
+        }
+        id
+    }
+
+    /// 创建一个 FunctionPiece 对象并返回其 ID（手动方式，区间双闭）
     fn make_piece(fx: &mut Fixture, curve_id: usize, start_x: f32, end_x: f32) -> usize {
         let obj = RuntimeObject::new_simple(
             FunctionPiece::GORGE_FULL_NAME.to_string(),
@@ -411,8 +490,45 @@ mod tests {
                 start_x as f64,
             );
             ctx.set_object_float_field(id, FunctionPiece::FIELD_INDEX_end_x, end_x as f64);
+            ctx.set_object_bool_field(id, FunctionPiece::FIELD_INDEX_left_closed, true);
+            ctx.set_object_bool_field(id, FunctionPiece::FIELD_INDEX_right_closed, true);
         }
         id
+    }
+
+    // ==================== 注入器字段元数据与默认值测试 ====================
+
+    #[test]
+    fn test_periodic_injector_fields_meta_and_defaults() {
+        // 注入器字段名与声明序对齐谱面存根
+        let meta = PeriodicFunctionCurve::gorge_injector_fields_meta();
+        let names: Vec<&str> = meta.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["functionCurve", "startX", "endX", "leftClosed"]);
+        // 默认值对齐 C#：startX=0、endX=1、leftClosed=true
+        assert_eq!(PeriodicFunctionCurve::gorge_injector_default_start_x(), 0.0);
+        assert_eq!(PeriodicFunctionCurve::gorge_injector_default_end_x(), 1.0);
+        assert!(PeriodicFunctionCurve::gorge_injector_default_left_closed());
+    }
+
+    #[test]
+    fn test_function_piece_injector_fields_meta_and_defaults() {
+        let meta = FunctionPiece::gorge_injector_fields_meta();
+        let names: Vec<&str> = meta.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["functionCurve", "startX", "endX", "leftClosed", "rightClosed"]
+        );
+        // 默认值对齐 C#：左包含、右不包含
+        assert!(FunctionPiece::gorge_injector_default_left_closed());
+        assert!(!FunctionPiece::gorge_injector_default_right_closed());
+    }
+
+    #[test]
+    fn test_axial_symmetric_injector_fields_meta() {
+        let meta = AxialSymmetricFunctionCurve::gorge_injector_fields_meta();
+        let names: Vec<&str> = meta.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["functionCurve", "axis", "keepLeft"]);
+        assert!(AxialSymmetricFunctionCurve::gorge_injector_default_keep_left());
     }
 
     // ==================== AdditionFunctionCurve 测试 ====================
@@ -427,7 +543,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_object_param(1, 0);
-        let obj_id = { let mut ctx = fx.ctx(); add.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); add.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); add.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -452,7 +568,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, c1);
         fx.vm.param_pool.set_object_param(1, c2);
-        let obj_id = { let mut ctx = fx.ctx(); add.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); add.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 0.0_f64);
         { let mut ctx = fx.ctx(); add.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -476,7 +592,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_object_param(1, c2);
-        let obj_id = { let mut ctx = fx.ctx(); add.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); add.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 1.0_f64);
         { let mut ctx = fx.ctx(); add.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -495,7 +611,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_object_param(1, 0);
-        let obj_id = { let mut ctx = fx.ctx(); mul.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); mul.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); mul.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -520,7 +636,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, c1);
         fx.vm.param_pool.set_object_param(1, c2);
-        let obj_id = { let mut ctx = fx.ctx(); mul.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); mul.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 0.0_f64);
         { let mut ctx = fx.ctx(); mul.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -539,7 +655,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_object_param(1, 0);
-        let obj_id = { let mut ctx = fx.ctx(); comp.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); comp.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); comp.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -565,7 +681,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, outer_id);
         fx.vm.param_pool.set_object_param(1, inner_id);
-        let obj_id = { let mut ctx = fx.ctx(); comp.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); comp.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 0.0_f64);
         { let mut ctx = fx.ctx(); comp.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -589,7 +705,7 @@ mod tests {
 
         fx.vm.param_pool.set_object_param(0, outer_id);
         fx.vm.param_pool.set_object_param(1, 0);
-        let obj_id = { let mut ctx = fx.ctx(); comp.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); comp.do_construct_native(&mut ctx, None, 1) };
 
         // inner=0 → inner_val=0 → outer(0) = 7.0
         fx.vm.param_pool.set_float_param(0, 3.0_f64);
@@ -605,13 +721,14 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 10.0,
+            left_closed: true,
         };
         let mut fx = Fixture::new();
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_float_param(0, 0.0);
         fx.vm.param_pool.set_float_param(1, 10.0);
-        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); p.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -624,6 +741,7 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
         };
         let mut fx = Fixture::new();
         fx.register_class(std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
@@ -631,6 +749,7 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
         }));
 
         // curve = Constant(42.0)，无论 x 映射后是哪，都返回 42.0
@@ -639,7 +758,7 @@ mod tests {
         fx.vm.param_pool.set_object_param(0, cid);
         fx.vm.param_pool.set_float_param(0, 0.0);
         fx.vm.param_pool.set_float_param(1, 10.0);
-        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 1) };
 
         // x=3 在区间内
         fx.vm.param_pool.set_float_param(0, 3.0_f64);
@@ -648,11 +767,43 @@ mod tests {
     }
 
     #[test]
+    fn test_periodic_left_closed_folds_negative_x() {
+        // left_closed=true（默认）：x=-1 折叠到周期区间末尾一侧
+        let p = PeriodicFunctionCurve {
+            curve: 0,
+            start_x: 0.0,
+            end_x: 10.0,
+            left_closed: true,
+        };
+        let mut fx = Fixture::new();
+        fx.register_class(std::sync::Arc::new(LinearFunctionCurve { k: 0.0, b: 0.0 }));
+        fx.register_class(std::sync::Arc::new(PeriodicFunctionCurve {
+            curve: 0,
+            start_x: 0.0,
+            end_x: 0.0,
+            left_closed: true,
+        }));
+
+        // curve = f(t) = t；x=-1 → realX = -1 % 10 + 0 = -1 < 0 → +10 → 9
+        let cid = make_linear_curve(&mut fx, 1.0);
+
+        fx.vm.param_pool.set_object_param(0, cid);
+        fx.vm.param_pool.set_float_param(0, 0.0);
+        fx.vm.param_pool.set_float_param(1, 10.0);
+        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 1) };
+
+        fx.vm.param_pool.set_float_param(0, -1.0_f64);
+        { let mut ctx = fx.ctx(); p.invoke_native_method(&mut ctx, obj_id, 0); }
+        assert!((fx.vm.param_pool.get_float_return() as f32 - 9.0).abs() < 0.001);
+    }
+
+    #[test]
     fn test_periodic_zero_period_returns_curve_at_start() {
         let p = PeriodicFunctionCurve {
             curve: 0,
             start_x: 5.0,
             end_x: 5.0,
+            left_closed: true,
         };
         let mut fx = Fixture::new();
         fx.register_class(std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
@@ -660,6 +811,7 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
         }));
 
         let cid = make_constant_curve(&mut fx, 99.0);
@@ -667,7 +819,7 @@ mod tests {
         fx.vm.param_pool.set_object_param(0, cid);
         fx.vm.param_pool.set_float_param(0, 5.0);
         fx.vm.param_pool.set_float_param(1, 5.0);
-        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); p.do_construct_native(&mut ctx, None, 1) };
 
         // period = 0 → curve.evaluate(start_x) = curve.evaluate(5) = 99.0
         fx.vm.param_pool.set_float_param(0, 7.0_f64);
@@ -681,15 +833,15 @@ mod tests {
     fn test_axial_symmetric_curve_zero_returns_zero() {
         let a = AxialSymmetricFunctionCurve {
             curve: 0,
-            axis_center: 0.0,
-            axis_amplitude: 0.0,
+            axis: 0.0,
+            keep_left: true,
         };
         let mut fx = Fixture::new();
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_float_param(0, 0.0);
-        fx.vm.param_pool.set_float_param(1, 0.0);
-        let obj_id = { let mut ctx = fx.ctx(); a.do_construct_native(&mut ctx, None, 0) };
+        fx.vm.param_pool.set_bool_param(0, true);
+        let obj_id = { let mut ctx = fx.ctx(); a.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 1.0_f64);
         { let mut ctx = fx.ctx(); a.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -700,29 +852,58 @@ mod tests {
     fn test_axial_symmetric_with_constant_curve() {
         let a = AxialSymmetricFunctionCurve {
             curve: 0,
-            axis_center: 0.0,
-            axis_amplitude: 0.0,
+            axis: 0.0,
+            keep_left: true,
         };
         let mut fx = Fixture::new();
         fx.register_class(std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
         fx.register_class(std::sync::Arc::new(AxialSymmetricFunctionCurve {
             curve: 0,
-            axis_center: 0.0,
-            axis_amplitude: 0.0,
+            axis: 0.0,
+            keep_left: true,
         }));
 
-        // curve=Constant(10.0), axis_center=2, axis_amplitude=3
-        // => curve.evaluate(2+3-x) = curve.evaluate(5-x) = 10.0（常值曲线忽略参数）
+        // curve=Constant(10.0), axis=2, keep_left=true
+        // x=100 > 2 → curve.evaluate(2*2-100)=curve(-96)=10.0（常值曲线忽略参数）
         let cid = make_constant_curve(&mut fx, 10.0);
 
         fx.vm.param_pool.set_object_param(0, cid);
         fx.vm.param_pool.set_float_param(0, 2.0);
-        fx.vm.param_pool.set_float_param(1, 3.0);
-        let obj_id = { let mut ctx = fx.ctx(); a.do_construct_native(&mut ctx, None, 0) };
+        fx.vm.param_pool.set_bool_param(0, true);
+        let obj_id = { let mut ctx = fx.ctx(); a.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 100.0_f64);
         { let mut ctx = fx.ctx(); a.invoke_native_method(&mut ctx, obj_id, 0); }
         assert!((fx.vm.param_pool.get_float_return() as f32 - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_axial_symmetric_keep_right_mirrors_left_side() {
+        // keep_left=false：保留 axis 右侧，左侧镜像到右侧
+        let a = AxialSymmetricFunctionCurve {
+            curve: 0,
+            axis: 0.0,
+            keep_left: false,
+        };
+        let mut fx = Fixture::new();
+        fx.register_class(std::sync::Arc::new(LinearFunctionCurve { k: 0.0, b: 0.0 }));
+        fx.register_class(std::sync::Arc::new(AxialSymmetricFunctionCurve {
+            curve: 0,
+            axis: 0.0,
+            keep_left: true,
+        }));
+
+        // curve = f(t) = t；axis=0、keep_left=false，x=-3 → curve(0-(-3)+0)=curve(3)=3
+        let cid = make_linear_curve(&mut fx, 1.0);
+
+        fx.vm.param_pool.set_object_param(0, cid);
+        fx.vm.param_pool.set_float_param(0, 0.0);
+        fx.vm.param_pool.set_bool_param(0, false);
+        let obj_id = { let mut ctx = fx.ctx(); a.do_construct_native(&mut ctx, None, 1) };
+
+        fx.vm.param_pool.set_float_param(0, -3.0_f64);
+        { let mut ctx = fx.ctx(); a.invoke_native_method(&mut ctx, obj_id, 0); }
+        assert!((fx.vm.param_pool.get_float_return() as f32 - 3.0).abs() < 0.001);
     }
 
     // ==================== FunctionPiece 测试 ====================
@@ -733,6 +914,8 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         };
         let mut fx = Fixture::new();
         fx.register_class(std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
@@ -740,6 +923,8 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         }));
 
         let cid = make_constant_curve(&mut fx, 25.0);
@@ -747,9 +932,9 @@ mod tests {
         fx.vm.param_pool.set_object_param(0, cid);
         fx.vm.param_pool.set_float_param(0, 0.0);
         fx.vm.param_pool.set_float_param(1, 10.0);
-        let obj_id = { let mut ctx = fx.ctx(); piece.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); piece.do_construct_native(&mut ctx, None, 1) };
 
-        // x=5 在 [0,10] 内 → 25.0
+        // x=5 在 [0,10) 内 → 25.0
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); piece.invoke_native_method(&mut ctx, obj_id, 0); }
         assert!((fx.vm.param_pool.get_float_return() as f32 - 25.0).abs() < 0.001);
@@ -761,6 +946,8 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         };
         let mut fx = Fixture::new();
         fx.register_class(std::sync::Arc::new(ConstantFunctionCurve { value: 0.0 }));
@@ -768,6 +955,8 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         }));
 
         let cid = make_constant_curve(&mut fx, 25.0);
@@ -775,9 +964,9 @@ mod tests {
         fx.vm.param_pool.set_object_param(0, cid);
         fx.vm.param_pool.set_float_param(0, 0.0);
         fx.vm.param_pool.set_float_param(1, 10.0);
-        let obj_id = { let mut ctx = fx.ctx(); piece.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); piece.do_construct_native(&mut ctx, None, 1) };
 
-        // x=15 不在 [0,10] 内 → 0.0
+        // x=15 不在 [0,10) 内 → 0.0
         fx.vm.param_pool.set_float_param(0, 15.0_f64);
         { let mut ctx = fx.ctx(); piece.invoke_native_method(&mut ctx, obj_id, 0); }
         assert_eq!(fx.vm.param_pool.get_float_return() as f32, 0.0);
@@ -789,18 +978,22 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         };
         let mut fx = Fixture::new();
         fx.register_class(std::sync::Arc::new(FunctionPiece {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         }));
 
         fx.vm.param_pool.set_object_param(0, 0);
         fx.vm.param_pool.set_float_param(0, 0.0);
         fx.vm.param_pool.set_float_param(1, 10.0);
-        let obj_id = { let mut ctx = fx.ctx(); piece.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); piece.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); piece.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -815,7 +1008,7 @@ mod tests {
         let mut fx = Fixture::new();
 
         fx.vm.param_pool.set_object_param(0, 0);
-        let obj_id = { let mut ctx = fx.ctx(); pfc.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); pfc.do_construct_native(&mut ctx, None, 1) };
 
         fx.vm.param_pool.set_float_param(0, 5.0_f64);
         { let mut ctx = fx.ctx(); pfc.invoke_native_method(&mut ctx, obj_id, 0); }
@@ -831,6 +1024,8 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         }));
         fx.register_class(std::sync::Arc::new(PiecewiseFunctionCurve { pieces: 0 }));
 
@@ -850,7 +1045,7 @@ mod tests {
         }
 
         fx.vm.param_pool.set_object_param(0, arr_id);
-        let obj_id = { let mut ctx = fx.ctx(); pfc.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); pfc.do_construct_native(&mut ctx, None, 1) };
 
         // x=3 在 [0,5] 内 → 第一条曲线 10.0
         fx.vm.param_pool.set_float_param(0, 3.0_f64);
@@ -872,6 +1067,8 @@ mod tests {
             curve: 0,
             start_x: 0.0,
             end_x: 0.0,
+            left_closed: true,
+            right_closed: false,
         }));
         fx.register_class(std::sync::Arc::new(PiecewiseFunctionCurve { pieces: 0 }));
 
@@ -886,7 +1083,7 @@ mod tests {
         }
 
         fx.vm.param_pool.set_object_param(0, arr_id);
-        let obj_id = { let mut ctx = fx.ctx(); pfc.do_construct_native(&mut ctx, None, 0) };
+        let obj_id = { let mut ctx = fx.ctx(); pfc.do_construct_native(&mut ctx, None, 1) };
 
         // x=99 不在任何分段内 → 0.0
         fx.vm.param_pool.set_float_param(0, 99.0_f64);

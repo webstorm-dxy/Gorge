@@ -1268,12 +1268,13 @@ impl Compiler {
                     }
                 }
             }
-            if !parameters.is_empty() {
-                result.push(gorge_core::objective::declaration::MethodAnnotation {
-                    name: ast_ann.name.clone(),
-                    parameters,
-                });
-            }
+            // 无参注解（如 `@Chart` / `@Song`）也必须记录：框架依赖注解名
+            // 定位谱表方法（`method_annotations` 为空会导致 `@Chart` 方法被整体
+            // 跳过、`score_elements=0`）。参数为空即无参注解，照常入表。
+            result.push(gorge_core::objective::declaration::MethodAnnotation {
+                name: ast_ann.name.clone(),
+                parameters,
+            });
         }
         result
     }
@@ -1774,6 +1775,28 @@ impl Compiler {
         }
     }
 
+    /// 获取该类此前已积累的注入器常量（作为新代码生成单元的索引种子）。
+    ///
+    /// 注入器常量的索引在**类内**连续分配（P0-7 按类持有）：每个新单元以
+    /// 本类此前已积累的常量作种子续写索引，单元结束把新常量回收进
+    /// `self.injector_constants`。这样类内各方法体的 `LoadInjectorConstant`
+    /// 引用与最终合并进 `CompiledClass.injector_constants` 的条目一一对应，
+    /// 避免方法间常量索引错位（此前每方法新建 cg 时索引从 0 重置）。
+    fn class_injector_constants_seed(&self, class_name: &str) -> Vec<gorge_core::objective::bytecode::InjectorConstantDef> {
+        self.injector_constants.get(class_name).cloned().unwrap_or_default()
+    }
+
+    /// 回收 CodeGenerator 中新产生的注入器常量到类级池。
+    ///
+    /// 由于 cg 借用了 `self.diagnostics`/`self.delegate_impls`，调用方必须
+    /// 先 `cg.take_injector_constants()` 取出 owned 常量、再 `cg.into_codes()`
+    /// 消费 cg 释放借用，最后才可调用本方法合并。
+    fn merge_class_injector_constants(&mut self, class_name: &str, ics: Vec<gorge_core::objective::bytecode::InjectorConstantDef>) {
+        if !ics.is_empty() {
+            self.injector_constants.entry(class_name.to_string()).or_default().extend(ics);
+        }
+    }
+
     /// S3b：生成隐藏方法的 IR
     ///
     /// 隐藏方法是注解参数表达式不能被常量折叠时生成的静态无参方法，
@@ -1781,11 +1804,13 @@ impl Compiler {
     fn generate_hidden_method_ir(&mut self) {
         let tasks = self.pending_hidden_methods.clone();
         for task in &tasks {
-            let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
-            cg.set_class_context(&task.class_name);
+            let class_name = task.class_name.clone();
+            let seed = self.class_injector_constants_seed(&class_name);
+            let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls, &self.injector_fields, seed);
+            cg.set_class_context(&class_name);
 
             // 设置注入器字段上下文（G1），使隐藏方法中可引用注入器字段
-            if let Some(inj_fields) = self.injector_fields.get(&task.class_name) {
+            if let Some(inj_fields) = self.injector_fields.get(&class_name) {
                 let inj_pairs: Vec<(String, ValueType)> = inj_fields.iter()
                     .map(|f| (f.name.clone(), f.value_type))
                     .collect();
@@ -1819,7 +1844,9 @@ impl Compiler {
             );
 
             let total_locals = cg.total_locals();
+            let new_constants = cg.take_injector_constants();
             let codes = cg.into_codes();
+            self.merge_class_injector_constants(&class_name, new_constants);
             let contents = CompiledMethodContents {
                 name: task.method_name.clone(),
                 codes,
@@ -1854,7 +1881,8 @@ impl Compiler {
                     }
                     if let Some(stmts) = self.find_matching_method_body(class_decl, method_info) {
                         let delegate_start = self.delegate_impls.len(); // I-D
-                        let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
+                        let seed = self.class_injector_constants_seed(&class_name);
+                        let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls, &self.injector_fields, seed);
 
                         cg.set_class_context(&class_decl.name);
 
@@ -1892,19 +1920,16 @@ impl Compiler {
                         }
 
                         cg.report_unresolved_leaves();
-                        let class_key = cg.current_class_name.clone().unwrap_or_default();
-                        let ic = std::mem::take(&mut cg.injector_constants);
-                        if !ic.is_empty() {
-                            self.injector_constants.entry(class_key.clone()).or_default().extend(ic);
-                        }
+                        let new_constants = cg.take_injector_constants();
                         let total_locals = cg.total_locals();
                         let codes = cg.into_codes();
+                        self.merge_class_injector_constants(&class_name, new_constants);
 
                         // I-D: 记录此类委托范围（合并同一类下多方法的委托范围）
                         let delegate_end = self.delegate_impls.len();
                         if delegate_end > delegate_start {
                             self.class_delegate_ranges
-                                .entry(class_key)
+                                .entry(class_name.clone())
                                 .and_modify(|(_s, e)| *e = delegate_end)
                                 .or_insert((delegate_start, delegate_end));
                         }
@@ -1945,7 +1970,8 @@ impl Compiler {
                             None => return,
                         };
                         let delegate_start = self.delegate_impls.len(); // I-D
-                        let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls);
+                        let seed = self.class_injector_constants_seed(class_name);
+                        let mut cg = CodeGenerator::new(&self.symbol_table, &mut self.diagnostics, &mut self.delegate_impls, &self.injector_fields, seed);
 
                         cg.set_class_context(&class_decl.name);
 
@@ -1986,19 +2012,16 @@ impl Compiler {
                         }
 
                         cg.report_unresolved_leaves();
-                        let class_key = cg.current_class_name.clone().unwrap_or_default();
-                        let ic = std::mem::take(&mut cg.injector_constants);
-                        if !ic.is_empty() {
-                            self.injector_constants.entry(class_key.clone()).or_default().extend(ic);
-                        }
+                        let new_constants = cg.take_injector_constants();
                         let total_locals = cg.total_locals();
                         let codes = cg.into_codes();
+                        self.merge_class_injector_constants(class_name, new_constants);
 
                         // I-D: 委托范围（合并同一类下多方法的委托范围）
                         let delegate_end = self.delegate_impls.len();
                         if delegate_end > delegate_start {
                             self.class_delegate_ranges
-                                .entry(class_key)
+                                .entry(class_name.clone())
                                 .and_modify(|(_s, e)| *e = delegate_end)
                                 .or_insert((delegate_start, delegate_end));
                         }
@@ -2045,10 +2068,13 @@ impl Compiler {
                                 continue;
                             }
                             if let Some(init_expr) = &field_decl.initializer {
+                                let seed = self.class_injector_constants_seed(&class_name);
                                 let mut cg = CodeGenerator::new(
                                     &self.symbol_table,
                                     &mut self.diagnostics,
                                     &mut self.delegate_impls,
+                                    &self.injector_fields,
+                                    seed,
                                 );
                                 cg.set_class_context(&class_name);
 
@@ -2125,7 +2151,9 @@ impl Compiler {
                                 );
 
                                 let total_locals = cg.total_locals();
+                                let new_constants = cg.take_injector_constants();
                                 let codes = cg.into_codes();
+                                self.merge_class_injector_constants(&class_name, new_constants);
 
                                 self.field_initializers
                                     .entry(class_name.clone())
@@ -2264,6 +2292,11 @@ impl Compiler {
                     _ => false,
                 },
             },
+            // 注入器类型 `Type^` / 数组 `Type[]` 按基础类型匹配（否则带注入器参数
+            // 的方法如 `@PeriodModifier PeriodModifier(DremuLane^ lane, ...)` 无法
+            // 在 find_matching_method_body 中定位方法体，导致方法整体不被编译）
+            TypeRef::Injector { base_type, .. } => self.type_ref_matches_type_info(base_type, ti),
+            TypeRef::Array { element_type, .. } => self.type_ref_matches_type_info(element_type, ti),
             _ => false,
         }
     }
@@ -3480,6 +3513,31 @@ class AnnTest {
         assert!(matches!(param, AnnotationValue::Float(v) if (v - 2.5).abs() < 1e-9));
     }
 
+    /// 无参注解（`@Chart`/`@Song`）也必须被捕获进 method_annotations，
+    /// 否则框架 `extract_element_periods_from_class` 找不到谱表方法、`score_elements=0`。
+    #[test]
+    fn test_s3_annotation_collect_bare_no_params() {
+        let source_text = r#"
+class AnnBare {
+    @Chart
+    float Period() { return 0.0; }
+}
+"#;
+        let (tokens, _) = crate::frontend::lexer::tokenize(source_text, 0);
+        let mut parser = crate::frontend::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source_file]);
+
+        let anns = compiler.method_annotations.get("AnnBare");
+        assert!(anns.is_some(), "AnnBare 应有方法注解");
+        let anns = anns.unwrap();
+        let method_anns = anns.get(&0).expect("全局 ID 0 应有注解");
+        assert_eq!(method_anns.len(), 1, "无参注解也应被记录");
+        assert_eq!(method_anns[0].name, "Chart", "应记录注解名 @Chart");
+        assert!(method_anns[0].parameters.is_empty(), "无参注解参数应为空");
+    }
+
     /// 注解参数用常量算术表达式 → 编译时折叠为常量
     #[test]
     fn test_s3_annotation_collect_constant_arithmetic() {
@@ -4142,6 +4200,72 @@ class Lane
         assert!(result.is_ok(), "裸 ^field 应编译通过: {:?}", result.err());
     }
 
+    /// 带注入器参数的方法（如 `@PeriodModifier` 的 `PeriodModifier(Lane^ lane, ...)`）
+    /// 必须被编译进产物。回归：`type_ref_matches_type_info` 对 `TypeRef::Injector`
+    /// 返回 false，导致 find_matching_method_body 匹配失败、方法整体未被编译
+    /// （真实 Demo 中 DremuNote/DremuMainLane 的 @PeriodModifier 方法缺失）。
+    #[test]
+    fn test_method_with_injector_param_is_compiled() {
+        let (tokens, lexer_diags) = crate::frontend::lexer::tokenize(r#"
+namespace Dremu;
+class Lane
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float generateTime = ^generateTime;
+}
+class PeriodConfig
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float timeOffset = ^timeOffset;
+}
+class Note
+{
+    static void PeriodModifier(Lane^ lane, PeriodConfig config)
+    {
+        int x = 1;
+    }
+}
+"#, 0);
+        assert!(lexer_diags.is_empty());
+        let mut parser = crate::frontend::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().expect("语法错误");
+        let module = crate::compile_sources(&[source_file], false).expect("编译应通过");
+        let names: Vec<&str> = module.classes.iter()
+            .flat_map(|c| c.methods.iter().map(|m| m.name.as_str()))
+            .collect();
+        assert!(
+            names.iter().any(|n| *n == "PeriodModifier"),
+            "带注入器参数的方法应被编译，实际方法列表: {:?}",
+            names
+        );
+    }
+
+    /// `obj.^field` 按对象声明类型解析注入器字段。回归：此前仅查当前类
+    /// injector_field_info，`@PeriodModifier` 的 `laneInjector.^generateTime`
+    /// （laneInjector 为 `Lane^` 参数）报「未定义的注入器字段」。
+    #[test]
+    fn test_injector_field_access_on_injector_param() {
+        let result = compile_text(r#"
+namespace Dremu;
+class Lane
+{
+    [auto defaultValue = 0.0]
+    @Inject
+    float generateTime = ^generateTime;
+}
+class Note
+{
+    static void PeriodModifier(Lane^ laneInjector)
+    {
+        laneInjector.^generateTime = laneInjector.^generateTime + 1.0;
+    }
+}
+"#);
+        assert!(result.is_ok(), "参数注入器字段访问应编译通过: {:?}", result.err());
+    }
+
     /// Lambda 参数上的 `obj.^field` 访问（DremuLane 类注解 display lambda 模式）
     #[test]
     fn test_injector_field_access_on_lambda_param() {
@@ -4247,6 +4371,407 @@ class Lane
 }
 "#);
         assert!(result.is_ok(), "注入器数组构造应编译通过: {:?}", result.err());
+    }
+
+    // ==================== P0-7 注入器常量按类持有 ====================
+
+    /// 类内多方法注入器常量索引连续分配（P0-7 按类持有）
+    ///
+    /// 每个方法体中的 `LoadInjectorConstant(idx)` 应引用类级常量池中
+    /// 属于该方法自己的条目，而不是从头重新计数（此前每方法新建
+    /// CodeGenerator 时索引从 0 重置，多方法类会产生索引错位）。
+    #[test]
+    fn test_p0_7_injector_constants_indexed_per_class() {
+        use gorge_core::objective::bytecode::InjectorConstField;
+        use gorge_core::virtual_machine::ir::IntermediateOperator;
+
+        // 构造含两个方法的类，各自返回注入器字面量
+        let source = SourceFile {
+            namespace: Some(QualifiedName {
+                parts: vec!["Dremu".into()],
+                span: dummy_span(),
+            }),
+            usings: vec![],
+            members: vec![
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Vector2".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![
+                        ClassMember::Field(FieldDeclaration {
+                            annotations: vec![Annotation {
+                                name: "Inject".into(),
+                                generic_type: None,
+                                arguments: vec![],
+                                metadatas: vec![],
+                                span: dummy_span(),
+                            }],
+                            modifiers: vec![],
+                            name: "x".into(),
+                            field_type: TypeRef::simple("float", dummy_span()),
+                            initializer: Some(Expression::Literal(Literal::Float(0.0), dummy_span())),
+                            span: dummy_span(),
+                        }),
+                    ],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Staff".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![
+                        ClassMember::Method(MethodDeclaration {
+                            annotations: vec![Annotation {
+                                name: "Chart".into(),
+                                generic_type: None,
+                                arguments: vec![],
+                                metadatas: vec![],
+                                span: dummy_span(),
+                            }],
+                            modifiers: vec![Modifier::Static],
+                            name: "PeriodA".into(),
+                            return_type: TypeRef::Injector {
+                                base_type: Box::new(TypeRef::simple("Vector2", dummy_span())),
+                                span: dummy_span(),
+                            },
+                            parameters: vec![],
+                            body: Some(vec![Statement::Return {
+                                value: Some(Expression::InjectorObject {
+                                    class_name: "Vector2".into(),
+                                    fields: vec![
+                                        ("x".into(), Expression::Literal(Literal::Float(1.0), dummy_span())),
+                                    ],
+                                    span: dummy_span(),
+                                }),
+                                span: dummy_span(),
+                            }]),
+                            span: dummy_span(),
+                        }),
+                        ClassMember::Method(MethodDeclaration {
+                            annotations: vec![Annotation {
+                                name: "Chart".into(),
+                                generic_type: None,
+                                arguments: vec![],
+                                metadatas: vec![],
+                                span: dummy_span(),
+                            }],
+                            modifiers: vec![Modifier::Static],
+                            name: "PeriodB".into(),
+                            return_type: TypeRef::Injector {
+                                base_type: Box::new(TypeRef::simple("Vector2", dummy_span())),
+                                span: dummy_span(),
+                            },
+                            parameters: vec![],
+                            body: Some(vec![Statement::Return {
+                                value: Some(Expression::InjectorObject {
+                                    class_name: "Vector2".into(),
+                                    fields: vec![
+                                        ("x".into(), Expression::Literal(Literal::Float(2.0), dummy_span())),
+                                    ],
+                                    span: dummy_span(),
+                                }),
+                                span: dummy_span(),
+                            }]),
+                            span: dummy_span(),
+                        }),
+                    ],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            span: dummy_span(),
+        };
+
+        let module = crate::compile_sources(&[source], false).expect("应编译成功");
+        let staff = module.classes.iter()
+            .find(|c| c.class_type.name() == "Staff")
+            .expect("应存在 Staff 类");
+
+        // 类级常量池包含两个方法各自产生的常量
+        assert_eq!(staff.injector_constants.len(), 2, "两个方法应产生两个类级常量");
+
+        // 类级常量池包含两个方法各自产生的常量
+        assert_eq!(staff.injector_constants.len(), 2, "两个方法应产生两个类级常量: {:?}",
+            staff.injector_constants.iter().map(|c| format!("{}:{}", c.class_name, c.fields.len())).collect::<Vec<_>>());
+
+        // PeriodA 的 LoadInjectorConstant(0) → 常量 x=1.0
+        let period_a = staff.methods.iter().find(|m| m.name == "PeriodA").expect("PeriodA");
+        let a_idx = period_a.codes.iter().rev().find_map(|code| match code.code.operator {
+            IntermediateOperator::LoadInjectorConstant(idx) => Some(idx),
+            _ => None,
+        }).expect("PeriodA 应含 LoadInjectorConstant");
+        assert_eq!(a_idx, 0, "首个方法常量索引应为 0");
+        let a_const = &staff.injector_constants[a_idx];
+        assert_eq!(a_const.class_name, "Vector2");
+        match &a_const.fields[0] {
+            InjectorConstField::Float(_, v) => assert!((*v - 1.0).abs() < 1e-9, "PeriodA x 应为 1.0"),
+            other => panic!("PeriodA 字段应为 Float: {:?}", other),
+        }
+
+        // PeriodB 的 LoadInjectorConstant(1) → 常量 x=2.0（索引在类内连续，不重置为 0）
+        let period_b = staff.methods.iter().find(|m| m.name == "PeriodB").expect("PeriodB");
+        let b_idx = period_b.codes.iter().rev().find_map(|code| match code.code.operator {
+            IntermediateOperator::LoadInjectorConstant(idx) => Some(idx),
+            _ => None,
+        }).expect("PeriodB 应含 LoadInjectorConstant");
+        assert_eq!(b_idx, 1, "第二个方法常量索引应续写为 1（类级连续分配）");
+        let b_const = &staff.injector_constants[b_idx];
+        assert_eq!(b_const.class_name, "Vector2");
+        match &b_const.fields[0] {
+            InjectorConstField::Float(_, v) => assert!((*v - 2.0).abs() < 1e-9, "PeriodB x 应为 2.0"),
+            other => panic!("PeriodB 字段应为 Float: {:?}", other),
+        }
+    }
+
+    /// H3A 修复：`new Element^[N]{ elem1, ... }`（带内联注入器元素）应折叠为
+    /// `class_name="Array"` 的类级常量，`@Chart` 方法返回该常量数组，使框架
+    /// `fill_element_period_from_method` 能从常量池逐元素恢复（不再静默丢弃）。
+    /// 复刻真实谱面 `DremuStaff.Period` 的形态：返回 `new Element^[N]{ 嵌套注入器对象 }`。
+    #[test]
+    fn test_p_chart_new_array_inline_injector_elements_build_array_constant() {
+        use gorge_core::objective::bytecode::InjectorConstField;
+        use gorge_core::virtual_machine::ir::IntermediateOperator;
+
+        // 构造一个 Element 注入器对象元素（含嵌套 Vector2 注入器字段）
+        let make_elem = |name: &str, x: f32| Expression::InjectorObject {
+            class_name: "Element".into(),
+            fields: vec![
+                ("name".into(), Expression::Literal(Literal::String(name.into()), dummy_span())),
+                (
+                    "pos".into(),
+                    Expression::InjectorObject {
+                        class_name: "Vector2".into(),
+                        fields: vec![("x".into(), Expression::Literal(Literal::Float(x as f64), dummy_span()))],
+                        span: dummy_span(),
+                    },
+                ),
+            ],
+            span: dummy_span(),
+        };
+
+        let source = SourceFile {
+            namespace: Some(QualifiedName { parts: vec!["Dremu".into()], span: dummy_span() }),
+            usings: vec![],
+            members: vec![
+                // 声明 Vector2 注入器类，供嵌套字段解析
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Vector2".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![ClassMember::Field(FieldDeclaration {
+                        annotations: vec![Annotation {
+                            name: "Inject".into(), generic_type: None, arguments: vec![],
+                            metadatas: vec![], span: dummy_span(),
+                        }],
+                        modifiers: vec![],
+                        name: "x".into(),
+                        field_type: TypeRef::simple("float", dummy_span()),
+                        initializer: Some(Expression::Literal(Literal::Float(0.0), dummy_span())),
+                        span: dummy_span(),
+                    })],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+                // 声明 Element 注入器类，作为数组元素类型
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Element".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![
+                        ClassMember::Field(FieldDeclaration {
+                            annotations: vec![Annotation {
+                                name: "Inject".into(), generic_type: None, arguments: vec![],
+                                metadatas: vec![], span: dummy_span(),
+                            }],
+                            modifiers: vec![],
+                            name: "name".into(),
+                            field_type: TypeRef::simple("string", dummy_span()),
+                            initializer: Some(Expression::Literal(Literal::String(String::new()), dummy_span())),
+                            span: dummy_span(),
+                        }),
+                        ClassMember::Field(FieldDeclaration {
+                            annotations: vec![Annotation {
+                                name: "Inject".into(), generic_type: None, arguments: vec![],
+                                metadatas: vec![], span: dummy_span(),
+                            }],
+                            modifiers: vec![],
+                            name: "pos".into(),
+                            field_type: TypeRef::simple("Vector2", dummy_span()),
+                            initializer: Some(Expression::Literal(Literal::Float(0.0), dummy_span())),
+                            span: dummy_span(),
+                        }),
+                    ],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+                TopLevelMember::Class(ClassDeclaration {
+                    annotations: vec![],
+                    modifiers: vec![],
+                    name: "Staff".into(),
+                    generic_params: vec![],
+                    super_class: None,
+                    super_interfaces: vec![],
+                    members: vec![ClassMember::Method(MethodDeclaration {
+                        annotations: vec![Annotation {
+                            name: "Chart".into(), generic_type: None,
+                            arguments: vec![], metadatas: vec![], span: dummy_span(),
+                        }],
+                        modifiers: vec![Modifier::Static],
+                        name: "Period".into(),
+                        return_type: TypeRef::simple("Element", dummy_span()),
+                        parameters: vec![],
+                        body: Some(vec![Statement::Return {
+                            value: Some(Expression::StaticMethodCall {
+                                class_name: "array".into(),
+                                method: "new_array".into(),
+                                arguments: vec![
+                                    Expression::Literal(Literal::Int(3), dummy_span()),
+                                    make_elem("A", 1.0),
+                                    make_elem("B", 2.0),
+                                    make_elem("C", 3.0),
+                                ],
+                                span: dummy_span(),
+                            }),
+                            span: dummy_span(),
+                        }]),
+                        span: dummy_span(),
+                    })],
+                    injector: None,
+                    span: dummy_span(),
+                }),
+            ],
+            span: dummy_span(),
+        };
+
+        let module = crate::compile_sources(&[source], false).expect("应编译成功");
+        let staff = module.classes.iter()
+            .find(|c| c.class_type.name() == "Staff")
+            .expect("应存在 Staff 类");
+
+        // 类级常量池应含一个 Array 常量（3 个元素），而非被静默丢弃
+        assert_eq!(staff.injector_constants.len(), 1, "应产生一个 Array 常量");
+        let arr = &staff.injector_constants[0];
+        assert_eq!(arr.class_name, "Array", "内联元素数组常量类名应为 Array");
+        assert_eq!(arr.fields.len(), 3, "Array 常量应含全部 3 个元素");
+
+        // 每个元素都是 InjectObject，保留类名 Element 与字段数据
+        for (i, f) in arr.fields.iter().enumerate() {
+            let expected = ["A", "B", "C"][i];
+            match f {
+                InjectorConstField::InjectObject(class_name, nested) => {
+                    assert_eq!(class_name, "Element");
+                    assert_eq!(nested.len(), 2, "每个元素应含 (name, pos) 两个字段");
+                    assert!(matches!(&nested[0], InjectorConstField::String(n, v) if n == "name" && v == expected));
+                    // 嵌套 pos 字段是 InjectObject，保留类名 Vector2
+                    match &nested[1] {
+                        InjectorConstField::InjectObject(nc, nf) => {
+                            assert_eq!(nc, "Vector2");
+                            assert!(matches!(&nf[0], InjectorConstField::Float(n, _) if n == "x"));
+                        }
+                        other => panic!("元素 {} 的 pos 应为 InjectObject: {:?}", i, other),
+                    }
+                }
+                other => panic!("元素 {} 应为 InjectObject: {:?}", i, other),
+            }
+        }
+
+        // Period 方法应发射 LoadInjectorConstant(0) 指向该 Array 常量
+        let period = staff.methods.iter().find(|m| m.name == "Period").expect("Period");
+        let idx = period.codes.iter().rev().find_map(|code| match code.code.operator {
+            IntermediateOperator::LoadInjectorConstant(idx) => Some(idx),
+            _ => None,
+        }).expect("Period 应含 LoadInjectorConstant");
+        assert_eq!(idx, 0, "Period 的 LoadInjectorConstant 应指向 Array 常量索引 0");
+    }
+
+    /// H3A 修复（源码文本端到端）：真实谱面 `@Chart` 方法体
+    /// `return new GorgeFramework.Element^[N]{ elem1, ... };` 应经 parser →
+    /// codegen 折叠为 `class_name="Array"` 的类级常量，`Period` 方法发射
+    /// `LoadInjectorConstant`，框架据此从常量池恢复元素（不再静默丢弃）。
+    #[test]
+    fn test_p_chart_new_array_source_text_build_array_constant() {
+        use gorge_core::objective::bytecode::InjectorConstField;
+        use gorge_core::virtual_machine::ir::IntermediateOperator;
+
+        let framework = {
+            let (tokens, _) = crate::frontend::lexer::tokenize(r#"
+namespace GorgeFramework;
+native class Element
+{
+    float generateTime;
+}
+"#, 0);
+            crate::frontend::parser::Parser::new(tokens).parse_source_file().expect("框架类语法错误")
+        };
+        let dremu = {
+            let (tokens, _) = crate::frontend::lexer::tokenize(r#"
+namespace Dremu;
+using GorgeFramework;
+class Staff
+{
+    @Chart
+    static GorgeFramework.Element^[] Period()
+    {
+        return new GorgeFramework.Element^[2]{
+            GorgeFramework.Element : {
+                generateTime : 1.0,
+                progressCurve : null,
+            },
+            GorgeFramework.Element : {
+                generateTime : 2.0,
+                progressCurve : null,
+            },
+        };
+    }
+}
+"#, 1);
+            crate::frontend::parser::Parser::new(tokens).parse_source_file().expect("谱面语法错误")
+        };
+
+        let module = crate::compile_sources(&[framework, dremu], false)
+            .expect("真实谱面 new Element^[N]{...} 应编译成功");
+        let staff = module.classes.iter()
+            .find(|c| c.class_type.name() == "Staff")
+            .expect("应存在 Staff 类");
+
+        // 类级常量池应含一个 Array 常量，含全部 2 个元素
+        assert_eq!(staff.injector_constants.len(), 1, "应产生一个 Array 常量");
+        let arr = &staff.injector_constants[0];
+        assert_eq!(arr.class_name, "Array", "内联元素数组常量类名应为 Array");
+        assert_eq!(arr.fields.len(), 2, "Array 常量应含全部 2 个元素");
+        for (i, f) in arr.fields.iter().enumerate() {
+            let expected = [1.0_f64, 2.0][i];
+            match f {
+                InjectorConstField::InjectObject(class_name, nested) => {
+                    assert!(class_name.ends_with("Element"), "元素应保留类名 Element，实际为 {:?}", class_name);
+                    assert!(matches!(&nested[0], InjectorConstField::Float(n, v) if n == "generateTime" && (*v - expected).abs() < 1e-9));
+                    // null 字段应折叠为 Object 引用 ID 0（VM null 约定）
+                    assert!(matches!(&nested[1], InjectorConstField::Object(n, id) if n == "progressCurve" && *id == 0));
+                }
+                other => panic!("元素 {} 应为 InjectObject: {:?}", i, other),
+            }
+        }
+
+        // Period 方法应发射 LoadInjectorConstant(0) 指向该 Array 常量
+        let period = staff.methods.iter().find(|m| m.name == "Period").expect("Period");
+        let idx = period.codes.iter().rev().find_map(|code| match code.code.operator {
+            IntermediateOperator::LoadInjectorConstant(idx) => Some(idx),
+            _ => None,
+        }).expect("Period 应含 LoadInjectorConstant");
+        assert_eq!(idx, 0, "Period 的 LoadInjectorConstant 应指向 Array 常量索引 0");
     }
 }
 

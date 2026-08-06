@@ -68,6 +68,10 @@ pub struct EnvironmentGlobal {
     pub asset_objects: HashMap<(usize, String), usize>,
     /// `(VM 地址, Graph 对象 ID)` → 平台纹理句柄。
     pub graph_handles: HashMap<(usize, usize), usize>,
+    /// `(VM 地址, Audio 对象 ID)` → 平台音频句柄。
+    pub audio_handles: HashMap<(usize, usize), usize>,
+    /// `(VM 地址, Video 对象 ID)` → 平台视频句柄。
+    pub video_handles: HashMap<(usize, usize), usize>,
     /// 存活元素信息表（用于 FindAliveLane）
     pub alive_elements: Vec<AliveElementInfo>,
     /// 计分器（由 SceneManager 在 RuntimeInitialize 时设置）
@@ -86,6 +90,8 @@ impl EnvironmentGlobal {
             assets: HashMap::new(),
             asset_objects: HashMap::new(),
             graph_handles: HashMap::new(),
+            audio_handles: HashMap::new(),
+            video_handles: HashMap::new(),
             alive_elements: Vec::new(),
             scoring: None,
             respond_effects: HashMap::new(),
@@ -150,6 +156,8 @@ pub fn sync_assets_from(assets: &HashMap<String, usize>) {
         env.assets.extend(assets.iter().map(|(k, v)| (k.clone(), *v)));
         env.asset_objects.clear();
         env.graph_handles.clear();
+        env.audio_handles.clear();
+        env.video_handles.clear();
     });
 }
 
@@ -192,6 +200,58 @@ pub fn resolve_graph_handle(vm_address: usize, graph_object_id: usize) -> usize 
             .get(&(vm_address, graph_object_id))
             .copied()
             .unwrap_or(graph_object_id)
+    })
+}
+
+/// 记录 Audio VM 对象与平台音频句柄的对应关系。
+pub fn register_audio_handle(
+    vm_address: usize,
+    audio_object_id: usize,
+    audio_handle: usize,
+) {
+    with_env_global_mut(|env| {
+        env.audio_handles.insert((vm_address, audio_object_id), audio_handle);
+    });
+}
+
+/// 将 Audio VM 对象 ID 解析为平台音频句柄。
+///
+/// 非资产创建的 Audio 没有注册映射时，保留原始值以兼容直接传入平台句柄的调用方。
+pub fn resolve_audio_handle(vm_address: usize, audio_object_id: usize) -> usize {
+    if audio_object_id == 0 {
+        return 0;
+    }
+    with_env_global(|env| {
+        env.audio_handles
+            .get(&(vm_address, audio_object_id))
+            .copied()
+            .unwrap_or(audio_object_id)
+    })
+}
+
+/// 记录 Video VM 对象与平台视频句柄的对应关系。
+pub fn register_video_handle(
+    vm_address: usize,
+    video_object_id: usize,
+    video_handle: usize,
+) {
+    with_env_global_mut(|env| {
+        env.video_handles.insert((vm_address, video_object_id), video_handle);
+    });
+}
+
+/// 将 Video VM 对象 ID 解析为平台视频句柄。
+///
+/// 非资产创建的 Video 没有注册映射时，保留原始值以兼容直接传入平台句柄的调用方。
+pub fn resolve_video_handle(vm_address: usize, video_object_id: usize) -> usize {
+    if video_object_id == 0 {
+        return 0;
+    }
+    with_env_global(|env| {
+        env.video_handles
+            .get(&(vm_address, video_object_id))
+            .copied()
+            .unwrap_or(video_object_id)
     })
 }
 

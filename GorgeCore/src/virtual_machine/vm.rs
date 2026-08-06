@@ -513,6 +513,46 @@ impl VirtualMachine {
         )
     }
 
+    /// 按全局方法 ID 调用类的静态方法（对齐 C# `ClassInfo.InvokeStaticMethod`）。
+    ///
+    /// 与 `invoke_method_by_id`（实例方法路径）不同，本方法沿 `class_static_methods`
+    /// 静态方法表分派，`set_this` 传 None（静态方法无 `this`）。`@PeriodModifier`
+    /// 等静态注解方法必须走此路径，否则会被误判为实例方法而报"调用目标对象为空"。
+    ///
+    /// 参数经 `set_*_param` 预置在参数池，方法体以 `LoadObjectParameter` 直读
+    /// （与 `invoke_method_by_id` 的 `ParamMode::None` 约定一致）。
+    ///
+    /// 静态方法索引 = `method_global_id - method_start_id`（编译器注解表按
+    /// `method_start_id + 局部索引` 记录全局 ID，`class_static_methods` 按声明顺序
+    /// 存储整类方法，二者索引一致）。
+    pub fn invoke_static_method_by_global_id(
+        &mut self,
+        class_name: &str,
+        method_global_id: usize,
+    ) -> VmResult<()> {
+        let start = self.class_table
+            .get(class_name)
+            .ok_or_else(|| format!("类 `{}` 未注册", class_name))?
+            .declaration
+            .method_start_id;
+        let static_idx = method_global_id.saturating_sub(start);
+        let method = self.class_static_methods
+            .get(class_name)
+            .ok_or_else(|| format!("类 `{}` 未注册方法表", class_name))?
+            .get(static_idx)
+            .map(|(m, _types)| m.clone())
+            .ok_or_else(|| format!("类 `{}` 静态方法索引 {} 越界", class_name, static_idx))?;
+        self.call_compiled_method(
+            &method,
+            &ParamMode::None,
+            None,
+            ValueType::Int,
+            Some(class_name),
+            None,
+            false,
+        )
+    }
+
     /// 通过注入器实例化对象（S3d）
     ///
     /// 创建空对象 → 保存并设置 current_injector=injector_obj_id →
@@ -2112,6 +2152,16 @@ impl VirtualMachine {
             IntermediateOperator::Nop => {}
 
             // 注入器常量加载（G2）
+            //
+            // 常量池条目由 runner/loader 注册（`CompiledClass.injector_constants`
+            // 合并进 `self.injector_constants`）。本指令负责把常量定义物化为
+            // 可执行对象：
+            // - 标量字段（Int/Float/Bool/String）直接填入注入器；
+            // - `InjectObject` 嵌套注入器递归物化为 RuntimeInjector，写入外层
+            //   注入器的 object 槽位；
+            // - `Array` 物化为 native 数组载荷（元素递归物化），并用编译层
+            //   RuntimeObject 包装（`length` 字段语义，对齐 InvokeArrayConstructor）；
+            // - `Object` 字段保留编译期记录的对象 ID（与常量定义的语义一致）。
             IntermediateOperator::LoadInjectorConstant(idx) => {
             let constant = match self.injector_constants.get(*idx) {
                 Some(c) => c.clone(),
@@ -2122,16 +2172,207 @@ impl VirtualMachine {
                     ));
                 }
             };
-                let inj = crate::system::native::injector::RuntimeInjector::from_constant(&constant);
-                let inj_id = self.next_object_id;
-                self.next_object_id += 1;
-                self.injectors.insert(inj_id, inj);
+                let inj_id = self.materialize_injector_constant(&constant)?;
                 let addr = self.get_object_addr(code.result);
                 self.object_stack.write(addr, inj_id);
             }
         }
 
         Ok(true) // pc 正常自增
+    }
+
+    /// 将注入器常量定义物化为运行时对象，返回对象 ID。
+    ///
+    /// 顶层返回注入器对象（`RuntimeInjector`）。实现分两步：
+    /// 1. `RuntimeInjector::from_constant` 按常量定义完成标量字段填充
+    ///    （object 槽位先按 0 占位）；
+    /// 2. 沿常量定义二次遍历，把嵌套 `InjectObject` 递归物化为注入器、
+    ///    `Array` 物化为 native 数组对象，写入对应 object 槽位。
+    fn materialize_injector_constant(
+        &mut self,
+        constant: &crate::objective::bytecode::InjectorConstantDef,
+    ) -> VmResult<usize> {
+        let class_decl = self.injector_declaration_for_constant(&constant.class_name);
+        let mut injector = RuntimeInjector::from_constant(constant, class_decl);
+
+        // 第二遍：递归物化嵌套对象/数组，写入 object 槽位
+        let mut oi = 0usize;
+        for field in &constant.fields {
+            match field {
+                crate::objective::bytecode::InjectorConstField::Object(..) => {
+                    oi += 1; // 编译期记录的对象 ID 已由 from_constant 写入
+                }
+                crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, fields) => {
+                    let nested = crate::objective::bytecode::InjectorConstantDef {
+                        class_name: nested_class.clone(),
+                        fields: fields.clone(),
+                    };
+                    let nested_id = self.materialize_injector_constant(&nested)?;
+                    if oi < injector.object_field_count() {
+                        injector.set_injector_object(oi, nested_id);
+                    }
+                    oi += 1;
+                }
+                crate::objective::bytecode::InjectorConstField::Array(elements) => {
+                    let array_id = self.materialize_injector_array(elements)?;
+                    if oi < injector.object_field_count() {
+                        injector.set_injector_object(oi, array_id);
+                    }
+                    oi += 1;
+                }
+                _ => {}
+            }
+        }
+        let inj_id = self.next_object_id;
+        self.next_object_id += 1;
+        self.injectors.insert(inj_id, injector);
+        Ok(inj_id)
+    }
+
+    /// 为注入器常量解析类声明。
+    ///
+    /// 常量中保存源码中的类名（可能为全限定名），而 VM 类表按 loader 约定
+    /// 以简单名注册，因此按「全名 → 末段短名」双键解析；未注册的类回退为
+    /// 哑声明（字段槽位按常量字段数分配，保证标量数据不丢失）。
+    fn injector_declaration_for_constant(
+        &self,
+        class_name: &str,
+    ) -> std::sync::Arc<crate::objective::declaration::ClassDeclaration> {
+        let resolved = if self.class_table.contains_key(class_name) {
+            Some(class_name.to_string())
+        } else {
+            let simple = class_name.rsplit('.').next().unwrap_or(class_name).to_string();
+            if self.class_table.contains_key(&simple) { Some(simple) } else { None }
+        };
+        if let Some(name) = resolved {
+            if let Some(cls) = self.class_table.get(&name) {
+                let mut decl = cls.declaration.clone();
+                // 注入器后续会以声明中的类型名查回 VM（如 Environment 中
+                // materialize_injector 的 resolve_registered_class_name），
+                // 因此保存实际注册键而非源码中的全限定名
+                decl.class_type = crate::objective::types::GorgeType::class(name, None);
+                return std::sync::Arc::new(decl);
+            }
+        }
+        // 未注册的类：使用哑声明（槽位按类型计数 0 分配，标量字段越界时
+        // 静默跳过，保证常量物化不失败）
+        std::sync::Arc::new(crate::objective::declaration::ClassDeclaration::dummy(class_name.to_string()))
+    }
+
+    /// 将注入器数组常量物化为 native 数组对象，返回对象 ID。
+    ///
+    /// 数组项为 `InjectObject` 时递归物化为注入器对象，其余标量项直接写入
+    /// 对应类型的 native 数组载荷；元素类型由常量中首项推导，空数组退化为
+    /// ObjectArray。同时创建编译层包装 RuntimeObject（int 字段 0 存放 length，
+    /// 对齐 `InvokeArrayConstructor` 的数组构造语义）。
+    fn materialize_injector_array(
+        &mut self,
+        elements: &[crate::objective::bytecode::InjectorConstField],
+    ) -> VmResult<usize> {
+        use crate::system::native::array::*;
+
+        // 元素类型：首项为 InjectObject 时取嵌套类名，否则按标量类型取
+        // 对应的基本类型名（Int → "int"，…）
+        let elem_type_name = match elements.first() {
+            Some(crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, _)) => {
+                nested_class.rsplit('.').next().unwrap_or(nested_class).to_string()
+            }
+            Some(crate::objective::bytecode::InjectorConstField::Int(..)) => "int".to_string(),
+            Some(crate::objective::bytecode::InjectorConstField::Float(..)) => "float".to_string(),
+            Some(crate::objective::bytecode::InjectorConstField::Bool(..)) => "bool".to_string(),
+            Some(crate::objective::bytecode::InjectorConstField::String(..)) => "string".to_string(),
+            _ => "object".to_string(),
+        };
+        let array_class = format!("{}Array", {
+            let mut c = elem_type_name.chars();
+            match c.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        });
+
+        // 预分配元素 ID（避免与插入 native 载荷的借用冲突）
+        let element_ids: Vec<Option<usize>> = elements.iter()
+            .map(|f| match f {
+                crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, fields) => {
+                    let nested = crate::objective::bytecode::InjectorConstantDef {
+                        class_name: nested_class.clone(),
+                        fields: fields.clone(),
+                    };
+                    self.materialize_injector_constant(&nested).ok()
+                }
+                _ => None,
+            })
+            .collect();
+
+        // 元素为对象 ID 的数组项：无论推导出的元素类型如何都写入 ObjectArray
+        let use_object_array = elements.iter().any(|f| matches!(
+            f,
+            crate::objective::bytecode::InjectorConstField::InjectObject(..)
+        ));
+
+        // 分配对象 ID 并写入对应类型的 native 载荷
+        let array_id = self.next_object_id;
+        self.next_object_id += 1;
+        if use_object_array {
+            let mut items: Vec<usize> = Vec::with_capacity(elements.len());
+            for (i, f) in elements.iter().enumerate() {
+                let item_id = match f {
+                    crate::objective::bytecode::InjectorConstField::InjectObject(..) => {
+                        element_ids[i].unwrap_or(0)
+                    }
+                    crate::objective::bytecode::InjectorConstField::Object(_, v) => *v,
+                    _ => 0,
+                };
+                items.push(item_id);
+            }
+            self.native_payloads.insert(array_id, Box::new(ObjectArray { items }));
+        } else if elem_type_name == "int" {
+            let items: Vec<i64> = elements.iter().map(|f| match f {
+                crate::objective::bytecode::InjectorConstField::Int(_, v) => *v,
+                _ => 0,
+            }).collect();
+            self.native_payloads.insert(array_id, Box::new(IntArray { items }));
+        } else if elem_type_name == "float" {
+            let items: Vec<f64> = elements.iter().map(|f| match f {
+                crate::objective::bytecode::InjectorConstField::Float(_, v) => *v,
+                _ => 0.0,
+            }).collect();
+            self.native_payloads.insert(array_id, Box::new(FloatArray { items }));
+        } else if elem_type_name == "bool" {
+            let items: Vec<bool> = elements.iter().map(|f| match f {
+                crate::objective::bytecode::InjectorConstField::Bool(_, v) => *v,
+                _ => false,
+            }).collect();
+            self.native_payloads.insert(array_id, Box::new(BoolArray { items }));
+        } else if elem_type_name == "string" {
+            let items: Vec<String> = elements.iter().map(|f| match f {
+                crate::objective::bytecode::InjectorConstField::String(_, v) => v.clone(),
+                _ => String::new(),
+            }).collect();
+            self.native_payloads.insert(array_id, Box::new(StringArray { items }));
+        } else {
+            let items: Vec<usize> = elements.iter().map(|f| match f {
+                crate::objective::bytecode::InjectorConstField::Object(_, v) => *v,
+                _ => 0,
+            }).collect();
+            self.native_payloads.insert(array_id, Box::new(ObjectArray { items }));
+        }
+
+        // 编译层包装对象：int 字段 0 存放 length（对齐 InvokeArrayConstructor）
+        let wrapper_id = self.next_object_id;
+        self.next_object_id += 1;
+        let mut wrapper = RuntimeObject::new_simple(
+            array_class.clone(),
+            &crate::objective::types::TypeCount { int_count: 1, ..crate::objective::types::TypeCount::zero() },
+        );
+        wrapper.set_int_field(0, elements.len() as i64);
+        wrapper.native_object_id = Some(array_id);
+        self.objects.insert(wrapper_id, wrapper);
+        if let Some(native_obj) = self.objects.get_mut(&array_id) {
+            native_obj.outer_compiled_id = Some(wrapper_id);
+        }
+        Ok(wrapper_id)
     }
 
     /// 获取 int 类型的返回值
@@ -4257,5 +4498,144 @@ mod tests {
         let result = vm.execute_one(&invoke_code);
         assert!(result.is_err(), "调用未实现的接口方法应返回 Err");
         assert!(result.unwrap_err().contains("未实现接口"), "错误信息应包含'未实现接口'");
+    }
+
+    // ==================== P0-7 LoadInjectorConstant 嵌套物化 ====================
+
+    /// LoadInjectorConstant 全链路：标量 + 嵌套注入器 + 数组递归物化
+    #[test]
+    fn test_p0_7_load_injector_constant_nested_materialize() {
+        use crate::objective::bytecode::{InjectorConstantDef, InjectorConstField};
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::objective::types::GorgeType;
+        use std::sync::Arc;
+
+        // 注册含 (int=1, object=1) 注入器字段的类（全名注册，验证双键解析）
+        let decl = ClassDeclaration {
+            class_type: GorgeType::class("Chart.Outer", None),
+            injector_field_type_count: TypeCount { int_count: 1, object_count: 1, ..TypeCount::zero() },
+            ..ClassDeclaration::dummy("Chart.Outer".into())
+        };
+        let cls = Arc::new(RuntimeClass::new(decl, None));
+
+        // 嵌套注入器类同样注册（按简单名），验证嵌套类名也走双键解析
+        let inner_decl = ClassDeclaration {
+            class_type: GorgeType::class("Chart.Vector2", None),
+            injector_field_type_count: TypeCount { float_count: 2, ..TypeCount::zero() },
+            ..ClassDeclaration::dummy("Chart.Vector2".into())
+        };
+        let inner_cls = Arc::new(RuntimeClass::new(inner_decl, None));
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("Outer", cls);
+        vm.register_runtime_class("Vector2", inner_cls);
+        vm.injector_constants = vec![InjectorConstantDef {
+            class_name: "Chart.Outer".into(),
+            fields: vec![
+                InjectorConstField::Int("id".into(), 7),
+                InjectorConstField::InjectObject(
+                    "Chart.Vector2".into(),
+                    vec![
+                        InjectorConstField::Float("x".into(), 1.5),
+                        InjectorConstField::Float("y".into(), -2.0),
+                    ],
+                ),
+            ],
+        }];
+
+        vm.object_stack.push_frame(2);
+        let code = IntermediateCode::new(
+            IntermediateOperator::LoadInjectorConstant(0),
+            Operand::int(0), None, Some(Address::new(ValueType::Object, 0)),
+        );
+        let result = vm.execute_one(&code);
+        assert!(result.is_ok(), "物化失败: {:?}", result.err());
+        let inj_id = *vm.object_stack.read(0);
+        assert!(inj_id > 0, "应返回有效注入器 ID");
+
+        // 外层注入器：int 字段 + 嵌套 object 字段均非默认
+        let inj = vm.injectors.get(&inj_id).expect("外层应为注入器");
+        assert_eq!(inj.get_injector_int(0), 7);
+        assert!(!inj.get_injector_int_default_value(0));
+        let nested_id = inj.get_injector_object(0);
+        assert!(nested_id > 0, "嵌套注入器不应为 0（原占位实现填 0）");
+        assert!(!inj.get_injector_object_default_value(0));
+
+        // 嵌套注入器：类名按实际注册键解析（简单名 "Vector2"），标量值完整
+        let nested = vm.injectors.get(&nested_id).expect("嵌套应为注入器");
+        assert_eq!(
+            nested.injection_class_declaration().class_type.full_name(),
+            "Vector2",
+            "嵌套注入器类名应解析为实际注册键（双键约定）"
+        );
+        assert_eq!(nested.get_injector_float(0), 1.5);
+        assert_eq!(nested.get_injector_float(1), -2.0);
+    }
+
+    /// LoadInjectorConstant 数组字段：物化为 native 数组载荷 + 编译层包装
+    #[test]
+    fn test_p0_7_load_injector_constant_array_materialize() {
+        use crate::objective::bytecode::{InjectorConstantDef, InjectorConstField};
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::objective::types::GorgeType;
+        use std::sync::Arc;
+
+        let decl = ClassDeclaration {
+            class_type: GorgeType::class("Chart.Holder", None),
+            injector_field_type_count: TypeCount { object_count: 1, ..TypeCount::zero() },
+            ..ClassDeclaration::dummy("Chart.Holder".into())
+        };
+        let cls = Arc::new(RuntimeClass::new(decl, None));
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("Holder", cls);
+        vm.injector_constants = vec![InjectorConstantDef {
+            class_name: "Chart.Holder".into(),
+            fields: vec![InjectorConstField::Array(vec![
+                InjectorConstField::Float("".into(), 0.25),
+                InjectorConstField::Float("".into(), 0.75),
+            ])],
+        }];
+
+        vm.object_stack.push_frame(2);
+        let code = IntermediateCode::new(
+            IntermediateOperator::LoadInjectorConstant(0),
+            Operand::int(0), None, Some(Address::new(ValueType::Object, 0)),
+        );
+        vm.execute_one(&code).unwrap();
+        let inj_id = *vm.object_stack.read(0);
+        let inj = vm.injectors.get(&inj_id).unwrap();
+        let wrapper_id = inj.get_injector_object(0);
+        assert!(wrapper_id > 0, "数组字段不应为 0");
+
+        // 编译层包装：length 字段语义（对齐 InvokeArrayConstructor）
+        let wrapper = vm.objects.get(&wrapper_id).expect("应为编译层包装对象");
+        assert_eq!(wrapper.get_int_field(0), 2, "length 应写入 int 字段 0");
+        let native_id = wrapper.native_object_id.expect("应链接 native 载荷");
+
+        // native 载荷：FloatArray 元素完整
+        use crate::system::native::array::FloatArray;
+        let payload = vm.native_payloads.get(&native_id)
+            .and_then(|p| p.downcast_ref::<FloatArray>())
+            .expect("应为 FloatArray 载荷");
+        assert_eq!(payload.items.len(), 2);
+        assert!((payload.items[0] - 0.25).abs() < 1e-9);
+        assert!((payload.items[1] - 0.75).abs() < 1e-9);
+    }
+
+    /// LoadInjectorConstant 常量索引越界返回 Err
+    #[test]
+    fn test_p0_7_load_injector_constant_index_out_of_bounds() {
+        let mut vm = VirtualMachine::new();
+        vm.object_stack.push_frame(2);
+        let code = IntermediateCode::new(
+            IntermediateOperator::LoadInjectorConstant(3),
+            Operand::int(0), None, Some(Address::new(ValueType::Object, 0)),
+        );
+        let result = vm.execute_one(&code);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("越界"));
     }
 }

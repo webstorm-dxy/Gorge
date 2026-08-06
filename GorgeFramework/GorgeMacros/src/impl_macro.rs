@@ -125,6 +125,10 @@ pub fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 COUNT.get_or_init(|| <#self_ty>::gorge_field_type_count())
             }
 
+            fn injector_fields_meta(&self) -> &'static [(&'static str, ::gorge_core::virtual_machine::ir::ValueType)] {
+                <#self_ty>::gorge_injector_fields_meta()
+            }
+
             fn invoke_native_static(
                 &self,
                 ctx: &mut ::gorge_core::objective::native::NativeContext,

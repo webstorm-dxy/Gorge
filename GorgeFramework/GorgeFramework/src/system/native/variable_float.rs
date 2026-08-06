@@ -13,18 +13,24 @@ use gorge_macros::{gorge_native_class, gorge_native_impl};
 /// 常用于谱面参数的动态控制（如宽度、速度随时间变化）。
 #[gorge_native_class(namespace = "GorgeFramework")]
 pub struct VariableFloat {
+    /// 基值（C#/存根未声明默认值，未注入时回退 Rust 默认 0.0）
     #[gorge_field]
-    #[inject(default = 0.0)]
+    #[inject(name = "baseValue")]
     pub base_value: f32,
 
     /// 变化曲线（FunctionCurve 对象 ID，0 表示无曲线）
     #[gorge_field]
+    #[inject(name = "variationCurve")]
     pub variation_curve: usize,
 }
 
 #[gorge_native_impl]
 impl VariableFloat {
-    /// 构造方法 0：基值 + 可选曲线
+    /// 构造方法 0：无参构造（字段由注入器提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) { let _ = (ctx, this); }
+
+    /// 构造方法 1：基值 + 可选曲线
     #[gorge_ctor]
     pub fn new(ctx: &mut NativeContext, this: usize, base_value: f32, variation_curve: usize) {
         ctx.set_object_float_field(this, Self::FIELD_INDEX_base_value, base_value as f64);

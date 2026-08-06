@@ -16,10 +16,13 @@ pub trait IStaff: Send + Sync + std::fmt::Debug {
     fn display_name(&self) -> &str;
     /// 设置显示名
     fn set_display_name(&mut self, name: String);
-    /// 所含乐段（泛型访问）
-    fn periods(&self) -> &[Box<dyn IPeriod>];
-    /// 取乐段
-    fn try_get_period(&self, period_name: &str) -> Option<&Box<dyn IPeriod>>;
+    /// 所含乐段（按 `IPeriod` 接口访问，对应 C# `IStaff.Periods` 的 `IEnumerable<IPeriod>`）
+    ///
+    /// 具体存储为 `Vec<ElementPeriod>`/`Vec<AudioPeriod>`，此处每次调用构建引用集合，
+    /// 语义与 C# 协变 `IEnumerable<IPeriod>` 等价。
+    fn periods(&self) -> Vec<&dyn IPeriod>;
+    /// 取乐段（按 `IPeriod` 接口访问，对应 C# `IStaff.TryGetPeriod`）
+    fn try_get_period(&self, period_name: &str) -> Option<&dyn IPeriod>;
     /// 检查目标乐段名是否和已有乐段名冲突
     fn check_period_name_conflict(&self, period_name: &str) -> bool;
     /// 添加乐段
@@ -76,18 +79,15 @@ impl IStaff for ElementStaff {
     fn display_name(&self) -> &str { &self.display_name }
     fn set_display_name(&mut self, name: String) { self.display_name = name; }
 
-    fn periods(&self) -> &[Box<dyn IPeriod>] {
-        // 返回引用需要把 Vec<ElementPeriod> 转换为 &[Box<dyn IPeriod>]
-        // 但这是不可行的，因为 ElementPeriod 和 Box<dyn IPeriod> 是不同的类型
-        // 返回空切片作为占位——IPeriod 访问通过 try_get_period 完成
-        &[]
+    fn periods(&self) -> Vec<&dyn IPeriod> {
+        self.periods.iter().map(|p| p as &dyn IPeriod).collect()
     }
 
-    fn try_get_period(&self, _period_name: &str) -> Option<&Box<dyn IPeriod>> {
-        // IStaff trait 的 try_get_period 返回 &Box<dyn IPeriod>
-        // 但我们存储的是 Vec<ElementPeriod>，无法直接返回引用
-        // 此方法在 trait 级别作为占位
-        None
+    fn try_get_period(&self, period_name: &str) -> Option<&dyn IPeriod> {
+        self.periods
+            .iter()
+            .find(|p| p.period_data.method_name == period_name)
+            .map(|p| p as &dyn IPeriod)
     }
 
     fn check_period_name_conflict(&self, period_name: &str) -> bool {
@@ -198,9 +198,16 @@ impl IStaff for AudioStaff {
     fn display_name(&self) -> &str { &self.display_name }
     fn set_display_name(&mut self, name: String) { self.display_name = name; }
 
-    fn periods(&self) -> &[Box<dyn IPeriod>] { &[] }
+    fn periods(&self) -> Vec<&dyn IPeriod> {
+        self.periods.iter().map(|p| p as &dyn IPeriod).collect()
+    }
 
-    fn try_get_period(&self, _period_name: &str) -> Option<&Box<dyn IPeriod>> { None }
+    fn try_get_period(&self, period_name: &str) -> Option<&dyn IPeriod> {
+        self.periods
+            .iter()
+            .find(|p| p.period_data.method_name == period_name)
+            .map(|p| p as &dyn IPeriod)
+    }
 
     fn check_period_name_conflict(&self, period_name: &str) -> bool {
         if period_name == self.class_name {
@@ -292,6 +299,38 @@ mod tests {
         assert!(staff.try_get_period("Period1").is_some());
         assert!(staff.try_get_period("Period2").is_some());
         assert!(staff.try_get_period("Period3").is_none());
+    }
+
+    #[test]
+    fn test_element_staff_trait_object_periods() {
+        let config = make_config_injector();
+        let mut staff = ElementStaff::new("TestChart".to_string(), true, "测试谱表".to_string(), "TestForm".to_string());
+        staff.periods.push(ElementPeriod::new("TestForm".to_string(), "Period1".to_string(), config.clone()));
+        staff.periods.push(ElementPeriod::new("TestForm".to_string(), "Period2".to_string(), config));
+
+        let trait_obj: &dyn IStaff = &staff;
+        let periods = trait_obj.periods();
+        assert_eq!(periods.len(), 2);
+        assert_eq!(periods[0].method_name(), "Period1");
+        assert_eq!(periods[1].method_name(), "Period2");
+
+        let p = trait_obj.try_get_period("Period2");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().method_name(), "Period2");
+        assert!(trait_obj.try_get_period("Period3").is_none());
+    }
+
+    #[test]
+    fn test_audio_staff_trait_object_periods() {
+        let config = make_config_injector();
+        let mut staff = AudioStaff::new("AudioChart".to_string(), true, "音频谱表".to_string());
+        staff.periods.push(AudioPeriod::new("Song1".to_string(), config, None));
+
+        let trait_obj: &dyn IStaff = &staff;
+        assert_eq!(trait_obj.periods().len(), 1);
+        assert_eq!(trait_obj.periods()[0].method_name(), "Song1");
+        assert!(trait_obj.try_get_period("Song1").is_some());
+        assert!(trait_obj.try_get_period("Song2").is_none());
     }
 
     #[test]
