@@ -418,12 +418,42 @@ pub fn tokenize(source: &str, source_id: usize) -> (Vec<TokenSpan>, Vec<gorge_co
     let mut tokens = Vec::new();
     let mut diagnostics = Vec::new();
 
+    // 行列游标（对齐 C# 参考实现 ANTLR 运行时的增量维护方式）：
+    // logos 产出的 range 单调递增，只需逐段推进游标即可得到每个 token
+    // 的行列号，避免为每个 token 从文件头重新扫描（O(n²) → O(n)）。
+    // 被跳过的空白/注释位于上一 token 末尾与当前 token 起点之间，
+    // 扫描 last_offset..start 段时一并计入，语义与全量扫描完全一致。
+    let mut last_offset = 0usize;
+    let mut line = 1usize;
+    let mut column = 1usize;
+
     for (result, range) in lexer.spanned() {
         let start = range.start;
         let end = range.end;
-        // 将字节偏移量转换为行列号，方便开发者定位错误
-        let (line, column) = offset_to_line_column(source, start);
-        let span = Span::new(start, end, line, column, source_id);
+
+        // 推进游标至 token 起点（含中间被跳过的空白/注释），得到该 token 的行列号
+        for c in source[last_offset..start].chars() {
+            if c == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        let (token_line, token_column) = (line, column);
+
+        // 推进游标越过 token 自身，多行 token 内部的换行计入后续 token
+        for c in source[start..end].chars() {
+            if c == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        last_offset = end;
+
+        let span = Span::new(start, end, token_line, token_column, source_id);
 
         match result {
             Ok(token) => {
@@ -442,37 +472,6 @@ pub fn tokenize(source: &str, source_id: usize) -> (Vec<TokenSpan>, Vec<gorge_co
     }
 
     (tokens, diagnostics)
-}
-
-/// 将字节偏移量转换为源代码中的行列号（从 1 开始）。
-///
-/// # 参数
-/// - `source`: 源代码字符串
-/// - `offset`: 字节偏移量
-///
-/// # 返回值
-/// 返回 `(line, column)` 元组，行列号均从 1 开始计数。
-///
-/// # 注意事项
-/// - 按字符（而非字节）遍历源代码，以正确处理多字节 Unicode 字符
-/// - 换行后列号重置为 1，行号递增
-fn offset_to_line_column(source: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut column = 1;
-
-    for (i, c) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-    }
-
-    (line, column)
 }
 
 #[cfg(test)]
@@ -629,5 +628,72 @@ class MyClass extends BaseClass :: IFoo, IBar {
 
         assert_eq!(tokens[2].span.line, 3);
         assert_eq!(tokens[2].span.column, 1);
+    }
+
+    /// 旧版朴素实现：从文件头逐字符扫描计算行列号。
+    ///
+    /// 已由增量游标替代，此处保留作为回归对照，验证新实现行列号语义完全一致。
+    fn naive_offset_to_line_column(source: &str, offset: usize) -> (usize, usize) {
+        let mut line = 1;
+        let mut column = 1;
+        for (i, c) in source.char_indices() {
+            if i >= offset {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        (line, column)
+    }
+
+    /// 增量游标与朴素实现的等价性：任意 token（含词法错误）的行列号一致
+    #[test]
+    fn test_incremental_position_matches_naive() {
+        // 覆盖多字节字符、跨行块注释、字符串字面量、空白与词法错误字符
+        let source = "abc\n  中文\n/* 多行\n注释 */ x = \"str\";\n+@?";
+        let (tokens, diagnostics) = tokenize(source, 0);
+        assert!(!diagnostics.is_empty(), "应存在无法识别的字符以覆盖错误分支");
+
+        // 每个产出项（token 与错误）的 span 都必须与朴素实现一致
+        for t in &tokens {
+            let (line, column) = naive_offset_to_line_column(source, t.span.start);
+            assert_eq!(
+                (t.span.line, t.span.column),
+                (line, column),
+                "token start={} 行列不一致",
+                t.span.start
+            );
+        }
+        for d in &diagnostics {
+            let (line, column) = naive_offset_to_line_column(source, d.span.start);
+            assert_eq!(
+                (d.span.line, d.span.column),
+                (line, column),
+                "错误 span start={} 行列不一致",
+                d.span.start
+            );
+        }
+    }
+
+    /// 多字节字符与跨行块注释后的行列定位
+    #[test]
+    fn test_position_with_multibyte_and_multiline_comment() {
+        // "ab\n 中z\n/* 注释\n跨行 */ q"
+        // 行2 = " 中z"：空格=1, 中=2（3 字节按 1 列计）, z=3
+        // 行4 = "跨行 */ q"：跨=1, 行=2, 空格=3, *=4, /=5, 空格=6, q=7
+        let source = "ab\n 中z\n/* 注释\n跨行 */ q";
+        let (tokens, _) = tokenize(source, 0);
+
+        // z 位于第 2 行第 3 列（多字节字符按 1 列计）
+        assert_eq!(tokens[1].span.line, 2);
+        assert_eq!(tokens[1].span.column, 3);
+        // 跨行块注释后 q 位于第 4 行第 7 列（注释内换行已计入）
+        let last = tokens.last().unwrap();
+        assert_eq!(last.span.line, 4);
+        assert_eq!(last.span.column, 7);
     }
 }

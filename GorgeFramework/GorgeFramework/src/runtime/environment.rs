@@ -220,11 +220,15 @@ impl ChartManager {
         // 2. 沿类 + 父类声明链收集 @PeriodModifier 静态方法（全局方法 ID）
         //    扫描直接用声明注解表（与 C# 遍历 FormContainer.ElementModifiers 等价），
         //    避免在持有 &mut vm 时借用 class_table。
+        //    注解表为 HashMap，按全局 ID 排序保证修改器应用顺序确定（声明顺序）。
         let mut modifiers: Vec<(String, usize)> = Vec::new();
         let mut declared = vm.injectors.get(&gameplay_id)?.injection_class_declaration().clone();
         let mut guard = 0;
         loop {
-            for (global_id, annotations) in &declared.method_annotations {
+            let mut annotation_ids: Vec<&usize> = declared.method_annotations.keys().collect();
+            annotation_ids.sort();
+            for global_id in annotation_ids {
+                let annotations = &declared.method_annotations[global_id];
                 if annotations.iter().any(|a| a.name == "PeriodModifier") {
                     if let Some(name) = resolve_registered_class_name(vm, &declared.class_type.full_name()) {
                         modifiers.push((name, *global_id));
@@ -334,7 +338,7 @@ impl ChartManager {
         // 因此这里必须保存实际注册键，而不是 JSON 中的全限定名。
         let mut declaration = class_decl.clone();
         declaration.class_type = gorge_core::objective::types::GorgeType::class(
-            registered_class_name,
+            registered_class_name.clone(),
             None,
         );
         let mut injector = RuntimeInjector::new(std::sync::Arc::new(declaration));

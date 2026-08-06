@@ -443,10 +443,56 @@ impl<'a> CodeGenerator<'a> {
     }
 
     /// 设置注入器上下文，填充注入器字段名→(字段索引,值类型) 映射
+    ///
+    /// 对齐 C# `ClassMemberCounter.InjectorFieldIndex`（ClassMemberCounter.cs 84/168）：
+    /// 字段索引按 Int/Float/Bool/String/Object 五种值类型**分组编号**（各类型
+    /// 独立从 0 起），且继承链上父类的字段在前（分组计数从父类继承）。
+    /// `fields` 为当前类自有字段（调用方从 `injector_fields` 表按类名取得），
+    /// 父类字段由本方法沿继承链从 `injector_fields` 表合并，保证与运行时
+    /// 注入器字段布局（`RuntimeInjector` 分组数组）一致。
     pub fn set_injector_context(&mut self, fields: &[(String, ValueType)]) {
         self.injector_field_info.clear();
-        for (i, (name, vt)) in fields.iter().enumerate() {
-            self.injector_field_info.insert(name.clone(), (i, *vt));
+        // 沿继承链合并注入器字段（根类在前、父类先于子类）
+        let mut merged: Vec<(String, ValueType)> = Vec::new();
+        if let Some(class_name) = self.current_class_name.clone() {
+            let mut chain: Vec<String> = vec![class_name.clone()];
+            loop {
+                let scope = self.class_lookup_scope();
+                let next = self.symbol_table
+                    .lookup_class(scope, chain.last().unwrap())
+                    .map(|cid| self.symbol_table.classes.get(cid.0).super_class)
+                    .flatten()
+                    .map(|cid| self.symbol_table.classes.get(cid.0).name.clone());
+                match next {
+                    Some(n) => chain.push(n),
+                    None => break,
+                }
+            }
+            for cls in chain.iter().rev() {
+                if let Some(fields) = self.injector_fields.get(cls) {
+                    merged.extend(fields.iter().map(|f| (f.name.clone(), f.value_type)));
+                }
+            }
+        }
+        if merged.is_empty() {
+            // 未设置类上下文（测试等直接构造场景）：使用调用方传入的字段
+            merged = fields.to_vec();
+        }
+        // 按值类型分组编号
+        let mut int_index = 0usize;
+        let mut float_index = 0usize;
+        let mut bool_index = 0usize;
+        let mut string_index = 0usize;
+        let mut object_index = 0usize;
+        for (name, vt) in &merged {
+            let index = match vt {
+                ValueType::Int => { let i = int_index; int_index += 1; i }
+                ValueType::Float => { let i = float_index; float_index += 1; i }
+                ValueType::Bool => { let i = bool_index; bool_index += 1; i }
+                ValueType::String => { let i = string_index; string_index += 1; i }
+                ValueType::Object => { let i = object_index; object_index += 1; i }
+            };
+            self.injector_field_info.insert(name.clone(), (index, *vt));
         }
     }
 
@@ -2083,16 +2129,39 @@ impl<'a> CodeGenerator<'a> {
                 None => break,
             }
         }
-        // 从根类向下累加注入器字段偏移（运行时布局 = 祖先字段 + 自有字段）
-        let mut offset = 0usize;
+        // 从根类向下按值类型分组累计字段偏移（对齐 C# ClassMemberCounter：
+        // 运行时布局 = 祖先字段在前，且 Int/Float/Bool/String/Object 分组编号）
+        let mut int_offset = 0usize;
+        let mut float_offset = 0usize;
+        let mut bool_offset = 0usize;
+        let mut string_offset = 0usize;
+        let mut object_offset = 0usize;
         for cls in chain.iter().rev() {
             if let Some(fields) = self.injector_fields.get(cls) {
-                for (i, f) in fields.iter().enumerate() {
-                    if f.name == field_name {
-                        return Some((offset + i, f.value_type));
+                for f in fields {
+                    match f.value_type {
+                        ValueType::Int => {
+                            if f.name == field_name { return Some((int_offset, ValueType::Int)); }
+                            int_offset += 1;
+                        }
+                        ValueType::Float => {
+                            if f.name == field_name { return Some((float_offset, ValueType::Float)); }
+                            float_offset += 1;
+                        }
+                        ValueType::Bool => {
+                            if f.name == field_name { return Some((bool_offset, ValueType::Bool)); }
+                            bool_offset += 1;
+                        }
+                        ValueType::String => {
+                            if f.name == field_name { return Some((string_offset, ValueType::String)); }
+                            string_offset += 1;
+                        }
+                        ValueType::Object => {
+                            if f.name == field_name { return Some((object_offset, ValueType::Object)); }
+                            object_offset += 1;
+                        }
                     }
                 }
-                offset += fields.len();
             }
         }
         None
@@ -3872,6 +3941,67 @@ mod tests {
         assert!(cg.diagnostics.error_count() > before);
     }
 
+    /// 跨继承链按对象声明类型解析注入器字段（对齐 C# 按对象声明类型查找），
+    /// 索引按值类型分组累计（父类字段在前）
+    #[test]
+    fn test_resolve_object_injector_field_inherited_grouped() {
+        let mut st = SymbolTable::new();
+        let global = st.global_scope;
+        let spam = Span::new(0, 1, 1, 1, 0);
+
+        // 模拟 DremuLane → DremuGuideLane 继承链（PeriodModifier 的
+        // laneInjector 参数类型为 DremuLane，字段 generateTime 属父类）
+        let parent_id = st.declare_class("DremuLane", global, None, vec![], false, spam);
+        let _child_id = st.declare_class("DremuGuideLane", global, Some(parent_id), vec![], false, spam);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut injector_fields: HashMap<String, Vec<InjectorFieldDef>> = HashMap::new();
+        injector_fields.insert("DremuLane".to_string(), vec![
+            InjectorFieldDef { name: "name".to_string(), value_type: ValueType::String, has_default: false, default_value: None },
+            InjectorFieldDef { name: "generateTime".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+            InjectorFieldDef { name: "keepTime".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+            InjectorFieldDef { name: "evaluateDelta".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+            InjectorFieldDef { name: "pointCount".to_string(), value_type: ValueType::Int, has_default: false, default_value: None },
+        ]);
+        injector_fields.insert("DremuGuideLane".to_string(), vec![
+            InjectorFieldDef { name: "positionZ".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+        ]);
+
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, &injector_fields, Vec::new());
+        cg.current_class_name = Some("DremuGuideLane".into());
+        cg.register_var_class("laneInjector", "DremuLane");
+
+        let obj = Expression::Identifier("laneInjector".into(), dummy_span());
+        // 父类字段 generateTime：Float 组第 0 个（不被 name/pointCount 挤占）
+        assert_eq!(
+            cg.resolve_object_injector_field(&obj, "generateTime"),
+            Some((0, ValueType::Float))
+        );
+        // 父类第二个 float 字段 keepTime
+        assert_eq!(
+            cg.resolve_object_injector_field(&obj, "keepTime"),
+            Some((1, ValueType::Float))
+        );
+        // 父类 String/Int 字段各自从 0 编号
+        assert_eq!(
+            cg.resolve_object_injector_field(&obj, "name"),
+            Some((0, ValueType::String))
+        );
+        assert_eq!(
+            cg.resolve_object_injector_field(&obj, "pointCount"),
+            Some((0, ValueType::Int))
+        );
+        // 子类字段 positionZ：Float 组从父类 3 个 float 之后编号
+        let this_obj = Expression::This(dummy_span());
+        assert_eq!(
+            cg.resolve_object_injector_field(&this_obj, "positionZ"),
+            Some((3, ValueType::Float))
+        );
+        // 未定义字段
+        assert_eq!(cg.resolve_object_injector_field(&obj, "unknown"), None);
+    }
+
     // ==================== G1 注入器字段访问测试 ====================
 
     #[test]
@@ -3892,8 +4022,69 @@ mod tests {
         assert_eq!(cg.injector_field_info.len(), 4);
         assert_eq!(cg.injector_field_info.get("x"), Some(&(0, ValueType::Float)));
         assert_eq!(cg.injector_field_info.get("y"), Some(&(1, ValueType::Float)));
-        assert_eq!(cg.injector_field_info.get("count"), Some(&(2, ValueType::Int)));
-        assert_eq!(cg.injector_field_info.get("label"), Some(&(3, ValueType::String)));
+        assert_eq!(cg.injector_field_info.get("count"), Some(&(0, ValueType::Int)));
+        assert_eq!(cg.injector_field_info.get("label"), Some(&(0, ValueType::String)));
+    }
+
+    /// 混合类型字段按值类型分组编号（对齐 C# ClassMemberCounter.InjectorFieldIndex）
+    #[test]
+    fn test_set_injector_context_grouped_by_type() {
+        let st = SymbolTable::new();
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut cg = make_codegen(&st, &mut diags, &mut delegates);
+
+        // 模拟 DremuNote 场景：laneName(String) 在 hitTime(Float) 之前声明
+        let fields = vec![
+            ("laneName".to_string(), ValueType::String),
+            ("hitTime".to_string(), ValueType::Float),
+            ("leadTime".to_string(), ValueType::Float),
+            ("hintReference".to_string(), ValueType::Bool),
+            ("position".to_string(), ValueType::Object),
+        ];
+        cg.set_injector_context(&fields);
+
+        // String 字段独立从 0 编号，Float 字段也从 0 编号（不被 String 前置字段挤占）
+        assert_eq!(cg.injector_field_info.get("laneName"), Some(&(0, ValueType::String)));
+        assert_eq!(cg.injector_field_info.get("hitTime"), Some(&(0, ValueType::Float)));
+        assert_eq!(cg.injector_field_info.get("leadTime"), Some(&(1, ValueType::Float)));
+        assert_eq!(cg.injector_field_info.get("hintReference"), Some(&(0, ValueType::Bool)));
+        assert_eq!(cg.injector_field_info.get("position"), Some(&(0, ValueType::Object)));
+    }
+
+    /// 跨继承链注入器字段索引按类型分组累计（父类字段在前）
+    #[test]
+    fn test_set_injector_context_inherited_fields_grouped() {
+        let mut st = SymbolTable::new();
+        let global = st.global_scope;
+        let spam = Span::new(0, 1, 1, 1, 0);
+
+        // 父类 DremuLane：string name + float generateTime/keepTime
+        let parent_id = st.declare_class("DremuLane", global, None, vec![], false, spam);
+        // 子类 DremuGuideLane : DremuLane，自有 float 字段 positionZ
+        let _child_id = st.declare_class("DremuGuideLane", global, Some(parent_id), vec![], false, spam);
+
+        let mut diags = Diagnostics::new();
+        let mut delegates = Vec::new();
+        let mut injector_fields: HashMap<String, Vec<InjectorFieldDef>> = HashMap::new();
+        injector_fields.insert("DremuLane".to_string(), vec![
+            InjectorFieldDef { name: "name".to_string(), value_type: ValueType::String, has_default: false, default_value: None },
+            InjectorFieldDef { name: "generateTime".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+            InjectorFieldDef { name: "keepTime".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+        ]);
+        injector_fields.insert("DremuGuideLane".to_string(), vec![
+            InjectorFieldDef { name: "positionZ".to_string(), value_type: ValueType::Float, has_default: false, default_value: None },
+        ]);
+
+        let mut cg = CodeGenerator::new(&st, &mut diags, &mut delegates, &injector_fields, Vec::new());
+        cg.current_class_name = Some("DremuGuideLane".into());
+        cg.set_injector_context(&[]);
+
+        // 继承合并后：name=String0, generateTime=Float0, keepTime=Float1, positionZ=Float2
+        assert_eq!(cg.injector_field_info.get("name"), Some(&(0, ValueType::String)));
+        assert_eq!(cg.injector_field_info.get("generateTime"), Some(&(0, ValueType::Float)));
+        assert_eq!(cg.injector_field_info.get("keepTime"), Some(&(1, ValueType::Float)));
+        assert_eq!(cg.injector_field_info.get("positionZ"), Some(&(2, ValueType::Float)));
     }
 
     #[test]

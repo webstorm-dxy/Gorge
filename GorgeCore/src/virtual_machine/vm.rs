@@ -2195,12 +2195,15 @@ impl VirtualMachine {
         let class_decl = self.injector_declaration_for_constant(&constant.class_name);
         let mut injector = RuntimeInjector::from_constant(constant, class_decl);
 
-        // 第二遍：递归物化嵌套对象/数组，写入 object 槽位
-        let mut oi = 0usize;
+        // 第二遍：递归物化嵌套对象/数组，写入 object 槽位。
+        // InjectObject/Array 在常量中无名（InjectObject 首槽位是类名），
+        // 按常量内 object 相对顺序写入（与 from_constant 的占槽规则一致，
+        // 常量字段按声明顺序输出时该顺序即声明分组索引）
+        let mut object_seq = 0usize;
         for field in &constant.fields {
             match field {
                 crate::objective::bytecode::InjectorConstField::Object(..) => {
-                    oi += 1; // 编译期记录的对象 ID 已由 from_constant 写入
+                    object_seq += 1; // 编译期记录的对象 ID 已由 from_constant 写入
                 }
                 crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, fields) => {
                     let nested = crate::objective::bytecode::InjectorConstantDef {
@@ -2208,17 +2211,17 @@ impl VirtualMachine {
                         fields: fields.clone(),
                     };
                     let nested_id = self.materialize_injector_constant(&nested)?;
-                    if oi < injector.object_field_count() {
-                        injector.set_injector_object(oi, nested_id);
+                    if object_seq < injector.object_field_count() {
+                        injector.set_injector_object(object_seq, nested_id);
                     }
-                    oi += 1;
+                    object_seq += 1;
                 }
                 crate::objective::bytecode::InjectorConstField::Array(elements) => {
                     let array_id = self.materialize_injector_array(elements)?;
-                    if oi < injector.object_field_count() {
-                        injector.set_injector_object(oi, array_id);
+                    if object_seq < injector.object_field_count() {
+                        injector.set_injector_object(object_seq, array_id);
                     }
-                    oi += 1;
+                    object_seq += 1;
                 }
                 _ => {}
             }

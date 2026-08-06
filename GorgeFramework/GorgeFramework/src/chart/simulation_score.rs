@@ -425,8 +425,11 @@ impl SimulationScore {
         staff: &mut AudioStaff,
         meta: &InjectorFieldMetaProvider,
     ) {
-        for (method_id, annotations) in &cc.method_annotations {
-            for ann in annotations {
+        // 方法注解表为 HashMap，按方法全局 ID 排序保证乐段顺序确定（声明顺序）
+        let mut method_ids: Vec<&usize> = cc.method_annotations.keys().collect();
+        method_ids.sort();
+        for method_id in method_ids {
+            for ann in &cc.method_annotations[method_id] {
                 if ann.name != "Song" {
                     continue;
                 }
@@ -455,8 +458,11 @@ impl SimulationScore {
         form_name: &str,
         meta: &InjectorFieldMetaProvider,
     ) {
-        for (method_id, annotations) in &cc.method_annotations {
-            for ann in annotations {
+        // 方法注解表为 HashMap，按方法全局 ID 排序保证乐段顺序确定（声明顺序）
+        let mut method_ids: Vec<&usize> = cc.method_annotations.keys().collect();
+        method_ids.sort();
+        for method_id in method_ids {
+            for ann in &cc.method_annotations[method_id] {
                 if ann.name != "Chart" {
                     continue;
                 }

@@ -183,9 +183,35 @@ fn collect_classes(
     all_methods: &[gorge_core::virtual_machine::ir::CompiledMethod],
     method_meta: &[(Option<ClassId>, bool)],
 ) {
+    // 同一作用域可能经多条路径到达（`symbols` 中的 Namespace 条目与
+    // `scope.children` 列表指向同一作用域），用 visited 集合保证每个
+    // 作用域只收集一次，避免类被重复收集（重复收集会使加载器重复注册、
+    // 注入器常量池重复合并，导致全局索引错位）。
+    let mut visited: std::collections::HashSet<ScopeId> = std::collections::HashSet::new();
+    collect_classes_impl(st, scope_id, classes, all_methods, method_meta, &mut visited);
+}
+
+/// `collect_classes` 的递归实现，`visited` 防止同一作用域被重复遍历
+fn collect_classes_impl(
+    st: &SymbolTable,
+    scope_id: ScopeId,
+    classes: &mut Vec<CompiledClass>,
+    all_methods: &[gorge_core::virtual_machine::ir::CompiledMethod],
+    method_meta: &[(Option<ClassId>, bool)],
+    visited: &mut std::collections::HashSet<ScopeId>,
+) {
+    if !visited.insert(scope_id) {
+        return;
+    }
     let scope = &st.scopes.get(scope_id.0);
 
-    for (_name, entry) in &scope.symbols {
+    // 符号表按 HashMap 存储，直接迭代顺序随机（每次进程种子不同），
+    // 导致类收集顺序非确定、编译产物逐次漂移。按名字排序保证确定性。
+    let mut symbol_names: Vec<&String> = scope.symbols.keys().collect();
+    symbol_names.sort();
+
+    for name in symbol_names {
+        let entry = &scope.symbols[name];
         match entry {
             SymbolEntry::Class(class_id) => {
                 let info = &st.classes.get(class_id.0);
@@ -258,17 +284,17 @@ fn collect_classes(
                 });
 
                 let class_scope = info.scope_id;
-                collect_classes(st, class_scope, classes, all_methods, method_meta);
+                collect_classes_impl(st, class_scope, classes, all_methods, method_meta, visited);
             }
             SymbolEntry::Namespace(ns_id) => {
                 let ns_info = st.namespaces.get(ns_id.0);
-                collect_classes(st, ns_info.scope_id, classes, all_methods, method_meta);
+                collect_classes_impl(st, ns_info.scope_id, classes, all_methods, method_meta, visited);
             }
             _ => {}
         }
     }
 
     for child_id in &scope.children {
-        collect_classes(st, *child_id, classes, all_methods, method_meta);
+        collect_classes_impl(st, *child_id, classes, all_methods, method_meta, visited);
     }
 }

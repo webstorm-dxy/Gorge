@@ -128,7 +128,11 @@ impl RuntimeInjector {
     /// 从注入器常量定义构造注入器的标量部分（G2）
     ///
     /// 常量中的所有字段值都是显式设置的（非默认）。字段按类型分组存储，
-    /// 索引基于常量定义中该类型字段出现的顺序。
+    /// **索引对齐类声明**（`field_index_map`）：按 Int/Float/Bool/String/Object
+    /// 分组独立编号、继承链父类字段在前，与运行时布局、codegen 编号及
+    /// `materialize_injector` 的 JSON 物化路径完全一致——常量缺失类中某些
+    /// 字段时不会造成索引错位（此前按"常量内字段顺序"编号，常量缺字段会
+    /// 与声明布局错位，导致字段读写越界或错值）。
     ///
     /// 嵌套的 `InjectObject`/`Array` 字段在常量中占 object 槽位，本方法
     /// 无法在无 VM 上下文时物化（需要分配对象 ID 并注册到对象表），因此
@@ -137,25 +141,43 @@ impl RuntimeInjector {
     /// 沿常量定义二次遍历，递归物化嵌套对象并写入 object 槽位。
     ///
     /// `class_decl` 为注入器所属类的声明（调用方负责按常量中的类名解析，
-    /// 未注册类可传哑声明）。
+    /// 未注册类可传哑声明——此时回退按常量内字段顺序编号，保证数据不丢）。
     pub fn from_constant(
         constant: &crate::objective::bytecode::InjectorConstantDef,
         class_decl: Arc<ClassDeclaration>,
     ) -> Self {
-        // 统计各类型字段数
-        let mut int_count = 0; let mut float_count = 0; let mut bool_count = 0;
-        let mut str_count = 0; let mut obj_count = 0;
-        for f in &constant.fields {
-            match f {
-                crate::objective::bytecode::InjectorConstField::Int(..) => int_count += 1,
-                crate::objective::bytecode::InjectorConstField::Float(..) => float_count += 1,
-                crate::objective::bytecode::InjectorConstField::Bool(..) => bool_count += 1,
-                crate::objective::bytecode::InjectorConstField::String(..) => str_count += 1,
-                crate::objective::bytecode::InjectorConstField::Object(..) => obj_count += 1,
-                crate::objective::bytecode::InjectorConstField::InjectObject(..) => obj_count += 1,
-                crate::objective::bytecode::InjectorConstField::Array(..) => obj_count += 1,
+        let index_map = Self::field_index_map(&class_decl);
+        let has_decl = !index_map.is_empty();
+
+        // 数组大小按类声明统计（含继承）；哑声明（未注册类）回退常量内统计
+        let (int_count, float_count, bool_count, str_count, obj_count) = if has_decl {
+            let mut counts = [0usize; 5];
+            for (_, (_, vt)) in &index_map {
+                match vt {
+                    ValueType::Int => counts[0] += 1,
+                    ValueType::Float => counts[1] += 1,
+                    ValueType::Bool => counts[2] += 1,
+                    ValueType::String => counts[3] += 1,
+                    ValueType::Object => counts[4] += 1,
+                }
             }
-        }
+            (counts[0], counts[1], counts[2], counts[3], counts[4])
+        } else {
+            let mut counts = [0usize; 5];
+            for f in &constant.fields {
+                match f {
+                    crate::objective::bytecode::InjectorConstField::Int(..) => counts[0] += 1,
+                    crate::objective::bytecode::InjectorConstField::Float(..) => counts[1] += 1,
+                    crate::objective::bytecode::InjectorConstField::Bool(..) => counts[2] += 1,
+                    crate::objective::bytecode::InjectorConstField::String(..) => counts[3] += 1,
+                    crate::objective::bytecode::InjectorConstField::Object(..)
+                    | crate::objective::bytecode::InjectorConstField::InjectObject(..)
+                    | crate::objective::bytecode::InjectorConstField::Array(..) => counts[4] += 1,
+                }
+            }
+            (counts[0], counts[1], counts[2], counts[3], counts[4])
+        };
+
         let mut result = Self {
             class_decl,
             int_fields: vec![(0, true); int_count],
@@ -164,42 +186,120 @@ impl RuntimeInjector {
             string_fields: vec![(String::new(), true); str_count],
             object_fields: vec![(0, true); obj_count],
         };
-        let mut ii = 0; let mut fi = 0; let mut bi = 0; let mut si = 0; let mut oi = 0;
+
+        // 常量内各类型的相对顺序（哑声明兜底索引）
+        let mut seq = [0usize; 5];
         for f in &constant.fields {
             match f {
-                crate::objective::bytecode::InjectorConstField::Int(_, v) => {
-                    result.int_fields[ii] = (*v, false);
-                    ii += 1;
+                crate::objective::bytecode::InjectorConstField::Int(name, v) => {
+                    if let Some(&(idx, ValueType::Int)) = index_map.get(name) {
+                        result.int_fields[idx] = (*v, false);
+                    } else if !has_decl && seq[0] < result.int_fields.len() {
+                        result.int_fields[seq[0]] = (*v, false);
+                    }
+                    seq[0] += 1;
                 }
-                crate::objective::bytecode::InjectorConstField::Float(_, v) => {
-                    result.float_fields[fi] = (*v, false);
-                    fi += 1;
+                crate::objective::bytecode::InjectorConstField::Float(name, v) => {
+                    if let Some(&(idx, ValueType::Float)) = index_map.get(name) {
+                        result.float_fields[idx] = (*v, false);
+                    } else if !has_decl && seq[1] < result.float_fields.len() {
+                        result.float_fields[seq[1]] = (*v, false);
+                    }
+                    seq[1] += 1;
                 }
-                crate::objective::bytecode::InjectorConstField::Bool(_, v) => {
-                    result.bool_fields[bi] = (*v, false);
-                    bi += 1;
+                crate::objective::bytecode::InjectorConstField::Bool(name, v) => {
+                    if let Some(&(idx, ValueType::Bool)) = index_map.get(name) {
+                        result.bool_fields[idx] = (*v, false);
+                    } else if !has_decl && seq[2] < result.bool_fields.len() {
+                        result.bool_fields[seq[2]] = (*v, false);
+                    }
+                    seq[2] += 1;
                 }
-                crate::objective::bytecode::InjectorConstField::String(_, v) => {
-                    result.string_fields[si] = (v.clone(), false);
-                    si += 1;
+                crate::objective::bytecode::InjectorConstField::String(name, v) => {
+                    if let Some(&(idx, ValueType::String)) = index_map.get(name) {
+                        result.string_fields[idx] = (v.clone(), false);
+                    } else if !has_decl && seq[3] < result.string_fields.len() {
+                        result.string_fields[seq[3]] = (v.clone(), false);
+                    }
+                    seq[3] += 1;
                 }
-                crate::objective::bytecode::InjectorConstField::Object(_, v) => {
-                    result.object_fields[oi] = (*v, false);
-                    oi += 1;
+                crate::objective::bytecode::InjectorConstField::Object(name, v) => {
+                    if let Some(&(idx, ValueType::Object)) = index_map.get(name) {
+                        result.object_fields[idx] = (*v, false);
+                    } else if !has_decl && seq[4] < result.object_fields.len() {
+                        result.object_fields[seq[4]] = (*v, false);
+                    }
+                    seq[4] += 1;
                 }
                 // 嵌套注入器和数组在常量中占 object 槽位，值由 VM 在
-                // 物化阶段递归填充（本方法只按 0 占槽）
+                // 物化阶段递归填充（本方法只按 0 占槽）。
+                // 两者在常量中均无名（InjectObject 首槽位是类名而非字段名），
+                // 按常量内 object 相对顺序占槽——常量字段按声明顺序输出时
+                // 该顺序即声明分组索引
                 crate::objective::bytecode::InjectorConstField::InjectObject(..) => {
-                    result.object_fields[oi] = (0, false);
-                    oi += 1;
+                    if seq[4] < result.object_fields.len() {
+                        result.object_fields[seq[4]] = (0, false);
+                    }
+                    seq[4] += 1;
                 }
                 crate::objective::bytecode::InjectorConstField::Array(..) => {
-                    result.object_fields[oi] = (0, false);
-                    oi += 1;
+                    if seq[4] < result.object_fields.len() {
+                        result.object_fields[seq[4]] = (0, false);
+                    }
+                    seq[4] += 1;
                 }
             }
         }
         result
+    }
+
+    /// 构建类声明的注入器字段名 → (分组索引, 值类型) 映射。
+    ///
+    /// 索引按 Int/Float/Bool/String/Object 五种值类型**分组独立编号**，
+    /// 且继承链父类字段在前，与运行时注入器布局（本类型分组数组）、
+    /// codegen 编号（对齐 C# `ClassMemberCounter.InjectorFieldIndex`）一致。
+    /// `injector_fields` 为空（哑声明）时返回空表，调用方回退常量顺序。
+    pub fn field_index_map(
+        class_decl: &ClassDeclaration,
+    ) -> std::collections::HashMap<String, (usize, ValueType)> {
+        let mut map = std::collections::HashMap::new();
+        let mut int_i = 0usize;
+        let mut float_i = 0usize;
+        let mut bool_i = 0usize;
+        let mut string_i = 0usize;
+        let mut object_i = 0usize;
+        for df in &class_decl.injector_fields {
+            let (idx, vt) = match df.field_type.basic_type {
+                crate::objective::types::BasicType::Int
+                | crate::objective::types::BasicType::Enum => {
+                    let i = int_i;
+                    int_i += 1;
+                    (i, ValueType::Int)
+                }
+                crate::objective::types::BasicType::Float => {
+                    let i = float_i;
+                    float_i += 1;
+                    (i, ValueType::Float)
+                }
+                crate::objective::types::BasicType::Bool => {
+                    let i = bool_i;
+                    bool_i += 1;
+                    (i, ValueType::Bool)
+                }
+                crate::objective::types::BasicType::String => {
+                    let i = string_i;
+                    string_i += 1;
+                    (i, ValueType::String)
+                }
+                _ => {
+                    let i = object_i;
+                    object_i += 1;
+                    (i, ValueType::Object)
+                }
+            };
+            map.insert(df.name.clone(), (idx, vt));
+        }
+        map
     }
 
     /// 注入器所属类的简单名（用于编辑期比较判定同类）。
@@ -489,5 +589,99 @@ mod tests {
         assert_eq!(dst.get_injector_int(0), 42);
         assert!(!dst.get_injector_int_default_value(0)); // 复制了非默认标记
         assert!(dst.get_injector_int_default_value(1));  // 字段1 仍为默认
+    }
+
+    /// 构造带声明字段的类声明（模拟 DremuLane：string name + 3 个 float + object）
+    fn make_lane_decl() -> Arc<ClassDeclaration> {
+        use crate::objective::declaration::InjectorFieldInfo;
+        use crate::objective::types::BasicType;
+        let decl = ClassDeclaration {
+            class_type: GorgeType::class("DremuLane", None),
+            is_native: false,
+            annotations: vec![],
+            fields: vec![],
+            methods: vec![],
+            static_methods: vec![],
+            constructors: vec![],
+            injector_fields: vec![
+                InjectorFieldInfo { name: "name".to_string(), field_type: GorgeType::new(BasicType::String), has_default_value: false },
+                InjectorFieldInfo { name: "generateTime".to_string(), field_type: GorgeType::new(BasicType::Float), has_default_value: false },
+                InjectorFieldInfo { name: "keepTime".to_string(), field_type: GorgeType::new(BasicType::Float), has_default_value: false },
+                InjectorFieldInfo { name: "laneLines".to_string(), field_type: GorgeType::new(BasicType::Object), has_default_value: false },
+                InjectorFieldInfo { name: "positionZ".to_string(), field_type: GorgeType::new(BasicType::Float), has_default_value: false },
+            ],
+            super_class: None,
+            super_interfaces: vec![],
+            field_type_count: TypeCount::zero(),
+            method_count: 0,
+            static_method_count: 0,
+            constructor_count: 0,
+            injector_field_type_count: TypeCount {
+                string_count: 1,
+                float_count: 3,
+                object_count: 1,
+                ..TypeCount::zero()
+            },
+            injector_field_default_value_type_count: TypeCount::zero(),
+            method_start_id: 0,
+            constructor_start_id: 0,
+            interface_method_impl_id: HashMap::new(),
+            method_override_id: HashMap::new(),
+            injector_constructor_impl_id: vec![],
+            method_annotations: HashMap::new(),
+            constructor_annotations: HashMap::new(),
+        };
+        Arc::new(decl)
+    }
+
+    /// from_constant：常量缺失类声明中的部分字段时，按类声明分组索引填充，
+    /// 数组大小按类声明统计（对齐 codegen 与 materialize 的布局约定）
+    #[test]
+    fn test_from_constant_indexes_by_declaration() {
+        use crate::objective::bytecode::{InjectorConstantDef, InjectorConstField};
+        let constant = InjectorConstantDef {
+            class_name: "DremuLane".to_string(),
+            fields: vec![
+                // 缺 generateTime（类声明中的第 0 个 float）
+                InjectorConstField::String("name".to_string(), "Main1".to_string()),
+                InjectorConstField::Float("keepTime".to_string(), 1.5),
+                InjectorConstField::Float("positionZ".to_string(), -2.0),
+            ],
+        };
+        let injector = RuntimeInjector::from_constant(&constant, make_lane_decl());
+
+        // 数组大小按类声明（含未在常量出现的字段）：float 应为 3（不是常量中的 2）
+        assert_eq!(injector.float_field_count(), 3);
+        assert_eq!(injector.string_field_count(), 1);
+        assert_eq!(injector.object_field_count(), 1);
+        // name → String 组 0
+        assert_eq!(injector.get_injector_string(0), "Main1");
+        assert!(!injector.get_injector_string_default_value(0));
+        // keepTime → Float 组 1（声明中 generateTime 在前占 0）
+        assert_eq!(injector.get_injector_float(1), 1.5);
+        assert!(!injector.get_injector_float_default_value(1));
+        // positionZ → Float 组 2
+        assert_eq!(injector.get_injector_float(2), -2.0);
+        // 未出现在常量的 generateTime（Float 组 0）保持默认值
+        assert!(injector.get_injector_float_default_value(0));
+        assert_eq!(injector.get_injector_float(0), 0.0);
+    }
+
+    /// from_constant：哑声明（未注册类）回退按常量内字段顺序编号，数据不丢
+    #[test]
+    fn test_from_constant_dummy_decl_fallback() {
+        use crate::objective::bytecode::{InjectorConstantDef, InjectorConstField};
+        let constant = InjectorConstantDef {
+            class_name: "UnknownClass".to_string(),
+            fields: vec![
+                InjectorConstField::Float("a".to_string(), 1.0),
+                InjectorConstField::Float("b".to_string(), 2.0),
+            ],
+        };
+        let dummy = Arc::new(ClassDeclaration::dummy("UnknownClass".to_string()));
+        let injector = RuntimeInjector::from_constant(&constant, dummy);
+        assert_eq!(injector.float_field_count(), 2);
+        assert_eq!(injector.get_injector_float(0), 1.0);
+        assert_eq!(injector.get_injector_float(1), 2.0);
     }
 }
