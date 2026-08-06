@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use gorge_framework::adaptor::{
     IAudioEffectPlayer, IAudioPlayer, ICurveSprite, INineSliceSprite, ISprite, PlatformBase,
 };
-use macroquad::audio::{play_sound, stop_sound, PlaySoundParams, Sound};
 use macroquad::prelude::*;
+use sasa::backend::cpal::{CpalBackend, CpalSettings};
+use sasa::{AudioClip, AudioManager, Music, MusicParams, PlaySfxParams, Sfx};
 
 // ==================== 精灵渲染状态 ====================
 
@@ -121,13 +122,12 @@ impl AudioPlayerState {
 
 /// 音效播放器状态
 struct AudioEffectState {
-    audio_id: usize,
     alive: bool,
 }
 
 impl AudioEffectState {
-    fn new(audio_id: usize) -> Self {
-        Self { audio_id, alive: true }
+    fn new() -> Self {
+        Self { alive: true }
     }
 }
 
@@ -140,10 +140,14 @@ struct InnerState {
     textures: HashMap<usize, Texture2D>,
     audio_players: Vec<AudioPlayerState>,
     audio_effects: Vec<AudioEffectState>,
-    audios: HashMap<usize, Sound>,
     next_texture_id: usize,
-    #[allow(dead_code)]
     next_audio_id: usize,
+    /// 音频资源表：audio_id -> 解码后的音频片段（供时长查询）
+    audio_clips: HashMap<usize, AudioClip>,
+    /// 音乐播放器表：audio_id -> 播放器（对应 IAudioPlayer 的底层）
+    music_players: HashMap<usize, Music>,
+    /// 音效播放器表：播放器索引 -> 播放器（对应 IAudioEffectPlayer 的底层；None 表示创建失败）
+    sfx_players: HashMap<usize, Option<Sfx>>,
 }
 
 impl InnerState {
@@ -155,9 +159,11 @@ impl InnerState {
             textures: HashMap::new(),
             audio_players: Vec::new(),
             audio_effects: Vec::new(),
-            audios: HashMap::new(),
             next_texture_id: 1,
             next_audio_id: 1,
+            audio_clips: HashMap::new(),
+            music_players: HashMap::new(),
+            sfx_players: HashMap::new(),
         }
     }
 
@@ -167,7 +173,6 @@ impl InnerState {
         id
     }
 
-    #[allow(dead_code)]
     fn alloc_audio_id(&mut self) -> usize {
         let id = self.next_audio_id;
         self.next_audio_id += 1;
@@ -177,6 +182,29 @@ impl InnerState {
 
 /// 供渲染循环访问的全局状态引用
 static RENDER_STATE: OnceLock<Arc<Mutex<InnerState>>> = OnceLock::new();
+
+// sasa 音频管理器单例（thread_local：cpal 设备流不要求 Send/Sync，仅主线程访问）。
+// 惰性创建；无音频设备时保持 None，播放相关调用降级为 no-op。
+thread_local! {
+    static AUDIO_MANAGER: Mutex<Option<AudioManager>> = Mutex::new(None);
+}
+
+/// 惰性创建 sasa 音频管理器
+///
+/// 首次调用时通过 cpal 初始化默认音频输出设备；失败（如无音频设备）
+/// 返回错误信息，调用方应降级处理。
+fn ensure_audio_manager() -> Result<(), String> {
+    AUDIO_MANAGER.with(|slot| {
+        let mut guard = slot.lock().expect("音频管理器锁未被污染");
+        if guard.is_none() {
+            match AudioManager::new(CpalBackend::new(CpalSettings::default())) {
+                Ok(manager) => *guard = Some(manager),
+                Err(err) => return Err(format!("音频设备初始化失败: {err}")),
+            }
+        }
+        Ok(())
+    })
+}
 
 // ==================== 平台 ====================
 
@@ -283,6 +311,45 @@ pub fn render_resource_counts() -> (usize, usize, usize, usize) {
             .count(),
         state.curves.iter().filter(|curve| curve.alive).count(),
     )
+}
+
+/// 返回当前平台中的音频资源与播放器数量
+///
+/// 用于启动诊断，验证音频资产是否真实解码注册到平台。
+/// 返回 (音频资源数, 音乐播放器数, 音效播放器数)。
+pub fn audio_resource_counts() -> (usize, usize, usize) {
+    let Some(state_lock) = RENDER_STATE.get() else {
+        return (0, 0, 0);
+    };
+    let state = state_lock.lock().unwrap();
+    (
+        state.audio_clips.len(),
+        state.music_players.len(),
+        state.sfx_players.len(),
+    )
+}
+
+/// 返回音频播放器运行状态摘要（开发诊断用）
+///
+/// 逐音乐播放器报告暂停状态与播放位置，用于验证 SongSimulator
+/// 是否真实触发播放。格式：`music[id]=paused:true|false,pos:0.00`。
+pub fn audio_playback_diagnostics() -> String {
+    let Some(state_lock) = RENDER_STATE.get() else {
+        return "无平台状态".to_string();
+    };
+    let mut state = state_lock.lock().unwrap();
+    let mut parts: Vec<String> = Vec::new();
+    let mut ids: Vec<usize> = state.music_players.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        if let Some(music) = state.music_players.get_mut(&id) {
+            parts.push(format!("music[{id}]=paused:{},pos:{:.3}", music.paused(), music.position()));
+        }
+    }
+    if parts.is_empty() {
+        return "无音乐播放器".to_string();
+    }
+    parts.join(" ")
 }
 
 // ==================== 渲染函数 ====================
@@ -579,36 +646,61 @@ impl IAudioPlayer for MacroquadAudio {
     }
 
     fn play(&self) {
-        let state = self.state.lock().unwrap();
-        if let Some(ap) = state.audio_players.get(self.index) {
-            if ap.audio_id != 0 {
-                if let Some(sound) = state.audios.get(&ap.audio_id) {
-                    play_sound(sound, PlaySoundParams { looped: true, volume: 1.0 });
+        let mut state = self.state.lock().unwrap();
+        let audio_id = state.audio_players.get(self.index).map(|ap| ap.audio_id).unwrap_or(0);
+        if audio_id != 0 {
+            if let Some(music) = state.music_players.get_mut(&audio_id) {
+                // sasa 播放：从当前（或 set_time 设置的）位置继续
+                if let Err(err) = music.play() {
+                    eprintln!("[Gorge] 音频播放失败: {err}");
                 }
             }
         }
     }
 
     fn stop(&self) {
-        let state = self.state.lock().unwrap();
-        if let Some(ap) = state.audio_players.get(self.index) {
-            if ap.audio_id != 0 {
-                if let Some(sound) = state.audios.get(&ap.audio_id) {
-                    stop_sound(sound);
+        let mut state = self.state.lock().unwrap();
+        let audio_id = state.audio_players.get(self.index).map(|ap| ap.audio_id).unwrap_or(0);
+        if audio_id != 0 {
+            if let Some(music) = state.music_players.get_mut(&audio_id) {
+                if let Err(err) = music.pause() {
+                    eprintln!("[Gorge] 音频暂停失败: {err}");
                 }
             }
         }
     }
 
+    /// 音频时长（秒）：直接取自解码后的音频数据
     fn audio_length(&self) -> f32 {
-        0.0
+        let state = self.state.lock().unwrap();
+        let audio_id = state.audio_players.get(self.index).map(|ap| ap.audio_id).unwrap_or(0);
+        state.audio_clips.get(&audio_id).map(|clip| clip.length()).unwrap_or(0.0)
     }
 
+    /// 是否正在播放：查询 sasa 播放器的真实暂停状态
     fn is_playing(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let audio_id = state.audio_players.get(self.index).map(|ap| ap.audio_id).unwrap_or(0);
+        if audio_id != 0 {
+            if let Some(music) = state.music_players.get_mut(&audio_id) {
+                return !music.paused();
+            }
+        }
         false
     }
 
-    fn set_time(&self, _time: f32) {}
+    /// 设置播放进度：sasa 支持真实 seek
+    fn set_time(&self, time: f32) {
+        let mut state = self.state.lock().unwrap();
+        let audio_id = state.audio_players.get(self.index).map(|ap| ap.audio_id).unwrap_or(0);
+        if audio_id != 0 {
+            if let Some(music) = state.music_players.get_mut(&audio_id) {
+                if let Err(err) = music.seek_to(time) {
+                    eprintln!("[Gorge] 音频 seek 失败: {err}");
+                }
+            }
+        }
+    }
 
     fn destruct(&self) {
         if let Some(ap) = self.state.lock().unwrap().audio_players.get_mut(self.index) {
@@ -624,12 +716,11 @@ struct MacroquadAudioEffect {
 
 impl IAudioEffectPlayer for MacroquadAudioEffect {
     fn play(&self) {
-        let state = self.state.lock().unwrap();
-        if let Some(ae) = state.audio_effects.get(self.index) {
-            if ae.audio_id != 0 {
-                if let Some(sound) = state.audios.get(&ae.audio_id) {
-                    play_sound(sound, PlaySoundParams { looped: false, volume: 1.0 });
-                }
+        let mut state = self.state.lock().unwrap();
+        if let Some(Some(sfx)) = state.sfx_players.get_mut(&self.index) {
+            // 音效每次从 0 位置播放（可叠加）
+            if let Err(err) = sfx.play(PlaySfxParams::default()) {
+                eprintln!("[Gorge] 音效播放失败: {err}");
             }
         }
     }
@@ -675,14 +766,27 @@ impl PlatformBase for MacroquadPlatform {
     fn create_audio_effect_player(&self, audio_id: usize) -> Box<dyn IAudioEffectPlayer> {
         let mut state = self.state.lock().unwrap();
         let index = state.audio_effects.len();
-        state.audio_effects.push(AudioEffectState::new(audio_id));
+        // 音频资源已就绪且设备可用时创建 sasa 音效播放器；否则保持 None（播放为 no-op）
+        let clip = state.audio_clips.get(&audio_id).cloned();
+        let sfx = clip.and_then(|c| {
+            ensure_audio_manager().ok()?;
+            AUDIO_MANAGER
+                .with(|slot| slot.lock().expect("音频管理器锁未被污染").as_mut()?.create_sfx(c, None).ok())
+        });
+        state.sfx_players.insert(index, sfx);
+        state.audio_effects.push(AudioEffectState::new());
         Box::new(MacroquadAudioEffect { state: self.state.clone(), index })
     }
 
-    fn create_audio(&self, _path: &str) -> usize {
-        // macroquad 音频加载需异步上下文，暂返回无效句柄
-        // 音频功能将在后续集成中通过异步队列实现
-        0
+    fn create_audio(&self, path: &str) -> usize {
+        // 从磁盘读取音频文件字节后复用字节加载路径（资源包解压到磁盘时可用）
+        match std::fs::read(path) {
+            Ok(data) => self.create_audio_from_data(path, &data).unwrap_or(0),
+            Err(err) => {
+                eprintln!("[Gorge] 音频文件读取失败 {path}: {err}");
+                0
+            }
+        }
     }
 
     fn create_graph_from_data(&self, _path: &str, data: &[u8]) -> Result<usize, String> {
@@ -693,13 +797,30 @@ impl PlatformBase for MacroquadPlatform {
         Ok(id)
     }
 
-    fn create_audio_from_data(&self, _path: &str, _data: &[u8]) -> Result<usize, String> {
-        // macroquad 音频加载需异步上下文，暂不支持从数据加载
-        Err("macroquad 音频加载需异步上下文，暂不支持".into())
+    fn create_audio_from_data(&self, _path: &str, data: &[u8]) -> Result<usize, String> {
+        // sasa 用 symphonia 同步解码（支持 WAV/MP3/FLAC/OGG 等），无需异步上下文
+        let clip = AudioClip::new(data.to_vec()).map_err(|err| format!("音频解码失败: {err}"))?;
+        ensure_audio_manager()?;
+        let music = AUDIO_MANAGER.with(|slot| {
+            slot.lock()
+                .expect("音频管理器锁未被污染")
+                .as_mut()
+                .expect("音频管理器已初始化")
+                .create_music(clip.clone(), MusicParams::default())
+                .map_err(|err| format!("音频播放器创建失败: {err}"))
+        })?;
+        let mut state = self.state.lock().unwrap();
+        let id = state.alloc_audio_id();
+        state.audio_clips.insert(id, clip);
+        state.music_players.insert(id, music);
+        Ok(id)
     }
 
     fn create_video_from_data(&self, path: &str, data: &[u8]) -> Result<usize, String> {
-        // macroquad 无内置视频支持，回退为纹理加载
+        // macroquad 无视频解码能力：识别常见视频容器魔数并返回明确错误
+        if is_video_data(data) {
+            return Err(format!("macroquad 无视频解码能力，视频资源不受支持: {path}"));
+        }
         self.create_graph_from_data(path, data)
     }
 
@@ -715,6 +836,39 @@ impl PlatformBase for MacroquadPlatform {
     fn log(&self, message: &str) {
         println!("[Gorge] {}", message);
     }
+}
+
+// ==================== 视频格式识别 ====================
+
+/// 识别常见视频容器格式魔数（MP4/MOV/WebM/MKV/AVI/FLV/WMV）
+///
+/// macroquad 无视频解码能力，`create_video_from_data` 据此提前识别
+/// 视频资源并返回明确错误，避免把视频字节当作图片纹理加载。
+fn is_video_data(data: &[u8]) -> bool {
+    // MP4 / MOV / M4A：偏移 4 处为 `ftyp` 品牌标识
+    if data.len() >= 8 && &data[4..8] == b"ftyp" {
+        return true;
+    }
+    // WebM / Matroska（MKV）：EBML 头
+    if data.len() >= 4 && data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return true;
+    }
+    // AVI：RIFF 容器 + AVI 类型标识
+    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"AVI " {
+        return true;
+    }
+    // FLV
+    if data.len() >= 3 && &data[0..3] == b"FLV" {
+        return true;
+    }
+    // WMV / ASF：ASF GUID 头
+    if data.len() >= 16
+        && data[0..16]
+            == [0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C]
+    {
+        return true;
+    }
+    false
 }
 
 // ==================== 安装辅助 ====================
@@ -862,5 +1016,88 @@ mod tests {
         // 仅验证 new() 会尝试设置
         let _platform = MacroquadPlatform::new();
         assert!(RENDER_STATE.get().is_some());
+    }
+
+    /// 构造最小标准 WAV 文件字节（44 字节头 + 纯 PCM 采样）
+    ///
+    /// 参数：采样数、采样率、声道数、位深（8/16）、音频格式（1=PCM）
+    fn make_wav_bytes(sample_count: u32, sample_rate: u32, channels: u16, bits: u16) -> Vec<u8> {
+        let bytes_per_sample = (bits / 8) as u32;
+        let block_align: u16 = (channels as u32 * bytes_per_sample) as u16;
+        let byte_rate = sample_rate * block_align as u32;
+        let data_size = sample_count * block_align as u32;
+        let mut bytes = Vec::with_capacity(44 + data_size as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        // 填充静音采样（8 位无符号 / 16 位有符号的小端字节）
+        let sample_bytes: [u8; 2] = if bits == 8 { [0x00, 0x00] } else { 0i16.to_le_bytes() };
+        for _ in 0..data_size / bytes_per_sample {
+            bytes.extend_from_slice(&sample_bytes);
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_is_video_data_recognizes_video_magic_numbers() {
+        // MP4：偏移 4 处为 ftyp
+        let mp4 = [0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'];
+        assert!(is_video_data(&mp4));
+        // WebM / MKV：EBML 头
+        assert!(is_video_data(&[0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86]));
+        // AVI
+        let mut avi = Vec::new();
+        avi.extend_from_slice(b"RIFF");
+        avi.extend_from_slice(&0u32.to_le_bytes());
+        avi.extend_from_slice(b"AVI ");
+        assert!(is_video_data(&avi));
+        // FLV
+        assert!(is_video_data(b"FLV\x01"));
+        // WMV / ASF GUID
+        let wmv = [0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C];
+        assert!(is_video_data(&wmv));
+    }
+
+    #[test]
+    fn test_is_video_data_rejects_non_video_data() {
+        // WAV 音频
+        assert!(!is_video_data(&make_wav_bytes(100, 8000, 1, 16)));
+        // PNG 魔数
+        assert!(!is_video_data(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+        // 空数据 / 过短数据
+        assert!(!is_video_data(&[]));
+        assert!(!is_video_data(&[0x1A, 0x45]));
+        // 无头 RIFF（无 AVI 标识）
+        assert!(!is_video_data(b"RIFF\x00\x00\x00\x00WAVE"));
+    }
+
+    #[test]
+    fn test_audio_clip_decodes_wav_length() {
+        // 8000Hz 单声道 16 位，1000 采样 → 0.125 秒
+        let wav = make_wav_bytes(1000, 8000, 1, 16);
+        let clip = AudioClip::new(wav).expect("最小 WAV 应可被 symphonia 解码");
+        assert_eq!(clip.sample_rate(), 8000);
+        assert_eq!(clip.frame_count(), 1000);
+        assert!((clip.length() - 0.125).abs() < 1e-4, "时长应为 0.125s，实际 {}", clip.length());
+    }
+
+    #[test]
+    fn test_audio_clip_decodes_stereo_wav() {
+        // 44100Hz 双声道 16 位，4410 采样 → 0.1 秒
+        let wav = make_wav_bytes(4410, 44100, 2, 16);
+        let clip = AudioClip::new(wav).expect("立体声 WAV 应可被解码");
+        assert_eq!(clip.sample_rate(), 44100);
+        assert_eq!(clip.frame_count(), 4410);
+        assert!((clip.length() - 0.1).abs() < 1e-4, "时长应为 0.1s，实际 {}", clip.length());
     }
 }

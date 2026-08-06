@@ -3,6 +3,7 @@
 use gorge_core::diagnostics::{Diagnostics, Span};
 use gorge_core::virtual_machine::ir::{CodeWithSpan, IntermediateOperator, Operand, ValueType};
 use gorge_core::objective::bytecode::{DelegateImpl, InjectorConstField, CompiledFieldInitializer};
+use gorge_core::objective::declaration::AnnotationValue;
 
 use crate::frontend::ast::*;
 use crate::visitors::codegen::CodeGenerator;
@@ -1231,9 +1232,13 @@ impl Compiler {
 
     /// S3a：从方法/构造方法的 AST 注解列表收集 MethodAnnotation
     ///
-    /// 对每个注解的每个参数：
+    /// 对每个注解的每个参数与元数据块条目：
     /// - 先尝试 `eval_metadata_const` 常量折叠 → `AnnotationValue::Int/Float/Bool/String`
     /// - 常量折叠失败（非常量表达式）→ 登记为隐藏方法任务，暂存 `AnnotationValue::Delegate(0)`
+    ///
+    /// 注解参数（`@Name(...)` 括号内）与元数据块（`[ type name = expr ]`）均入
+    /// `parameters` 表（键冲突时参数优先，跳过同名元数据条目）——对齐 C# 参考
+    /// `Annotation.TryGetMetadata("config")` 等按名读取的语义（框架从参数表按名取）。
     fn collect_annotations_from_decl(
         &mut self,
         ast_annotations: &[crate::frontend::ast::Annotation],
@@ -1244,28 +1249,18 @@ impl Compiler {
         for ast_ann in ast_annotations {
             let mut parameters = Vec::new();
             for (param_name, param_expr) in &ast_ann.arguments {
-                match eval_metadata_const(param_expr) {
-                    Some(inj_const) => {
-                        if let Some(av) = injector_const_to_annotation_value(&inj_const) {
-                            parameters.push((param_name.clone(), av));
-                        }
+                let av = self.annotation_expr_to_value(&ast_ann.name, param_name, param_expr, class_name, decl_span);
+                parameters.push((param_name.clone(), av));
+            }
+            // 元数据块条目（`[ PeriodConfig^ config = ... ]` 等）：与参数相同的编码路径
+            for entry in &ast_ann.metadatas {
+                if let Some(value_expr) = &entry.value {
+                    // 键冲突时参数优先（参数表语义更直接）
+                    if parameters.iter().any(|(k, _)| k == &entry.name) {
+                        continue;
                     }
-                    None => {
-                        // 非常量表达式 → 创建隐藏方法（S3b）
-                        let vt = Self::infer_expression_value_type(param_expr);
-                        let hidden_name = format!("__annotation_{}_{}", ast_ann.name, param_name);
-                        // 方法全局 ID 在 freeze 之后再分配，当前填 0 占位
-                        self.pending_hidden_methods.push(HiddenMethodTask {
-                            class_name: class_name.into(),
-                            global_id: 0,
-                            method_name: hidden_name,
-                            expression: param_expr.clone(),
-                            return_value_type: vt,
-                            class_span: decl_span,
-                        });
-                        // 占位 Delegate(0)，freeze 之后再回填真实 ID
-                        parameters.push((param_name.clone(), gorge_core::objective::declaration::AnnotationValue::Delegate(0)));
-                    }
+                    let av = self.annotation_expr_to_value(&ast_ann.name, &entry.name, value_expr, class_name, decl_span);
+                    parameters.push((entry.name.clone(), av));
                 }
             }
             // 无参注解（如 `@Chart` / `@Song`）也必须记录：框架依赖注解名
@@ -1277,6 +1272,46 @@ impl Compiler {
             });
         }
         result
+    }
+
+    /// 将注解参数/元数据表达式转换为 `AnnotationValue`（S3a 辅助）
+    ///
+    /// 可常量折叠（Int/Float/Bool/String 字面量及算术）→ 直接存储；
+    /// 非常量（字段引用、注入器字面量等）→ 登记为隐藏方法任务，
+    /// 存储 `Delegate(0)` 占位（freeze 后回填真实方法全局 ID）。
+    fn annotation_expr_to_value(
+        &mut self,
+        ast_ann_name: &str,
+        param_name: &str,
+        param_expr: &Expression,
+        class_name: &str,
+        decl_span: Span,
+    ) -> gorge_core::objective::declaration::AnnotationValue {
+        match eval_metadata_const(param_expr) {
+            Some(inj_const) => {
+                if let Some(av) = injector_const_to_annotation_value(&inj_const) {
+                    return av;
+                }
+                // 折叠成功但无法表示为标量（防御性分支，当前不会发生）
+                AnnotationValue::Delegate(0)
+            }
+            None => {
+                // 非常量表达式 → 创建隐藏方法（S3b）
+                let vt = Self::infer_expression_value_type(param_expr);
+                let hidden_name = format!("__annotation_{}_{}", ast_ann_name, param_name);
+                // 方法全局 ID 在 freeze 之后再分配，当前填 0 占位
+                self.pending_hidden_methods.push(HiddenMethodTask {
+                    class_name: class_name.into(),
+                    global_id: 0,
+                    method_name: hidden_name,
+                    expression: param_expr.clone(),
+                    return_value_type: vt,
+                    class_span: decl_span,
+                });
+                // 占位 Delegate(0)，freeze 之后再回填真实 ID
+                AnnotationValue::Delegate(0)
+            }
+        }
     }
 
     /// 从表达式推导值类型（S3b 辅助）
@@ -3516,8 +3551,7 @@ class AnnTest {
     /// 无参注解（`@Chart`/`@Song`）也必须被捕获进 method_annotations，
     /// 否则框架 `extract_element_periods_from_class` 找不到谱表方法、`score_elements=0`。
     #[test]
-    fn test_s3_annotation_collect_bare_no_params() {
-        let source_text = r#"
+    fn test_s3_annotation_collect_bare_no_params() {        let source_text = r#"
 class AnnBare {
     @Chart
     float Period() { return 0.0; }
@@ -3536,6 +3570,97 @@ class AnnBare {
         assert_eq!(method_anns.len(), 1, "无参注解也应被记录");
         assert_eq!(method_anns[0].name, "Chart", "应记录注解名 @Chart");
         assert!(method_anns[0].parameters.is_empty(), "无参注解参数应为空");
+    }
+
+    /// 元数据块条目（`[ PeriodConfig^ config = ... ]` 形式，对齐 C# `Annotation.Metadatas`）
+    /// 应与括号参数同样编码进注解参数表；常量标量直接存储。
+    #[test]
+    fn test_s3_annotation_collect_metadata_block_scalar() {
+        use gorge_core::objective::declaration::AnnotationValue;
+        let source_text = r#"
+class AnnMetaScalar {
+    [
+        string displayName = "谱表",
+        float timeOffset = 0.373,
+    ]
+    @Song
+    static GorgeFramework.AudioAsset^ GetSong() { return null; }
+}
+"#;
+        let (tokens, _) = crate::frontend::lexer::tokenize(source_text, 0);
+        let mut parser = crate::frontend::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source_file]);
+
+        let anns = compiler.method_annotations.get("AnnMetaScalar").unwrap();
+        let method_anns = anns.get(&0).unwrap();
+        assert_eq!(method_anns[0].name, "Song");
+        let display = method_anns[0].find_parameter("displayName").expect("元数据 displayName 应入参数表");
+        assert!(matches!(display, AnnotationValue::String(s) if s == "谱表"));
+        let offset = method_anns[0].find_parameter("timeOffset").expect("元数据 timeOffset 应入参数表");
+        assert!(matches!(offset, AnnotationValue::Float(v) if (v - 0.373).abs() < 1e-9));
+    }
+
+    /// 元数据块条目为注入器字面量（`PeriodConfig^ config = PeriodConfig : {...}`）
+    /// → 走隐藏方法路径，存储 Delegate，freeze 后回填真实全局方法 ID。
+    #[test]
+    fn test_s3_annotation_collect_metadata_block_injector_delegate() {
+        use gorge_core::objective::declaration::AnnotationValue;
+        let source_text = r#"
+class MyPeriodConfig {
+    float timeOffset = 0.0;
+}
+class AnnMetaInjector {
+    [
+        MyPeriodConfig^ config = MyPeriodConfig : {
+            timeOffset : 0.373,
+        }
+    ]
+    @Song
+    static int GetSong() { return 0; }
+}
+"#;
+        let (tokens, _) = crate::frontend::lexer::tokenize(source_text, 0);
+        let mut parser = crate::frontend::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source_file]);
+        assert!(!compiler.diagnostics.has_errors(), "测试源码应无编译错误");
+
+        let anns = compiler.method_annotations.get("AnnMetaInjector").unwrap();
+        let method_anns = anns.get(&0).unwrap();
+        let config = method_anns[0].find_parameter("config").expect("元数据 config 应入参数表");
+        assert!(
+            matches!(config, AnnotationValue::Delegate(id) if *id != 0),
+            "注入器字面量应编码为隐藏方法 Delegate，实际: {config:?}"
+        );
+    }
+
+    /// 括号参数与元数据块同名时参数优先，元数据条目跳过。
+    #[test]
+    fn test_s3_annotation_metadata_conflict_param_wins() {
+        let source_text = r#"
+class AnnMetaConflict {
+    [
+        float value = 1.0,
+    ]
+    @Timed(value = 2.0)
+    int Work() { return 0; }
+}
+"#;
+        let (tokens, _) = crate::frontend::lexer::tokenize(source_text, 0);
+        let mut parser = crate::frontend::parser::Parser::new(tokens);
+        let source_file = parser.parse_source_file().unwrap();
+        let mut compiler = Compiler::new();
+        let _ = compiler.compile(&[source_file]);
+
+        let anns = compiler.method_annotations.get("AnnMetaConflict").unwrap();
+        let method_anns = anns.get(&0).unwrap();
+        let value = method_anns[0].find_parameter("value").unwrap();
+        assert!(matches!(value, gorge_core::objective::declaration::AnnotationValue::Float(v) if (v - 2.0).abs() < 1e-9));
+        let count = method_anns[0].parameters.iter().filter(|(k, _)| k == "value").count();
+        assert_eq!(count, 1, "同名元数据应被参数覆盖，只保留一个");
     }
 
     /// 注解参数用常量算术表达式 → 编译时折叠为常量

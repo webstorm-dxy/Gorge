@@ -102,18 +102,26 @@ pub fn compile_sources(sources: &[SourceFile], show_progress: bool) -> Result<Co
             let mut sorted: Vec<&(usize, compiler::CompiledMethodContents)> = hidden.iter().collect();
             sorted.sort_by_key(|(gid, _)| *gid);
             for (gid, contents) in &sorted {
+                // 隐藏方法按本类局部索引（全局 ID - method_start_id）定位放置，
+                // 与 freeze 的方法全局 ID 分配（method_count_total + 隐藏偏移）对齐。
+                let local = *gid - class.method_start_id;
                 let optimized = crate::optimizer::optimizer::IntermediateCodeOptimizer::optimize(&contents.codes);
-                // 确保 methods 容量足够容纳隐藏方法（按全局 ID 定位可能需要扩充）
-                while class.methods.len() <= *gid - class.method_start_id {
+                // 中间缺失的槽位用空方法占位，保证索引连续
+                while class.methods.len() < local {
                     class.methods.push(gorge_core::virtual_machine::ir::CompiledMethod {
                         name: String::new(), codes: vec![], local_count: 0,
                     });
                 }
-                class.methods.push(gorge_core::virtual_machine::ir::CompiledMethod {
+                let compiled = gorge_core::virtual_machine::ir::CompiledMethod {
                     name: contents.name.clone(),
                     codes: optimized,
                     local_count: contents.total_locals,
-                });
+                };
+                if class.methods.len() == local {
+                    class.methods.push(compiled);
+                } else {
+                    class.methods[local] = compiled;
+                }
             }
         }
     }

@@ -22,6 +22,8 @@ use gorge_core::virtual_machine::vm::VirtualMachine;
 use gorge_framework::chart::package::Package;
 use gorge_framework::runtime::runtime_manager::{RuntimeManager, RuntimeState};
 
+use crate::adaptor;
+
 /// 从完整限定名提取简单类名（最后一段）
 fn simple_name(full: &str) -> String {
     full.rsplit('.').next().unwrap_or(full).to_string()
@@ -307,6 +309,8 @@ pub struct GameLoader {
     pub runtime_manager: RuntimeManager,
     /// 当前仿真时间（秒）
     simulation_time: f32,
+    /// 上次音频状态诊断时间（秒）
+    last_audio_diagnostic: f32,
 }
 
 impl GameLoader {
@@ -316,6 +320,7 @@ impl GameLoader {
             vm: VirtualMachine::new(),
             runtime_manager: RuntimeManager::new(),
             simulation_time: 0.0,
+            last_audio_diagnostic: 0.0,
         }
     }
 
@@ -407,6 +412,17 @@ impl GameLoader {
                 runtime.graphics.nodes.len(),
             );
         }
+        let (audio_clips, music_players, sfx_players) = adaptor::audio_resource_counts();
+        let audio_period_count = self
+            .runtime_manager
+            .simulation_runtime
+            .as_ref()
+            .map(|rt| rt.audio.period_audio_sources.len())
+            .unwrap_or(0);
+        eprintln!(
+            "[Gorge] 音频资源: clips={} music={} sfx={} period_players={}",
+            audio_clips, music_players, sfx_players, audio_period_count
+        );
         eprintln!("[Gorge] 加载完成!");
 
         Ok(())
@@ -417,6 +433,15 @@ impl GameLoader {
         self.simulation_time += delta_time;
         self.runtime_manager
             .drive(delta_time, &mut self.vm);
+        // 每 2 秒打印一次音频播放状态（开发诊断：验证 SongSimulator 播放触发）
+        if self.simulation_time - self.last_audio_diagnostic >= 2.0 {
+            self.last_audio_diagnostic = self.simulation_time;
+            eprintln!(
+                "[Gorge] t={:.2} 音频: {}",
+                self.simulation_time,
+                adaptor::audio_playback_diagnostics()
+            );
+        }
     }
 
     /// 返回当前仿真时间（秒）

@@ -247,8 +247,46 @@ impl RuntimeManager {
         {
             rt.load_score(score, machine, vm);
             Self::seed_instant_audio(rt, score);
+            // 音频乐段注册（对齐 C# `AudioManager.StartSimulation` 遍历 Stave 中
+            // AudioStaff.Periods 建播放器；Rust 采用缓存机制：load_score 时登记
+            // `cached_periods`，StartSimulation 按缓存补齐播放器）
+            Self::seed_audio_periods(rt, score);
         }
         self.state = RuntimeState::ScoreLoaded;
+    }
+
+    /// 从谱面 AudioStaff 乐段注册音频播放器数据（对齐 C# `AudioPeriod.UpdateAudio`）
+    ///
+    /// 对每个 `@AudioStaff` 谱表的 `@Song` 乐段：
+    /// - `audio_id`：从音频资产注入器 JSON 的 `name` 字段（如 `audio:Song`）查
+    ///   已加载资源表（`loaded_assets`）取得平台音频句柄；查不到时为 0（无声音）
+    /// - `time_offset`：乐段 `PeriodConfig.timeOffset`
+    /// - `period_id`：自增分配（load_score 期间保持稳定，StopSimulation 后缓存复用）
+    fn seed_audio_periods(rt: &mut GorgeSimulationRuntime, score: &SimulationScore) {
+        use crate::chart::staff::AudioStaff;
+        let mut periods: Vec<crate::runtime::environment::AudioPeriodData> = Vec::new();
+        let mut next_period_id: usize = 1;
+        for staff in &score.stave {
+            let Some(audio_staff) = staff.as_any().downcast_ref::<AudioStaff>() else {
+                continue;
+            };
+            for period in &audio_staff.periods {
+                let audio_id = period
+                    .audio_injector
+                    .as_ref()
+                    .and_then(|injector| injector.get("name").and_then(|n| n.as_str()))
+                    .and_then(|name| score.get_asset_by_name(name))
+                    .map(|asset| asset.handle)
+                    .unwrap_or(0);
+                periods.push(crate::runtime::environment::AudioPeriodData::new(
+                    next_period_id,
+                    audio_id,
+                    period.period_data.config.time_offset,
+                ));
+                next_period_id += 1;
+            }
+        }
+        rt.register_audio_periods(&periods);
     }
 
     /// 从谱面 InstantAudio 播种即时音效缓存到 AudioManager（P1-3）
@@ -376,6 +414,73 @@ mod tests {
     fn test_runtime_manager_new_initializes_environment_global() {
         let _manager = RuntimeManager::new();
         global::with_env_global(|_| ());
+    }
+
+    // ==================== 音频乐段注册测试 ====================
+
+    /// `seed_audio_periods` 应从 AudioStaff 乐段提取 audio_id（经资产名查句柄）
+    /// 与 time_offset，注册到 AudioManager（period_audio_sources 非空）。
+    #[test]
+    fn test_seed_audio_periods_registers_period_players() {
+        use crate::chart::staff::AudioStaff;
+        use crate::runtime::environment::GorgeSimulationRuntime;
+
+        let _ = setup();
+        let mut score = SimulationScore::new(0.0, 100.0, 1.0);
+        // 资产表：audio:Song → 句柄 7
+        score.loaded_assets.insert(
+            "audio:Song".to_string(),
+            crate::chart::simulation_score::Asset {
+                name: "audio:Song".to_string(),
+                handle: 7,
+            },
+        );
+        // 谱表：AudioStaff 含一个 @Song 乐段（注入器 JSON 带 name 与 timeOffset）
+        let mut staff = AudioStaff::new("Song".to_string(), true, "音频".to_string());
+        staff.periods.push(crate::chart::period::AudioPeriod::new(
+            "GetSong".to_string(),
+            serde_json::json!({ "timeOffset": 0.373 }),
+            Some(serde_json::json!({ "__type": "AudioAsset", "name": "audio:Song" })),
+        ));
+        score.stave.push(Box::new(staff));
+
+        let mut rt = GorgeSimulationRuntime::new();
+        RuntimeManager::seed_audio_periods(&mut rt, &score);
+
+        assert_eq!(
+            rt.audio.period_audio_sources.len(),
+            1,
+            "应注册 1 个乐段播放器"
+        );
+        assert!(
+            rt.audio.period_player(1).is_some(),
+            "period_id=1 的播放器应存在"
+        );
+        // audio_id=7 应登记到缓存（供 SongSimulator 经 period_time_offset 使用）
+        let offset = rt.audio.period_time_offset(1);
+        assert!((offset - 0.373).abs() < 1e-4, "time_offset 应为 0.373，实际 {offset}");
+    }
+
+    /// `seed_audio_periods` 对资产缺失的乐段应仍注册播放器（audio_id=0，
+    /// 播放时 no-op），不 panic、不跳过注册。
+    #[test]
+    fn test_seed_audio_periods_missing_asset_still_registers() {
+        use crate::chart::staff::AudioStaff;
+        use crate::runtime::environment::GorgeSimulationRuntime;
+
+        let _ = setup();
+        let mut score = SimulationScore::new(0.0, 100.0, 1.0);
+        let mut staff = AudioStaff::new("Song".to_string(), true, "音频".to_string());
+        staff.periods.push(crate::chart::period::AudioPeriod::new(
+            "GetSong".to_string(),
+            serde_json::json!({}),
+            Some(serde_json::json!({ "name": "audio:Missing" })),
+        ));
+        score.stave.push(Box::new(staff));
+
+        let mut rt = GorgeSimulationRuntime::new();
+        RuntimeManager::seed_audio_periods(&mut rt, &score);
+        assert_eq!(rt.audio.period_audio_sources.len(), 1, "资产缺失也应注册播放器");
     }
 
     // ==================== R-2 生命周期测试 ====================

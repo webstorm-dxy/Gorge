@@ -195,15 +195,19 @@
 
 ## P3 — 平台适配（Macroquad Demo）
 
-- [ ] **P3-1 音频从字节数据创建**
+- [x] **P3-1 音频从字节数据创建**
   - 说明：`create_audio_from_data` 返回 Err，`create_audio(path)` 返回 0；音频时长/播放状态/seek 为占位
   - 修改文件：
-    - `DemoImplement/MarcoquadDemo/src/adaptor.rs:603-611`（`audio_length`/`is_playing`/`set_time`）
-    - `DemoImplement/MarcoquadDemo/src/adaptor.rs:682-699`（`create_audio`/`create_audio_from_data`）
+    - `DemoImplement/MarcoquadDemo/src/adaptor.rs`（`audio_length`/`is_playing`/`set_time`、`create_audio`/`create_audio_from_data`）
+  - 完成时间：2026-08-06
+  - 实现说明：引入 sasa（git 依赖 + rev 4470cd7 锁定，未发布 crates.io）作为唯一音频后端——macroquad 保持默认（dummy 音频、无音频线程），避免 quad-snd 与 cpal 双 WASAPI 设备冲突。`create_audio_from_data` 用 `AudioClip::new`（symphonia 同步解码 WAV/MP3/FLAC/OGG）→ `AudioManager::create_music`；`create_audio(path)` 读磁盘字节复用同一路径。`audio_length`=clip.length() 真实时长、`is_playing`=!music.paused() 真实状态、`set_time`=music.seek_to() 真实 seek，与 C# 语义完全对齐；音效播放器走 `create_sfx`（每次从 0 播放可叠加）。AudioManager 用 thread_local 单例（sasa 的 `Box<dyn Backend>` 无 Send 标记，放不进 `Arc<Mutex<InnerState>>`），惰性创建，无音频设备时优雅降级（返回明确 Err / 播放 no-op）。Demo 实测音频资源真实解码注册：clips=5 music=5 sfx=3。
+  - 后续链路线（2026-08-06 同日修复，见 MEMORY 最新条目）：编译器丢 metadata（`[PeriodConfig^ config=...]` 块未入参数表）、隐藏方法插入索引错位（global_id=0 存量 bug）、`register_audio_periods` 无调用点、`create_period_player` 缺 SetAudio。修复后 Demo 实测 **0.373s 起播放 Song.wav（130.7 秒）真实出声**（music paused:false、pos 实时增长）。
 
-- [ ] **P3-2 视频真实支持**
+- [x] **P3-2 视频真实支持**
   - 说明：视频当前退化为纹理/占位路径
-  - 修改文件：`DemoImplement/MarcoquadDemo/src/adaptor.rs:701-704`（`create_video_from_data`）
+  - 修改文件：`DemoImplement/MarcoquadDemo/src/adaptor.rs`（`create_video_from_data`）
+  - 完成时间：2026-08-06
+  - 实现说明：macroquad 无视频解码能力（谱面包也无视频资源）。新增 `is_video_data` 魔数识别（MP4/MOV ftyp、WebM/MKV EBML、AVI RIFF、FLV、WMV/ASF GUID），命中返回明确 Err「macroquad 无视频解码能力，视频资源不受支持」；图片类数据继续走纹理加载。新增 4 个回归测试（视频魔数识别 5 种 / 非视频数据拒绝 / WAV 解码时长 8kHz 单声道 / 44.1kHz 立体声）。Demo 测试 9 → 13，全 workspace 测试通过、零 warning。
 
 ---
 

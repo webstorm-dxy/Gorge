@@ -776,6 +776,11 @@ impl AudioManager {
     /// 创建乐段播放器并登记两表（`add_period` 与 `start_simulation` 复用）
     fn create_period_player(&mut self, period_id: usize) {
         let player = crate::adaptor::platform().create_audio_player();
+        // 关联乐段音频（对齐 C# `DoAddPeriod` 的 `audioPlayer.SetAudio(audioPeriod.Audio)`；
+        // 缺失 SetAudio 时播放器 audio_id 恒为 0，时长/播放全部失效）
+        if let Some(data) = self.cached_periods.iter().find(|p| p.period_id == period_id) {
+            player.set_audio(data.audio_id);
+        }
         let handle = self.alloc_id();
         self.period_players.insert(handle, player);
         self.period_audio_sources.insert(period_id, handle);
@@ -1851,6 +1856,17 @@ mod tests {
         assert_eq!(rt.audio.period_audio_sources.len(), 2);
         assert!(rt.audio.period_audio_sources.contains_key(&100));
         assert!(rt.audio.period_audio_sources.contains_key(&101));
+
+        // 乐段缓存应携带 audio_id 与 time_offset（create_period_player 据此
+        // SetAudio 关联播放器——对齐 C# DoAddPeriod；全局平台单例下无法断言
+        // 具体播放器，此处验证数据源）
+        assert_eq!(rt.audio.cached_periods.len(), 2);
+        assert!(
+            rt.audio.cached_periods
+                .iter()
+                .any(|p| p.period_id == 100 && p.audio_id == 10 && (p.time_offset - 0.5).abs() < 1e-4),
+            "period 100 应缓存 audio_id=10 与 time_offset=0.5"
+        );
     }
 
     #[test]

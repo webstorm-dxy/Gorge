@@ -8,3 +8,4 @@ gorge_framework = { path = "../../GorgeFramework/GorgeFramework" }
 gorge_compiler = { package = "GorgeCompiler", path = "../../GorgeCompiler" }
 gorge_core = { path = "../../GorgeCore" }
 macroquad = "0.4"
+sasa = { git = "https://github.com/Mivik/sasa", rev = "4470cd7867f2fd4e0ef4800b27dfa993fc97afca" }
