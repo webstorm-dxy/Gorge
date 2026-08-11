@@ -62,8 +62,9 @@ pub trait ICurveSprite: Send + Sync {
     fn set_rotation(&self, x: f32, y: f32, z: f32);
     /// 设置缩放
     fn set_scale(&self, x: f32, y: f32, z: f32);
-    /// 设置曲线点
-    fn set_line(&self, point_count: usize);
+    /// 设置曲线点坐标（对齐 C# `ICurveSprite.SetLine(ObjectArray)`：
+    /// 平台接收完整点数组，而不是只有点数——只有点数时平台无法渲染曲线）
+    fn set_points(&self, points: &[(f32, f32)]);
     /// 设置颜色
     fn set_color(&self, r: u8, g: u8, b: u8, a: u8);
     /// 设置线宽
@@ -208,7 +209,7 @@ pub enum CallEntry {
     CurveSetPosition { sprite_id: usize, x: f32, y: f32, z: f32 },
     CurveSetRotation { sprite_id: usize, x: f32, y: f32, z: f32 },
     CurveSetScale { sprite_id: usize, x: f32, y: f32, z: f32 },
-    CurveSetLine { sprite_id: usize, point_count: usize },
+    CurveSetPoints { sprite_id: usize, points: Vec<(f32, f32)> },
     CurveSetColor { sprite_id: usize, r: u8, g: u8, b: u8, a: u8 },
     CurveSetWidth { sprite_id: usize, width: f32 },
     CurveDestroy { sprite_id: usize },
@@ -445,8 +446,11 @@ impl ICurveSprite for HeadlessCurve {
     fn set_scale(&self, x: f32, y: f32, z: f32) {
         self.calls.lock().unwrap().push(CallEntry::CurveSetScale { sprite_id: self.id, x, y, z });
     }
-    fn set_line(&self, point_count: usize) {
-        self.calls.lock().unwrap().push(CallEntry::CurveSetLine { sprite_id: self.id, point_count });
+    fn set_points(&self, points: &[(f32, f32)]) {
+        self.calls.lock().unwrap().push(CallEntry::CurveSetPoints {
+            sprite_id: self.id,
+            points: points.to_vec(),
+        });
     }
     fn set_color(&self, r: u8, g: u8, b: u8, a: u8) {
         self.calls.lock().unwrap().push(CallEntry::CurveSetColor { sprite_id: self.id, r, g, b, a });
@@ -645,7 +649,7 @@ mod tests {
     fn test_headless_curve_calls() {
         let hp = HeadlessPlatform::new();
         let cs = hp.create_curve_sprite();
-        cs.set_line(3);
+        cs.set_points(&[(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]);
         cs.set_width(0.5);
         cs.set_color(100, 200, 50, 255);
         cs.destroy();
@@ -653,7 +657,8 @@ mod tests {
         let calls = hp.calls();
         assert_eq!(calls.len(), 5);
         assert!(matches!(calls[0], CallEntry::CreateCurveSprite { sprite_id: 1 }));
-        assert!(matches!(calls[1], CallEntry::CurveSetLine { sprite_id: 1, point_count: 3 }));
+        assert!(matches!(&calls[1], CallEntry::CurveSetPoints { sprite_id: 1, points }
+            if points == &vec![(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]));
         assert!(matches!(calls[2], CallEntry::CurveSetWidth { sprite_id: 1, width: 0.5 }));
         assert!(matches!(calls[3], CallEntry::CurveSetColor { .. }));
         assert!(matches!(calls[4], CallEntry::CurveDestroy { sprite_id: 1 }));

@@ -174,23 +174,23 @@ pub fn native_classes() -> Vec<Arc<dyn NativeClass>> {
         Arc::new(VideoNative {}),
         Arc::new(Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         }),
         Arc::new(NineSliceSprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, slice_left_top: 0, slice_right_bottom: 0, base_size: 0, color: 0, hsl: 0,
         }),
         Arc::new(CurveSprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             points: 0, color: 0, width: 0.1,
         }),
         Arc::new(EnvironmentNative {}),
@@ -199,9 +199,9 @@ pub fn native_classes() -> Vec<Arc<dyn NativeClass>> {
         Arc::new(VariableFloat { base_value: 0.0, variation_curve: 0 }),
         Arc::new(Node {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
         }),
         Arc::new(Element { nodes: 0, derived_elements: 0, simulator: 0, late_independent_simulator: 0 }),
         Arc::new(Note { automaton: 0 }),
@@ -284,7 +284,7 @@ mod tests {
         fx.vm.param_pool.set_float_param(1, 4.0);
         let id = {
             let mut ctx = fx.ctx();
-            v.do_construct_native(&mut ctx, None, 0)
+            v.do_construct_native(&mut ctx, None, 1)
         };
         {
             let mut ctx = fx.ctx();

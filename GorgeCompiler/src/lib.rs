@@ -65,7 +65,8 @@ pub fn compile_sources(sources: &[SourceFile], show_progress: bool) -> Result<Co
         let key = &class.class_type.name();
         if let Some(fields) = compiler.injector_fields.get(key) {
             class.injector_fields = fields.iter().map(|f| gorge_core::objective::bytecode::InjectorFieldDef {
-                name: f.name.clone(), value_type: f.value_type, has_default: f.has_default,
+                name: f.name.clone(), value_type: f.value_type, is_array: f.is_array,
+                has_default: f.has_default,
                 default_value: f.default_value.clone(),
             }).collect();
         }
@@ -103,7 +104,8 @@ pub fn compile_sources(sources: &[SourceFile], show_progress: bool) -> Result<Co
             sorted.sort_by_key(|(gid, _)| *gid);
             for (gid, contents) in &sorted {
                 // 隐藏方法按本类局部索引（全局 ID - method_start_id）定位放置，
-                // 与 freeze 的方法全局 ID 分配（method_count_total + 隐藏偏移）对齐。
+                // 与 freeze 的方法全局 ID 分配（method_count_total + 1 + 隐藏偏移）
+                // 对齐；+1 保证 ID 永不为 0（Delegate(0) 是未回填占位）。
                 let local = *gid - class.method_start_id;
                 let optimized = crate::optimizer::optimizer::IntermediateCodeOptimizer::optimize(&contents.codes);
                 // 中间缺失的槽位用空方法占位，保证索引连续

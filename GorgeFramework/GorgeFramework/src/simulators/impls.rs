@@ -402,6 +402,37 @@ const ELEMENT_NODES_FIELD: usize = 2;
 const ELEMENT_DERIVED_ELEMENTS_FIELD: usize = 3;
 const NOTE_AUTOMATON_FIELD: usize = 4;
 
+/// 将存活元素同步到 EnvironmentGlobal 快照（供 `FindAliveLane` 查询）。
+///
+/// name 取元素字符串字段 0（DremuLane 的 `name` 字段布局），
+/// lane_id 取整数字段 0（无整数字段时保持 0）。
+fn snapshot_alive_element(vm: &VirtualMachine, element_id: usize, class_full_name: &str) {
+    let name = vm.objects.get(&element_id)
+        .map(|o| {
+            if o.compiled_fields.strings.is_empty() && o.native_field_bounds.string_count == 0 {
+                String::new()
+            } else {
+                o.get_string_field(0)
+            }
+        })
+        .unwrap_or_default();
+    let lane_id = vm.objects.get(&element_id)
+        .map(|o| {
+            if o.compiled_fields.ints.is_empty() && o.native_field_bounds.int_count == 0 {
+                0
+            } else {
+                o.get_int_field(0) as i32
+            }
+        })
+        .unwrap_or(0);
+    crate::runtime::environment::global::register_alive_element(
+        element_id,
+        class_full_name.to_string(),
+        name,
+        lane_id,
+    );
+}
+
 pub struct GenerateElement {
     /// 元素注入器 ID
     pub injector_id: usize,
@@ -434,13 +465,25 @@ impl IGameplayAction for GenerateElement {
         if class_name.is_empty() { return; }
 
         // 1. instantiate_with_injector 创建元素
-        let element_id = vm.instantiate_with_injector(&class_name, self.constructor_id, self.injector_id)
-            .unwrap_or(0);
+        let element_id = match vm.instantiate_with_injector(&class_name, self.constructor_id, self.injector_id) {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!(
+                    "[Gorge] 元素构造失败 {}#{} injector={}: {}",
+                    class_name,
+                    self.constructor_id,
+                    self.injector_id,
+                    error,
+                );
+                return;
+            }
+        };
         if element_id == 0 { return; }
 
         // 2. 登记到存活元素表
         runtime.chart.alive_elements.push(element_id);
         runtime.chart.alive_injector_map.insert(element_id, self.injector_id);
+        snapshot_alive_element(vm, element_id, &class_name);
 
         // 3. 读取 element.simulator / element.late_independent_simulator 字段
         // Element 类字段顺序：simulator(对象0), late_independent_simulator(对象1)
@@ -493,8 +536,14 @@ impl IGameplayAction for GenerateElement {
                 .map(|cls| cls.declaration.methods_with_annotation("ForwardTimedDestroy")
                     .into_iter().map(|(id, ann)| (id, ann.clone())).collect())
                 .unwrap_or_default();
-        for (_method_id, ann) in fwd_destroy {
-            let time = resolve_annotation_time_from_method(&ann, &class_name, Some(element_id), vm);
+        for (method_id, ann) in fwd_destroy {
+            let time = resolve_annotation_time_from_method(
+                &ann,
+                &class_name,
+                Some(element_id),
+                method_id,
+                vm,
+            );
             runtime.chart.forward_timed_destroy_list.push((time, element_id));
         }
 
@@ -503,8 +552,14 @@ impl IGameplayAction for GenerateElement {
                 .map(|cls| cls.declaration.methods_with_annotation("BackwardTimedDestroy")
                     .into_iter().map(|(id, ann)| (id, ann.clone())).collect())
                 .unwrap_or_default();
-        for (_method_id, ann) in bwd_destroy {
-            let time = resolve_annotation_time_from_method(&ann, &class_name, Some(element_id), vm);
+        for (method_id, ann) in bwd_destroy {
+            let time = resolve_annotation_time_from_method(
+                &ann,
+                &class_name,
+                Some(element_id),
+                method_id,
+                vm,
+            );
             runtime.chart.backward_timed_destroy_list.push((time, element_id));
         }
 
@@ -514,12 +569,8 @@ impl IGameplayAction for GenerateElement {
             .map(|o| o.get_object_field(ELEMENT_NODES_FIELD))
             .unwrap_or(0);
         if nodes_array_id != 0 {
-            // 经 ObjectArray payload 读取各节点对象 ID
-            let node_ids = vm.native_payloads
-                .get(&nodes_array_id)
-                .and_then(|p| p.downcast_ref::<gorge_core::system::native::array::ObjectArray>())
-                .map(|a| a.items.clone())
-                .unwrap_or_default();
+            let node_ids = gorge_core::objective::native::NativeContext::new(vm)
+                .object_array_items(nodes_array_id);
             for node_id in node_ids {
                 runtime.graphics.nodes.push(node_id);
             }
@@ -531,11 +582,8 @@ impl IGameplayAction for GenerateElement {
             .map(|o| o.get_object_field(ELEMENT_DERIVED_ELEMENTS_FIELD))
             .unwrap_or(0);
         if derived_array_id != 0 {
-            let derived_ids = vm.native_payloads
-                .get(&derived_array_id)
-                .and_then(|p| p.downcast_ref::<gorge_core::system::native::array::ObjectArray>())
-                .map(|a| a.items.clone())
-                .unwrap_or_default();
+            let derived_ids = gorge_core::objective::native::NativeContext::new(vm)
+                .object_array_items(derived_array_id);
             for derived_id in derived_ids {
                 let derived_dir = if self.is_reverse { SimulateDirection::Backward } else { SimulateDirection::Forward };
                 do_derive_element(runtime, vm, derived_id, derived_dir);
@@ -602,17 +650,15 @@ impl IGameplayAction for DestroyElement {
         // 3. 从统一表中注销
         runtime.chart.alive_elements.retain(|&id| id != self.element_id);
         runtime.chart.alive_injector_map.remove(&self.element_id);
+        crate::runtime::environment::global::unregister_alive_element(self.element_id);
 
         // 4. 注销图形节点（对齐 C#：逐节点 `node.Destroy()` + `Graphics.Nodes.Remove(node)`）
         let nodes_array_id = vm.objects.get(&self.element_id)
             .map(|o| o.get_object_field(ELEMENT_NODES_FIELD))
             .unwrap_or(0);
         if nodes_array_id != 0 {
-            let node_ids = vm.native_payloads
-                .get(&nodes_array_id)
-                .and_then(|p| p.downcast_ref::<gorge_core::system::native::array::ObjectArray>())
-                .map(|a| a.items.clone())
-                .unwrap_or_default();
+            let node_ids = gorge_core::objective::native::NativeContext::new(vm)
+                .object_array_items(nodes_array_id);
             for node_id in node_ids {
                 if node_id == 0 { continue; }
                 let node_class = vm.objects.get(&node_id)
@@ -734,28 +780,81 @@ fn fill_pending_detection_conditions(
     }
 }
 
-/// 从方法注解中解析时间值（S4-1）——Float 直接取 / Delegate 经 invoke_method_by_id 求值
+/// 从方法注解中解析时间值（S4-1）。
+///
+/// 优先级：
+/// 1. 注解显式携带 `time` 参数：Float/Int 直接取；Delegate 经
+///    `invoke_method_by_id` 调用隐藏方法求值。
+/// 2. 注解无 `time` 参数（真实谱面的 `@ForwardTimedDestroy float
+///    ForwardDestroyTime()` 写法）：调用**被注解的方法本身**
+///    （`annotated_method_id`，以元素对象为 this）并读取其 float 返回值。
+/// 失败路径一律输出可见告警，不再静默返回 0。
 fn resolve_annotation_time_from_method(
     ann: &gorge_core::objective::declaration::MethodAnnotation,
     class_name: &str,
     obj_id: Option<usize>,
+    annotated_method_id: usize,
     vm: &mut VirtualMachine,
 ) -> f32 {
     use gorge_core::objective::declaration::AnnotationValue;
-    if let Some(time_val) = ann.find_parameter("time") {
-        match time_val {
-            AnnotationValue::Float(f) => return *f as f32,
-            AnnotationValue::Delegate(method_id) => {
-                if vm.invoke_method_by_id(class_name, None, *method_id).is_ok() {
-                    return vm.return_float.unwrap_or(0.0) as f32;
+    match ann.find_parameter("time") {
+        Some(AnnotationValue::Float(f)) => *f as f32,
+        Some(AnnotationValue::Delegate(method_id)) => {
+            match vm.invoke_method_by_id(class_name, None, *method_id) {
+                Ok(()) => match vm.return_float {
+                    Some(v) => v as f32,
+                    None => {
+                        // 隐藏方法调用成功但未返回 Float——显式报错，
+                        // 不再静默当作 0。
+                        eprintln!(
+                            "[Gorge] 生成时间委托未返回 Float {}#{}（return_float 为空）",
+                            class_name,
+                            method_id,
+                        );
+                        0.0
+                    }
+                },
+                Err(error) => {
+                    eprintln!(
+                        "[Gorge] 生成时间委托调用失败 {}#{}: {}",
+                        class_name,
+                        method_id,
+                        error,
+                    );
+                    0.0
                 }
             }
-            AnnotationValue::Int(i) => return *i as f32,
-            _ => {}
+        }
+        Some(AnnotationValue::Int(i)) => *i as f32,
+        _ => {
+            // 无 time 参数：调用被注解方法自身（如 @ForwardTimedDestroy
+            // float ForwardDestroyTime()），以元素对象为 this。
+            match vm.invoke_method_by_id(class_name, obj_id, annotated_method_id) {
+                Ok(()) => match vm.return_float {
+                    Some(v) => v as f32,
+                    None => {
+                        eprintln!(
+                            "[Gorge] 注解方法 `{}#{}`（{}）未返回 Float，时间按 0 处理",
+                            class_name,
+                            annotated_method_id,
+                            ann.name,
+                        );
+                        0.0
+                    }
+                },
+                Err(error) => {
+                    eprintln!(
+                        "[Gorge] 注解方法调用失败 {}#{}（{}）: {}",
+                        class_name,
+                        annotated_method_id,
+                        ann.name,
+                        error,
+                    );
+                    0.0
+                }
+            }
         }
     }
-    let _ = obj_id;
-    0.0
 }
 
 /// 执行派生元素的 @DeriveGenerate 方法 + 登记流程（S4-2）
@@ -781,6 +880,10 @@ fn do_derive_element(
 
     // 登记到存活元素表
     runtime.chart.alive_elements.push(element_id);
+    let snapshot_class = vm.class_table.get(&class_name)
+        .map(|cls| cls.declaration.class_type.full_name())
+        .unwrap_or_else(|| class_name.clone());
+    snapshot_alive_element(vm, element_id, &snapshot_class);
     // 注册模拟器（P1-4：注册键记录到 element_simulator_keys，供 DestroyElement 精确注销）
     let simulator_id = vm.objects.get(&element_id)
         .map(|o| o.get_object_field(ELEMENT_SIMULATOR_FIELD))
@@ -824,11 +927,8 @@ fn do_derive_element(
         .map(|o| o.get_object_field(ELEMENT_NODES_FIELD))
         .unwrap_or(0);
     if nodes_array_id != 0 {
-        let node_ids = vm.native_payloads
-            .get(&nodes_array_id)
-            .and_then(|payload| payload.downcast_ref::<gorge_core::system::native::array::ObjectArray>())
-            .map(|nodes| nodes.items.clone())
-            .unwrap_or_default();
+        let node_ids = gorge_core::objective::native::NativeContext::new(vm)
+            .object_array_items(nodes_array_id);
         runtime.graphics.nodes.extend(node_ids.into_iter().filter(|node_id| *node_id != 0));
     }
 }
@@ -1206,11 +1306,31 @@ fn element_simulate(
     for transformer_id in transformers {
         if transformer_id == 0 { continue; }
         let mut tctx = gorge_core::objective::native::NativeContext::new(vm);
-        // 调用 transform 方法 (method 0) 并用 float 参数
         let cls_name = tctx.vm.objects.get(&transformer_id)
             .map(|o| o.class_name.clone()).unwrap_or_default();
+        if cls_name.is_empty() { continue; }
+        // 清空参数池，避免上一轮调用残留参数被 ParamMode::Batch 一并布置
+        tctx.vm.param_pool.reset();
+        // 调用 transform 方法：native 类走 native ABI 0 号方法；
+        // 编译类（如 DremuMainLaneLineTransformer）走 VM 编译方法分派，
+        // 参数经 ParamMode::Batch 布置到局部栈（Transform(float now)）。
         tctx.set_float_param(0, chart_time as f64);
-        tctx.invoke_native_method_on(&cls_name, transformer_id, 0);
+        if tctx.vm.native_class_table.contains_key(&cls_name) {
+            tctx.invoke_native_method_on(&cls_name, transformer_id, 0);
+        } else if let Some(global_id) = find_compiled_method_by_name(tctx.vm, &cls_name, "Transform") {
+            if let Err(error) = tctx.vm.invoke_instance_method_by_global_id_batch(
+                &cls_name,
+                transformer_id,
+                global_id,
+            ) {
+                eprintln!(
+                    "[Gorge] 变换器 Transform 调用失败 {}#{} transformer_id={}: {}",
+                    cls_name, global_id, transformer_id, error,
+                );
+            }
+        } else {
+            eprintln!("[Gorge] 变换器 {} 未找到 Transform 方法", cls_name);
+        }
         let result_arr_id = tctx.get_object_return();
         if result_arr_id != 0 {
             let conv = convert_actions_from_commands(&mut tctx, result_arr_id, direction);
@@ -1218,6 +1338,24 @@ fn element_simulate(
         }
     }
     all_actions
+}
+
+/// 按方法名查找编译类实例方法，返回全局方法 ID。
+///
+/// `RuntimeClass.method_impls` 的键是类内局部索引（与 `method_start_id`
+/// 的偏移一致），`CompiledMethod.name` 保存方法名。用于框架侧按名字调用
+/// 编译类接口实现（如 `ITransformer.Transform`），避免依赖接口映射键的
+/// 全名/短名差异。
+fn find_compiled_method_by_name(
+    vm: &VirtualMachine,
+    class_name: &str,
+    method_name: &str,
+) -> Option<usize> {
+    let cls = vm.class_table.get(class_name)?;
+    let start = cls.declaration.method_start_id;
+    cls.method_impls.iter()
+        .find(|(_, method)| method.name == method_name)
+        .map(|(local_idx, _)| start + *local_idx)
 }
 
 /// 将自动机指令 ObjectArray 转换为 IGameplayAction（内联版本，避免循环依赖）
@@ -1259,7 +1397,8 @@ mod s4_integration_tests {
     use gorge_core::system::native::array::ObjectArray;
     use gorge_core::system::native::injector::RuntimeInjector;
     use gorge_core::virtual_machine::ir::{
-        CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand,
+        Address, CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator, Operand,
+        ValueType,
     };
     use gorge_core::virtual_machine::vm::VirtualMachine;
     use std::collections::HashMap;
@@ -1445,6 +1584,10 @@ mod s4_integration_tests {
         vm.next_object_id = 1;
 
         let mut decl = make_test_element_decl();
+        decl.injector_field_type_count = TypeCount {
+            float_count: 1,
+            ..TypeCount::zero()
+        };
         decl.constructor_annotations.clear();
         decl.constructor_annotations.insert(0, vec![
             MethodAnnotation {
@@ -1456,26 +1599,49 @@ mod s4_integration_tests {
         let class_name = decl.class_type.full_name();
         let mut runtime_class = RuntimeClass::new(decl, None);
         runtime_class.register_constructor(0, make_empty_ctor_method());
-        // 注册隐藏方法（全局ID=0），返回 float 通过 vm.return_float
-        let return_code = IntermediateCode {
-            result: None,
-            operator: IntermediateOperator::ReturnFloat,
-            left: Operand::float(3.0),
-            right: None,
-        };
+        // 注册隐藏方法（全局 ID=0），从当前元素注入器读取生成时间。
         let hidden_method = CompiledMethod {
             name: "__annotation_ForwardTimedGenerate_time".into(),
-            codes: vec![CodeWithSpan::new(return_code, Span::dummy())],
-            local_count: 0,
+            codes: vec![
+                CodeWithSpan::new(
+                    IntermediateCode::new(
+                        IntermediateOperator::LoadObjectParameter,
+                        Operand::int(0),
+                        None,
+                        Some(Address::new(ValueType::Object, 0)),
+                    ),
+                    Span::dummy(),
+                ),
+                CodeWithSpan::new(
+                    IntermediateCode::new(
+                        IntermediateOperator::LoadFloatInjectorField(0),
+                        Operand::Address(Address::new(ValueType::Object, 0)),
+                        None,
+                        Some(Address::new(ValueType::Float, 0)),
+                    ),
+                    Span::dummy(),
+                ),
+                CodeWithSpan::new(
+                    IntermediateCode::new(
+                        IntermediateOperator::ReturnFloat,
+                        Operand::Address(Address::new(ValueType::Float, 0)),
+                        None,
+                        None,
+                    ),
+                    Span::dummy(),
+                ),
+            ],
+            local_count: 1,
         };
         runtime_class.register_method(0, hidden_method);
         // P0-5：注册父类链（GorgeFramework.Element）
         vm.register_class_super(&class_name, "GorgeFramework.Element");
         vm.class_table.insert(class_name.clone(), Arc::new(runtime_class));
 
-        let injector = RuntimeInjector::new(Arc::new(
+        let mut injector = RuntimeInjector::new(Arc::new(
             vm.class_table.get(&class_name).unwrap().declaration.clone(),
         ));
+        injector.set_injector_float(0, 3.0);
         let injector_id = vm.next_object_id;
         vm.next_object_id += 1;
         vm.injectors.insert(injector_id, injector);
@@ -1485,9 +1651,63 @@ mod s4_integration_tests {
         runtime.chart.add_score_element(injector_id, &default_config, &mut vm);
 
         assert_eq!(runtime.chart.forward_timed_generate_list.len(), 1);
-        // Delegate 方法体返回 float 3.0
+        // Delegate 方法体必须从 gameplay 注入器读取 float 3.0。
         assert!((runtime.chart.forward_timed_generate_list[0].0 - 3.0).abs() < 0.01,
             "Delegate 方法返回 3.0，time 应为 3.0");
+    }
+
+    /// 无 time 参数的方法注解（真实谱面 `@ForwardTimedDestroy float
+    /// ForwardDestroyTime()` 写法）：调用被注解方法自身并以元素对象为
+    /// this，读取其 float 返回值作为销毁时间。
+    #[test]
+    fn test_resolve_annotation_time_invokes_annotated_method_when_no_time_param() {
+        let mut decl = make_test_element_decl();
+        decl.method_annotations = HashMap::from([(
+            0,
+            vec![MethodAnnotation {
+                name: "ForwardTimedDestroy".into(),
+                parameters: vec![],
+            }],
+        )]);
+        let mut cls = RuntimeClass::new(decl, None);
+        cls.register_method(0, CompiledMethod {
+            name: "ForwardDestroyTime".into(),
+            codes: vec![CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::ReturnFloat,
+                    Operand::float(4.5),
+                    None,
+                    None,
+                ),
+                Span::dummy(),
+            )],
+            local_count: 0,
+        });
+        let mut vm = VirtualMachine::new();
+        let class_name = "S4TestElement".to_string();
+        vm.class_table.insert(class_name.clone(), Arc::new(cls));
+        let element_id = vm.next_object_id;
+        vm.next_object_id += 1;
+        vm.objects.insert(
+            element_id,
+            RuntimeObject::new_simple(class_name.clone(), &TypeCount::zero()),
+        );
+
+        let ann = MethodAnnotation {
+            name: "ForwardTimedDestroy".into(),
+            parameters: vec![],
+        };
+        let time = resolve_annotation_time_from_method(
+            &ann,
+            &class_name,
+            Some(element_id),
+            0,
+            &mut vm,
+        );
+        assert!(
+            (time - 4.5).abs() < 0.01,
+            "无 time 参数时应调用被注解方法自身，时间应为 4.5，实际 {time}",
+        );
     }
 
     #[test]
@@ -1511,6 +1731,7 @@ mod s4_integration_tests {
         let element_id = 1;
         let nodes_array_id = 2;
         let node_id = 3;
+        let native_array_id = 4;
 
         let mut element = RuntimeObject::new_simple(
             class_name,
@@ -1518,8 +1739,14 @@ mod s4_integration_tests {
         );
         element.set_object_field(ELEMENT_NODES_FIELD, nodes_array_id);
         vm.objects.insert(element_id, element);
+        let mut nodes_wrapper = RuntimeObject::new_simple(
+            "ObjectArray".into(),
+            &TypeCount { int_count: 1, ..TypeCount::zero() },
+        );
+        nodes_wrapper.native_object_id = Some(native_array_id);
+        vm.objects.insert(nodes_array_id, nodes_wrapper);
         vm.native_payloads.insert(
-            nodes_array_id,
+            native_array_id,
             Box::new(ObjectArray { items: vec![node_id] }),
         );
 
@@ -1579,15 +1806,15 @@ mod s4_integration_tests {
         // 注册 Node native 类（destroy 分派目标）
         let node_native = Node {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
         };
         vm.register_native_class("GorgeFramework.Node", Arc::new(Node {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
         }));
 
         // Note 子类（类名含 "Note" 即通过 is_subclass_of_note 判定）

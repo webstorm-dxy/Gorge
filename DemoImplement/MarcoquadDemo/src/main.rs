@@ -35,6 +35,7 @@ async fn main() {
     }
 
     let mut last_time = get_time() as f32;
+    let mut screenshot_taken = false;
 
     loop {
         let current_time = get_time() as f32;
@@ -45,6 +46,14 @@ async fn main() {
 
         loader.drive(delta);
         render_all();
+
+        // 验收辅助：仿真约 5 秒时保存一帧画面，供人工确认判定线可见
+        if !screenshot_taken && loader.simulation_time() >= 5.0 {
+            screenshot_taken = true;
+            let image = get_screen_data();
+            image.export_png("test_output/screenshot.png");
+            eprintln!("[Gorge] 已保存验收截图 test_output/screenshot.png");
+        }
 
         draw_text(
             &format!("FPS: {}", get_fps()),

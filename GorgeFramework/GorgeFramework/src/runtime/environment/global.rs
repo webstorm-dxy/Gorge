@@ -147,6 +147,44 @@ pub fn reset_env_global() {
     }
 }
 
+/// 登记存活元素快照（元素创生时调用）。
+///
+/// `FindAliveLane` 依赖本表按（类全名, name 字段）查找判定线；
+/// 同一元素重复登记时先移除旧记录（元素重建场景）。
+pub fn register_alive_element(
+    element_id: usize,
+    class_name: String,
+    name: String,
+    lane_id: i32,
+) {
+    let Some(lock) = ENV_GLOBAL.get() else {
+        // 环境全局未初始化（纯单元测试场景）：跳过快照，避免拖垮测试。
+        return;
+    };
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    {
+        let env = &mut *guard;
+        env.alive_elements.retain(|info| info.element_id != element_id);
+        env.alive_elements.push(
+            AliveElementInfo::new(element_id, class_name)
+                .with_name(name)
+                .with_lane_id(lane_id),
+        );
+    }
+}
+
+/// 注销存活元素快照（元素销毁时调用），避免销毁后的判定线仍可被查到。
+pub fn unregister_alive_element(element_id: usize) {
+    let Some(lock) = ENV_GLOBAL.get() else {
+        return;
+    };
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    {
+        let env = &mut *guard;
+        env.alive_elements.retain(|info| info.element_id != element_id);
+    }
+}
+
 // ==================== 同步辅助方法 ====================
 
 /// 将 AssetManager 的资产表同步到全局（由 RuntimeManager 在 prepare_score 后调用）

@@ -298,7 +298,9 @@ impl VirtualMachine {
             let mut j = 0;
             while j < bound && self.param_pool.object_params.borrow()[j].is_set {
                 let v = self.param_pool.get_object_param(j);
-                self.object_stack.write(j, v);
+                // 局部 object 槽 0 固定保留给 this（codegen 的
+                // next_local 对 Object 从 1 起分配），参数从 1 开始布置
+                self.object_stack.write(j + 1, v);
                 j += 1;
             }
         }
@@ -361,12 +363,18 @@ impl VirtualMachine {
         ctor_id: usize,
     ) -> usize {
         if let Some(cls) = self.native_class_table.get(class_name).cloned() {
+            // 编译产物使用继承空间中的全局构造 ID，native 分派表按本类从 0 编号。
+            let native_ctor_id = self.class_table.get(class_name)
+                .and_then(|runtime_class| {
+                    ctor_id.checked_sub(runtime_class.declaration.constructor_start_id)
+                })
+                .unwrap_or(ctor_id);
             let is_new = target.is_none();
             let current_inj = self.current_injector.unwrap_or(0);
             let class_name_owned = class_name.to_string();
             let obj_id = {
                 let mut ctx = crate::objective::native::NativeContext::with_injector(self, current_inj);
-                cls.do_construct_native(&mut ctx, target, ctor_id)
+                cls.do_construct_native(&mut ctx, target, native_ctor_id)
             };
             // ctx 已销毁，self 可再次借用
             if is_new {
@@ -456,6 +464,17 @@ impl VirtualMachine {
         }
     }
 
+    /// 将 Gorge 元素类型映射为运行时 native 数组类。
+    fn native_array_class_name(element_type: &str) -> &'static str {
+        match element_type.rsplit('.').next().unwrap_or(element_type).to_ascii_lowercase().as_str() {
+            "int" | "enum" => "IntArray",
+            "float" => "FloatArray",
+            "bool" => "BoolArray",
+            "string" => "StringArray",
+            _ => "ObjectArray",
+        }
+    }
+
     /// 按对象 ID 调用委托（1c）
     ///
     /// 查询 runtime_delegates 表，取得委托的方法实现，通过 call_compiled_method
@@ -509,6 +528,34 @@ impl VirtualMachine {
             ValueType::Int,
             Some(class_name),
             target_obj_id,
+            false,
+        )
+    }
+
+    /// 按方法全局 ID 调用编译方法，并把参数池按类型分组批量布置到局部栈。
+    ///
+    /// 与 `invoke_method_by_id`（`ParamMode::None`）不同：普通编译方法
+    /// 的参数在 codegen 中注册为局部变量（`register_parameters`），调用方
+    /// 须用 `ParamMode::Batch` 把 `param_pool` 复制到局部槽。框架侧调用
+    /// 编译类接口实现（如 `ITransformer.Transform(float now)`）必须走此入口。
+    pub fn invoke_instance_method_by_global_id_batch(
+        &mut self,
+        class_name: &str,
+        target_obj_id: usize,
+        method_global_id: usize,
+    ) -> VmResult<()> {
+        let method = self.class_table
+            .get(class_name)
+            .ok_or_else(|| format!("类 `{}` 未注册", class_name))?
+            .find_method(method_global_id)
+            .ok_or_else(|| format!("类 `{}` 中未找到方法全局 ID {}", class_name, method_global_id))?;
+        self.call_compiled_method(
+            &method,
+            &ParamMode::Batch,
+            None,
+            ValueType::Int,
+            Some(class_name),
+            Some(target_obj_id),
             false,
         )
     }
@@ -567,16 +614,22 @@ impl VirtualMachine {
             .get(class_name)
             .ok_or_else(|| format!("类 `{}` 未注册", class_name))?
             .clone();
-        let total_fields = cls.declaration.field_type_count.clone();
-        let mut total_with_inheritance = total_fields.clone();
-        if let Some(ref super_cls) = cls.super_class {
-            let sc = &super_cls.declaration.field_type_count;
-            total_with_inheritance.int_count += sc.int_count;
-            total_with_inheritance.float_count += sc.float_count;
-            total_with_inheritance.bool_count += sc.bool_count;
-            total_with_inheritance.string_count += sc.string_count;
-            total_with_inheritance.object_count += sc.object_count;
-        }
+        let total_with_inheritance = self.class_field_counts.get(class_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut total = TypeCount::zero();
+                let mut current = Some(cls.clone());
+                while let Some(runtime_class) = current {
+                    let own = &runtime_class.declaration.field_type_count;
+                    total.int_count += own.int_count;
+                    total.float_count += own.float_count;
+                    total.bool_count += own.bool_count;
+                    total.string_count += own.string_count;
+                    total.object_count += own.object_count;
+                    current = runtime_class.super_class.clone();
+                }
+                total
+            });
         let obj = RuntimeObject::new_simple(class_name.to_string(), &total_with_inheritance);
         let obj_id = self.next_object_id;
         self.next_object_id += 1;
@@ -586,20 +639,19 @@ impl VirtualMachine {
         self.current_injector = Some(injector_obj_id);
 
         // 执行字段初始化器
-        if let Some(initials) = self.class_field_initializers.get(class_name).cloned() {
-            for init in &initials {
-                let method = CompiledMethod {
-                    name: "field_init".into(),
-                    codes: init.codes.clone(),
-                    local_count: init.local_count,
-                };
-                self.call_compiled_method(&method, &ParamMode::None, None, ValueType::Int, Some(class_name), Some(obj_id), false)?;
-            }
+        if let Err(error) = self.run_field_initializers(class_name, obj_id) {
+            self.current_injector = saved_injector;
+            return Err(error);
         }
 
-        let ctor = cls.find_constructor(ctor_global_id)
-            .ok_or_else(|| format!("类 `{}` 中未找到构造方法全局 ID {}", class_name, ctor_global_id))?;
-        self.call_compiled_method(
+        let ctor = match cls.find_constructor(ctor_global_id) {
+            Some(ctor) => ctor,
+            None => {
+                self.current_injector = saved_injector;
+                return Err(format!("类 `{}` 中未找到构造方法全局 ID {}", class_name, ctor_global_id));
+            }
+        };
+        let construct_result = self.call_compiled_method(
             &ctor,
             &ParamMode::Batch,
             None,
@@ -607,11 +659,56 @@ impl VirtualMachine {
             Some(class_name),
             Some(obj_id),
             false,
-        )?;
+        );
 
         self.current_injector = saved_injector;
+        construct_result?;
 
         Ok(obj_id)
+    }
+
+    /// 收集类的继承链（本类在前，根类在后，含 native 父类名）。
+    fn inheritance_chain(&self, class_name: &str) -> Vec<String> {
+        let mut chain = vec![class_name.to_string()];
+        let mut current = self.class_super_name.get(class_name).cloned();
+        while let Some(name) = current {
+            chain.push(name.clone());
+            current = self.class_super_name.get(&name).cloned();
+        }
+        chain
+    }
+
+    /// 沿继承链（根类在前）执行各类的字段初始化器。
+    ///
+    /// 字段初始化器按类分别注册（如 DremuLane 的 `name = ^name` 注册在
+    /// DremuLane 名下），实例化 DremuMainLane 时也必须执行父类初始化器，
+    /// 否则父类注入器字段（name/generateTime 等）不会落到对象上。
+    fn run_field_initializers(&mut self, class_name: &str, obj_id: usize) -> VmResult<()> {
+        let chain = self.inheritance_chain(class_name);
+        for owner in chain.iter().rev() {
+            if let Some(initials) = self.class_field_initializers.get(owner).cloned() {
+                for init in &initials {
+                    let field_initializer_injector = self.current_injector;
+                    let method = CompiledMethod {
+                        name: "field_init".into(),
+                        codes: init.codes.clone(),
+                        local_count: init.local_count,
+                    };
+                    let initialize_result = self.call_compiled_method(
+                        &method,
+                        &ParamMode::None,
+                        None,
+                        ValueType::Int,
+                        Some(owner),
+                        Some(obj_id),
+                        false,
+                    );
+                    self.current_injector = field_initializer_injector;
+                    initialize_result?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 带构造参数注入实例化（A-3）
@@ -926,7 +1023,8 @@ impl VirtualMachine {
                         }
                         ValueType::Object => {
                             let val = self.param_pool.get_object_param(i);
-                            self.object_stack.write(i, val);
+                            // 局部 object 槽 0 固定保留给 this，参数从 1 开始
+                            self.object_stack.write(i + 1, val);
                         }
                     }
                 }
@@ -937,7 +1035,8 @@ impl VirtualMachine {
                     self.float_stack.write(i, self.param_pool.get_float_param(i));
                     self.bool_stack.write(i, self.param_pool.get_bool_param(i));
                     self.string_stack.write(i, self.param_pool.get_string_param(i));
-                    self.object_stack.write(i, self.param_pool.get_object_param(i));
+                    // 局部 object 槽 0 固定保留给 this，参数从 1 开始
+                    self.object_stack.write(i + 1, self.param_pool.get_object_param(i));
                 }
             }
         }
@@ -959,7 +1058,9 @@ impl VirtualMachine {
         let count = method.codes.len();
         while self.pc < count {
             let cs = &method.codes[self.pc];
-            let advance = self.execute_one(&cs.code)?;
+            let advance = self.execute_one(&cs.code).map_err(|error| {
+                format!("{}（方法 `{}`）", error, method.name)
+            })?;
             if !advance {
                 if self.pc >= count { break; }
                 continue;
@@ -1057,6 +1158,34 @@ impl VirtualMachine {
         self.bool_stack.pop_frame();
         self.string_stack.pop_frame();
         self.object_stack.pop_frame();
+    }
+
+    /// 校验对象字段索引是否在（native 边界 + 编译字段）范围内。
+    ///
+    /// 越界时返回带对象类名与当前执行类的明确错误，避免 value_pool
+    /// 裸索引 panic（对象字段布局与 IR 字段索引不一致时便于定位）。
+    fn check_field_bounds(
+        &self,
+        obj: &crate::objective::object::RuntimeObject,
+        obj_id: usize,
+        field_idx: usize,
+        native_count: usize,
+        compiled_len: usize,
+        type_name: &str,
+    ) -> VmResult<()> {
+        let total = native_count + compiled_len;
+        if field_idx >= total {
+            return Err(format!(
+                "对象 `{}`（ID {}）的 {} 字段索引 {} 越界（共 {} 个），当前执行类 `{}`",
+                obj.class_name,
+                obj_id,
+                type_name,
+                field_idx,
+                total,
+                self.current_class,
+            ));
+        }
+        Ok(())
     }
 
     /// 执行单条 IR 指令
@@ -1166,7 +1295,8 @@ impl VirtualMachine {
             }
             IntermediateOperator::SetInjector => {
                 // 从 left 操作数读取对象 ID 并设为当前注入器
-                self.current_injector = Some(self.read_object_operand(&code.left));
+                let value = self.read_object_operand(&code.left);
+                self.current_injector = Some(value);
             }
 
             // === 算术运算 ===
@@ -1568,46 +1698,96 @@ impl VirtualMachine {
             // 对齐 C# LoadField: left = 对象引用, field_idx 在 variant 内, result = 输出地址
             IntermediateOperator::LoadIntField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
-                let val = self.objects
-                    .get(&obj_id)
-                    .map(|obj| obj.get_int_field(*field_idx))
-                    .unwrap_or(0);
+                let val = match self.objects.get(&obj_id) {
+                    Some(obj) => {
+                        self.check_field_bounds(
+                            obj,
+                            obj_id,
+                            *field_idx,
+                            obj.native_field_bounds.int_count,
+                            obj.compiled_fields.ints.len(),
+                            "int",
+                        )?;
+                        obj.get_int_field(*field_idx)
+                    }
+                    None => 0,
+                };
                 let addr = self.get_int_addr(code.result);
                 self.int_stack.write(addr, val);
             }
             IntermediateOperator::LoadFloatField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
-                let val = self.objects
-                    .get(&obj_id)
-                    .map(|obj| obj.get_float_field(*field_idx))
-                    .unwrap_or(0.0);
+                let val = match self.objects.get(&obj_id) {
+                    Some(obj) => {
+                        self.check_field_bounds(
+                            obj,
+                            obj_id,
+                            *field_idx,
+                            obj.native_field_bounds.float_count,
+                            obj.compiled_fields.floats.len(),
+                            "float",
+                        )?;
+                        obj.get_float_field(*field_idx)
+                    }
+                    None => 0.0,
+                };
                 let addr = self.get_float_addr(code.result);
                 self.float_stack.write(addr, val);
             }
             IntermediateOperator::LoadBoolField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
-                let val = self.objects
-                    .get(&obj_id)
-                    .map(|obj| obj.get_bool_field(*field_idx))
-                    .unwrap_or(false);
+                let val = match self.objects.get(&obj_id) {
+                    Some(obj) => {
+                        self.check_field_bounds(
+                            obj,
+                            obj_id,
+                            *field_idx,
+                            obj.native_field_bounds.bool_count,
+                            obj.compiled_fields.bools.len(),
+                            "bool",
+                        )?;
+                        obj.get_bool_field(*field_idx)
+                    }
+                    None => false,
+                };
                 let addr = self.get_bool_addr(code.result);
                 self.bool_stack.write(addr, val);
             }
             IntermediateOperator::LoadStringField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
-                let val = self.objects
-                    .get(&obj_id)
-                    .map(|obj| obj.get_string_field(*field_idx))
-                    .unwrap_or_default();
+                let val = match self.objects.get(&obj_id) {
+                    Some(obj) => {
+                        self.check_field_bounds(
+                            obj,
+                            obj_id,
+                            *field_idx,
+                            obj.native_field_bounds.string_count,
+                            obj.compiled_fields.strings.len(),
+                            "string",
+                        )?;
+                        obj.get_string_field(*field_idx)
+                    }
+                    None => String::new(),
+                };
                 let addr = self.get_string_addr(code.result);
                 self.string_stack.write(addr, val);
             }
             IntermediateOperator::LoadObjectField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
-                let val = self.objects
-                    .get(&obj_id)
-                    .map(|obj| obj.get_object_field(*field_idx))
-                    .unwrap_or(0);
+                let val = match self.objects.get(&obj_id) {
+                    Some(obj) => {
+                        self.check_field_bounds(
+                            obj,
+                            obj_id,
+                            *field_idx,
+                            obj.native_field_bounds.object_count,
+                            obj.compiled_fields.objects.len(),
+                            "object",
+                        )?;
+                        obj.get_object_field(*field_idx)
+                    }
+                    None => 0,
+                };
                 let addr = self.get_object_addr(code.result);
                 self.object_stack.write(addr, val);
             }
@@ -1617,6 +1797,18 @@ impl VirtualMachine {
             IntermediateOperator::SetIntField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
                 let val = self.read_int_operand(code.right.as_ref().unwrap());
+                if let Some(obj) = self.objects.get(&obj_id) {
+                    let (native_count, compiled_len) =
+                        (obj.native_field_bounds.int_count, obj.compiled_fields.ints.len());
+                    self.check_field_bounds(
+                        obj,
+                        obj_id,
+                        *field_idx,
+                        native_count,
+                        compiled_len,
+                        "int",
+                    )?;
+                }
                 if let Some(obj) = self.objects.get_mut(&obj_id) {
                     obj.set_int_field(*field_idx, val);
                 }
@@ -1624,6 +1816,18 @@ impl VirtualMachine {
             IntermediateOperator::SetFloatField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
                 let val = self.read_float_operand(code.right.as_ref().unwrap());
+                if let Some(obj) = self.objects.get(&obj_id) {
+                    let (native_count, compiled_len) =
+                        (obj.native_field_bounds.float_count, obj.compiled_fields.floats.len());
+                    self.check_field_bounds(
+                        obj,
+                        obj_id,
+                        *field_idx,
+                        native_count,
+                        compiled_len,
+                        "float",
+                    )?;
+                }
                 if let Some(obj) = self.objects.get_mut(&obj_id) {
                     obj.set_float_field(*field_idx, val);
                 }
@@ -1631,6 +1835,18 @@ impl VirtualMachine {
             IntermediateOperator::SetBoolField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
                 let val = self.read_bool_operand(code.right.as_ref().unwrap());
+                if let Some(obj) = self.objects.get(&obj_id) {
+                    let (native_count, compiled_len) =
+                        (obj.native_field_bounds.bool_count, obj.compiled_fields.bools.len());
+                    self.check_field_bounds(
+                        obj,
+                        obj_id,
+                        *field_idx,
+                        native_count,
+                        compiled_len,
+                        "bool",
+                    )?;
+                }
                 if let Some(obj) = self.objects.get_mut(&obj_id) {
                     obj.set_bool_field(*field_idx, val);
                 }
@@ -1638,6 +1854,18 @@ impl VirtualMachine {
             IntermediateOperator::SetStringField(field_idx) => {
                 let obj_id = self.read_object_operand(&code.left);
                 let val = self.read_string_operand(code.right.as_ref().unwrap());
+                if let Some(obj) = self.objects.get(&obj_id) {
+                    let (native_count, compiled_len) =
+                        (obj.native_field_bounds.string_count, obj.compiled_fields.strings.len());
+                    self.check_field_bounds(
+                        obj,
+                        obj_id,
+                        *field_idx,
+                        native_count,
+                        compiled_len,
+                        "string",
+                    )?;
+                }
                 if let Some(obj) = self.objects.get_mut(&obj_id) {
                     obj.set_string_field(*field_idx, val);
                 }
@@ -1646,6 +1874,18 @@ impl VirtualMachine {
                 let obj_id = self.read_object_operand(&code.left);
                 let val = self.read_object_operand(code.right.as_ref().unwrap());
                 if let Some(obj) = self.objects.get_mut(&obj_id) {
+                    let total_object_fields = obj.native_field_bounds.object_count
+                        + obj.compiled_fields.objects.len();
+                    if *field_idx >= total_object_fields {
+                        return Err(format!(
+                            "对象 `{}`（ID {}）的 object 字段索引 {} 越界（共 {} 个），当前执行类 `{}`",
+                            obj.class_name,
+                            obj_id,
+                            field_idx,
+                            total_object_fields,
+                            self.current_class,
+                        ));
+                    }
                     obj.set_object_field(*field_idx, val);
                 }
             }
@@ -1728,8 +1968,10 @@ impl VirtualMachine {
                 let inj_id = self.read_object_operand(&code.left);
                 let val = if let Some(inj) = self.injectors.get(&inj_id) {
                     if inj.get_injector_int_default_value(*field_idx) {
-                        // 默认值：从类级默认值池查找
-                        self.lookup_injector_default_int(inj_id, *field_idx).unwrap_or(0)
+                        // 默认值：优先类级默认值池（旧路径），
+                        // 其次注入器槽内已物化的默认值
+                        self.lookup_injector_default_int(inj_id, *field_idx)
+                            .unwrap_or_else(|| inj.get_injector_int(*field_idx))
                     } else {
                         inj.get_injector_int(*field_idx)
                     }
@@ -1739,37 +1981,35 @@ impl VirtualMachine {
             }
             IntermediateOperator::LoadFloatInjectorField(field_idx) => {
                 let inj_id = self.read_object_operand(&code.left);
-                let val = if let Some(inj) = self.injectors.get(&inj_id) {
-                    if inj.get_injector_float_default_value(*field_idx) { 0.0 }
-                    else { inj.get_injector_float(*field_idx) }
-                } else { 0.0 };
+                // 默认值已在物化阶段写入槽位（apply_injector_defaults），
+                // 直接读存储值；标记仅用于编辑期相等语义。
+                let val = self.injectors.get(&inj_id)
+                    .map(|inj| inj.get_injector_float(*field_idx))
+                    .unwrap_or(0.0);
                 let addr = self.get_float_addr(code.result);
                 self.float_stack.write(addr, val);
             }
             IntermediateOperator::LoadBoolInjectorField(field_idx) => {
                 let inj_id = self.read_object_operand(&code.left);
-                let val = if let Some(inj) = self.injectors.get(&inj_id) {
-                    if inj.get_injector_bool_default_value(*field_idx) { false }
-                    else { inj.get_injector_bool(*field_idx) }
-                } else { false };
+                let val = self.injectors.get(&inj_id)
+                    .map(|inj| inj.get_injector_bool(*field_idx))
+                    .unwrap_or(false);
                 let addr = self.get_bool_addr(code.result);
                 self.bool_stack.write(addr, val);
             }
             IntermediateOperator::LoadStringInjectorField(field_idx) => {
                 let inj_id = self.read_object_operand(&code.left);
-                let val = if let Some(inj) = self.injectors.get(&inj_id) {
-                    if inj.get_injector_string_default_value(*field_idx) { String::new() }
-                    else { inj.get_injector_string(*field_idx) }
-                } else { String::new() };
+                let val = self.injectors.get(&inj_id)
+                    .map(|inj| inj.get_injector_string(*field_idx))
+                    .unwrap_or_default();
                 let addr = self.get_string_addr(code.result);
                 self.string_stack.write(addr, val);
             }
             IntermediateOperator::LoadObjectInjectorField(field_idx) => {
                 let inj_id = self.read_object_operand(&code.left);
-                let val = if let Some(inj) = self.injectors.get(&inj_id) {
-                    if inj.get_injector_object_default_value(*field_idx) { 0 }
-                    else { inj.get_injector_object(*field_idx) }
-                } else { 0 };
+                let val = self.injectors.get(&inj_id)
+                    .map(|inj| inj.get_injector_object(*field_idx))
+                    .unwrap_or(0);
                 let addr = self.get_object_addr(code.result);
                 self.object_stack.write(addr, val);
             }
@@ -1814,7 +2054,12 @@ impl VirtualMachine {
             IntermediateOperator::InvokeInstance(method_id) => {
                 let target_obj_id = self.read_object_operand(&code.left);
                 if target_obj_id == 0 {
-                    return Err("调用目标对象为空".into());
+                    return Err(format!(
+                        "调用目标对象为空（当前执行类 `{}`，指令 pc={}，left={:?}）",
+                        self.current_class,
+                        self.pc,
+                        code.left,
+                    ));
                 }
                 let class_name = self.objects
                     .get(&target_obj_id)
@@ -1849,7 +2094,18 @@ impl VirtualMachine {
                 }
                 };
                 let return_type = code.result.as_ref().map(|r| r.value_type).unwrap_or(ValueType::Int);
-                self.call_compiled_method(&method, &ParamMode::Batch, code.result.as_ref(), return_type, None, Some(target_obj_id), false)?;
+                // switch_class 必须切换到目标类：否则方法体内的字段解析、
+                // 嵌套实例调用（如 EvaluateLaneLine 调 animation.Evaluate）
+                // 会沿用调用方（如 transformer）的执行类上下文。
+                self.call_compiled_method(
+                    &method,
+                    &ParamMode::Batch,
+                    code.result.as_ref(),
+                    return_type,
+                    Some(&class_name),
+                    Some(target_obj_id),
+                    false,
+                )?;
                 return Ok(true);
             }
             IntermediateOperator::InvokeStatic(idx) => {
@@ -1973,22 +2229,17 @@ impl VirtualMachine {
                 let field_counts = self.class_field_counts.get(&target_class).cloned().unwrap_or_default();
                 let obj = RuntimeObject::new_simple(target_class.clone(), &field_counts);
                 self.objects.insert(obj_id, obj);
+                // 保存调用者 this 槽：嵌套构造会临时把 object[0] 换成新对象，
+                // 返回后必须恢复，否则外层 LoadThis 读到被构造出的对象。
+                let saved_caller_this = *self.object_stack.read(0);
                 self.object_stack.write(0, obj_id);
                 let result_addr_index = self.get_object_addr(code.result);
                 self.object_stack.write(result_addr_index, obj_id);
 
-                // 2. 执行字段初始化器（Phase P）
-                if let Some(initials) = self.class_field_initializers.get(&target_class).cloned() {
-                    for init in &initials {
-                        let saved_injector = self.current_injector;
-                        let init_method = CompiledMethod {
-                            name: "field_init".into(),
-                            codes: init.codes.clone(),
-                            local_count: init.local_count,
-                        };
-                        self.call_compiled_method(&init_method, &ParamMode::None, None, ValueType::Int, None, Some(obj_id), false)?;
-                        self.current_injector = saved_injector;
-                    }
+                // 2. 执行字段初始化器（Phase P，沿继承链：父类先于子类）
+                if let Err(error) = self.run_field_initializers(&target_class, obj_id) {
+                    self.object_stack.write(0, saved_caller_this);
+                    return Err(error);
                 }
 
                 // 3. 执行构造方法
@@ -1997,9 +2248,22 @@ impl VirtualMachine {
                     .and_then(|cls| cls.find_constructor(*ctor_id))
                 {
                     let result_ref = code.result.as_ref();
-                    self.call_compiled_method(&ctor_method, &ParamMode::Batch, result_ref, ValueType::Object, Some(&target_class), Some(obj_id), false)?;
+                    if let Err(error) = self.call_compiled_method(
+                        &ctor_method,
+                        &ParamMode::Batch,
+                        result_ref,
+                        ValueType::Object,
+                        Some(&target_class),
+                        Some(obj_id),
+                        false,
+                    ) {
+                        self.object_stack.write(0, saved_caller_this);
+                        return Err(error);
+                    }
                     self.object_stack.write(result_addr_index, obj_id);
                 }
+                // 恢复调用者 this 槽（构造方法可能嵌套创建其他对象）
+                self.object_stack.write(0, saved_caller_this);
                 return Ok(true);
             }
             IntermediateOperator::DoConstruct(class_id) => {
@@ -2051,47 +2315,48 @@ impl VirtualMachine {
 
             // === 注入器构造方法（G3）===
             IntermediateOperator::InvokeInjectorConstructor(inj_ctor_idx) => {
-                let target_class = Self::read_target_class(code.right.as_ref())
-                    .unwrap_or_else(|| self.current_class.clone());
-                let injector_id = self.read_object_operand(&code.left);
-                let saved_injector = self.current_injector;
-                if injector_id != 0 {
-                    self.current_injector = Some(injector_id);
-                }
-            let ctor_id = match self.class_table.get(&target_class)
-                .and_then(|cls| cls.declaration.injector_constructor_impl_id.get(*inj_ctor_idx))
-            {
-                Some(&real_id) => real_id,
-                None => {
-                    self.current_injector = saved_injector;
-                    return Err(format!(
-                        "类 `{}` 中未找到注入器构造方法映射（注入器构造 ID {}）",
-                        target_class, inj_ctor_idx
-                    ));
-                }
-            };
+                // left 是参数数量；真实目标类取自 SetInjector 激活的动态注入器。
+                let injector_id = self.current_injector
+                    .filter(|id| *id != 0)
+                    .ok_or_else(|| "注入器构造调用缺少当前注入器".to_string())?;
+                let (declared_class, ctor_id) = {
+                    let injector = self.injectors.get(&injector_id)
+                        .ok_or_else(|| format!("当前注入器对象 {} 不存在", injector_id))?;
+                    let declaration = injector.injection_class_declaration();
+                    // native 类未声明显式注入器构造时，注入器构造 ID 即
+                    // native 分派表的本地构造 ID（多为 0）；编译类必须显式映射。
+                    let implementation_id = declaration.injector_constructor_impl_id
+                        .get(*inj_ctor_idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            if declaration.is_native { *inj_ctor_idx } else { usize::MAX }
+                        });
+                    if implementation_id == usize::MAX {
+                        return Err(format!(
+                            "类 `{}` 中未找到注入器构造方法映射（注入器构造 ID {}）",
+                            declaration.class_type.full_name(), inj_ctor_idx
+                        ));
+                    }
+                    (declaration.class_type.full_name(), implementation_id)
+                };
+                let simple_class = declared_class.rsplit('.').next().unwrap_or(&declared_class).to_string();
+                let target_class = if self.class_table.contains_key(&declared_class) {
+                    declared_class
+                } else if self.class_table.contains_key(&simple_class) {
+                    simple_class
+                } else {
+                    declared_class
+                };
                 if self.native_class_table.contains_key(&target_class) {
                     let new_id = self.dispatch_native_construct(&target_class, None, ctor_id);
                     let obj_id = if new_id != 0 { new_id } else { self.param_pool.get_object_return() };
                     let result_addr = self.get_object_addr(code.result);
                     self.object_stack.write(result_addr, obj_id);
-                    self.current_injector = saved_injector;
                     return Ok(true);
                 }
-                let obj_id = self.next_object_id; self.next_object_id += 1;
-                let field_counts = self.class_field_counts.get(&target_class).cloned().unwrap_or_default();
-                let obj = RuntimeObject::new_simple(target_class.clone(), &field_counts);
-                self.objects.insert(obj_id, obj);
-                self.object_stack.write(0, obj_id);
+                let obj_id = self.instantiate_with_injector(&target_class, ctor_id, injector_id)?;
                 let result_addr = self.get_object_addr(code.result);
                 self.object_stack.write(result_addr, obj_id);
-                if let Some(ctor_method) = self.class_table.get(&target_class)
-                    .and_then(|cls| cls.find_constructor(ctor_id))
-                {
-                    let result_ref = code.result.as_ref();
-                    self.call_compiled_method(&ctor_method, &ParamMode::Batch, result_ref, ValueType::Object, Some(&target_class), Some(obj_id), false)?;
-                }
-                self.current_injector = saved_injector;
             }
 
             // === 数组构造（Phase H）===
@@ -2100,15 +2365,7 @@ impl VirtualMachine {
             IntermediateOperator::InvokeArrayConstructor => {
                 let size = self.read_int_operand(&code.left) as usize;
                 let elem_type = Self::read_target_class(code.right.as_ref()).unwrap_or_default();
-                // 首字母大写以匹配 native 类名（如 int → IntArray）
-                let capitalized = {
-                    let mut c = elem_type.chars();
-                    match c.next() {
-                        None => String::new(),
-                        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
-                    }
-                };
-                let array_class = format!("{}Array", capitalized);
+                let array_class = Self::native_array_class_name(&elem_type).to_string();
 
                 // 尝试通过 native 类构造
                 if let Some(native_cls) = self.native_class_table.get(&array_class).cloned() {
@@ -2118,6 +2375,26 @@ impl VirtualMachine {
                         None,
                         0,
                     );
+                    // 注入器数组构造 `new (^laneLines)[N]`：当前注入器是
+                    // ObjectArray 包装时复制其元素（注入器引用），否则
+                    // `laneLines[i]` 会读到空数组、动态 new 目标为 0。
+                    if let Some(injector_id) = self.current_injector {
+                        if let Some(array_payload_id) = self.objects.get(&injector_id)
+                            .and_then(|object| object.native_object_id)
+                        {
+                            if let Some(source) = self.native_payloads
+                                .get(&array_payload_id)
+                                .and_then(|payload| payload.downcast_ref::<crate::system::native::array::ObjectArray>())
+                            {
+                                let items = source.items.clone();
+                                if let Some(target) = self.native_payloads.get_mut(&native_id)
+                                    .and_then(|payload| payload.downcast_mut::<crate::system::native::array::ObjectArray>())
+                                {
+                                    target.items = items;
+                                }
+                            }
+                        }
+                    }
                     // 创建编译层包装对象并建立双向引用
                     let obj_id = self.next_object_id; self.next_object_id += 1;
                     let mut wrapper = RuntimeObject::new_simple(array_class.clone(), &TypeCount { int_count: 1, ..TypeCount::zero() });
@@ -2192,6 +2469,34 @@ impl VirtualMachine {
         &mut self,
         constant: &crate::objective::bytecode::InjectorConstantDef,
     ) -> VmResult<usize> {
+        // 接口/抽象类型的注入器字面量 `Interface^ : {Concrete : {...}}`：
+        // 外层类名是接口（如 FunctionCurve）无法物化，唯一子对象字段名与
+        // 内层具体类名一致时（如 ConstantFunctionCurve），递归物化内层。
+        if constant.fields.len() == 1 {
+            if let crate::objective::bytecode::InjectorConstField::InjectObject(
+                nested_class,
+                nested_field_name,
+                nested_fields,
+            ) = &constant.fields[0]
+            {
+                let nested_simple = nested_class.rsplit('.').next().unwrap_or(nested_class);
+                if *nested_field_name == nested_simple {
+                    let outer_simple = constant.class_name.rsplit('.').next().unwrap_or(&constant.class_name);
+                    let outer_resolvable = self.class_table.contains_key(&constant.class_name)
+                        || self.native_class_table.contains_key(&constant.class_name)
+                        || self.class_table.contains_key(outer_simple)
+                        || self.native_class_table.contains_key(outer_simple);
+                    if !outer_resolvable {
+                        return self.materialize_injector_constant(
+                            &crate::objective::bytecode::InjectorConstantDef {
+                                class_name: nested_class.clone(),
+                                fields: nested_fields.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
         let class_decl = self.injector_declaration_for_constant(&constant.class_name);
         let mut injector = RuntimeInjector::from_constant(constant, class_decl);
 
@@ -2205,7 +2510,7 @@ impl VirtualMachine {
                 crate::objective::bytecode::InjectorConstField::Object(..) => {
                     object_seq += 1; // 编译期记录的对象 ID 已由 from_constant 写入
                 }
-                crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, fields) => {
+                crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, _, fields) => {
                     let nested = crate::objective::bytecode::InjectorConstantDef {
                         class_name: nested_class.clone(),
                         fields: fields.clone(),
@@ -2216,7 +2521,7 @@ impl VirtualMachine {
                     }
                     object_seq += 1;
                 }
-                crate::objective::bytecode::InjectorConstField::Array(elements) => {
+                crate::objective::bytecode::InjectorConstField::Array(_, elements) => {
                     let array_id = self.materialize_injector_array(elements)?;
                     if object_seq < injector.object_field_count() {
                         injector.set_injector_object(object_seq, array_id);
@@ -2226,10 +2531,158 @@ impl VirtualMachine {
                 _ => {}
             }
         }
+        // 应用类声明默认值：常量未显式提供的字段回退到 metadata 默认值。
+        // 对象型默认值先收集，再脱离注入器借用递归物化后写回 object 槽位。
+        let mut pending_defaults: Vec<(usize, bool, crate::objective::bytecode::InjectorConstField)> = Vec::new();
+        Self::apply_injector_defaults_to(&mut injector, &mut pending_defaults)?;
+        for (object_index, is_array, default_value) in pending_defaults {
+            let object_id = self.materialize_injector_default_const(&default_value)?;
+            // 默认值本身是 Array 常量时已是数组（元素为具体类注入器），
+            // 只有单对象默认值（InjectObject）才需要按数组字段包装。
+            let final_id = if is_array
+                && matches!(default_value, crate::objective::bytecode::InjectorConstField::InjectObject(..))
+            {
+                self.materialize_object_array(&[object_id])?
+            } else {
+                object_id
+            };
+            injector.set_injector_object(object_index, final_id);
+        }
         let inj_id = self.next_object_id;
         self.next_object_id += 1;
         self.injectors.insert(inj_id, injector);
         Ok(inj_id)
+    }
+
+    /// 对已创建的注入器应用类声明默认值（chart JSON / 编译常量共用）。
+    ///
+    /// 谱面 JSON 或注入器常量未显式提供的字段（如 `animation` 的
+    /// `auto defaultValue = LinearFunctionCurve : {...}`）按类声明的
+    /// `default_value` 常量补齐：标量直接写入；`InjectObject`/`Array`
+    /// 递归物化为注入器/数组对象后写入 object 槽位。
+    pub fn apply_injector_defaults(&mut self, injector_id: usize) -> VmResult<()> {
+        let mut pending: Vec<(usize, bool, crate::objective::bytecode::InjectorConstField)> = Vec::new();
+        {
+            let Some(injector) = self.injectors.get_mut(&injector_id) else {
+                return Ok(());
+            };
+            Self::apply_injector_defaults_to(injector, &mut pending)?;
+        }
+        for (object_index, is_array, default_value) in pending {
+            let object_id = self.materialize_injector_default_const(&default_value)?;
+            // 默认值本身是 Array 常量时已是数组（元素为具体类注入器），
+            // 只有单对象默认值（InjectObject）才需要按数组字段包装。
+            let final_id = if is_array
+                && matches!(default_value, crate::objective::bytecode::InjectorConstField::InjectObject(..))
+            {
+                // 数组字段默认值若是单对象（如 laneLines 的
+                // `FunctionCurve^ : {ConstantFunctionCurve : {...}}`），
+                // 按注入器语义包装为单元素数组，否则字段初始化器
+                // `new (^field)[^field.length]` 会得到空数组。
+                self.materialize_object_array(&[object_id])?
+            } else {
+                object_id
+            };
+            if let Some(injector) = self.injectors.get_mut(&injector_id) {
+                injector.set_injector_object(object_index, final_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// 将一组对象 ID 物化为 ObjectArray 编译层包装（chart JSON 数组字段）。
+    ///
+    /// 数组元素为已物化的注入器/对象 ID；返回包装对象 ID（int 字段 0 为
+    /// length），供编译侧 `arr.length` / `arr[i]` 访问。
+    pub fn materialize_object_array(&mut self, item_ids: &[usize]) -> VmResult<usize> {
+        use crate::objective::bytecode::InjectorConstField;
+        let fields: Vec<InjectorConstField> = item_ids.iter()
+            .map(|id| InjectorConstField::Object(String::new(), *id))
+            .collect();
+        self.materialize_injector_array(&fields)
+    }
+
+    /// 单注入器默认值应用（标量就地写入；对象默认值先收集到 `pending`，
+    /// 由调用方在脱离注入器借用后递归物化）。
+    fn apply_injector_defaults_to(
+        injector: &mut crate::system::native::injector::RuntimeInjector,
+        pending: &mut Vec<(usize, bool, crate::objective::bytecode::InjectorConstField)>,
+    ) -> VmResult<()> {
+        use crate::objective::bytecode::InjectorConstField;
+        use crate::objective::types::BasicType;
+        use crate::system::native::injector::Injector;
+
+        let declaration = injector.injection_class_declaration().clone();
+        let mut int_index = 0usize;
+        let mut float_index = 0usize;
+        let mut bool_index = 0usize;
+        let mut string_index = 0usize;
+        let mut object_index = 0usize;
+        for field in &declaration.injector_fields {
+            match field.field_type.basic_type {
+                BasicType::Int | BasicType::Enum => {
+                    if injector.get_injector_int_default_value(int_index) {
+                        if let Some(InjectorConstField::Int(_, value)) = &field.default_value {
+                            injector.set_injector_int(int_index, *value);
+                        }
+                    }
+                    int_index += 1;
+                }
+                BasicType::Float => {
+                    if injector.get_injector_float_default_value(float_index) {
+                        if let Some(InjectorConstField::Float(_, value)) = &field.default_value {
+                            injector.set_injector_float(float_index, *value);
+                        }
+                    }
+                    float_index += 1;
+                }
+                BasicType::Bool => {
+                    if injector.get_injector_bool_default_value(bool_index) {
+                        if let Some(InjectorConstField::Bool(_, value)) = &field.default_value {
+                            injector.set_injector_bool(bool_index, *value);
+                        }
+                    }
+                    bool_index += 1;
+                }
+                BasicType::String => {
+                    if injector.get_injector_string_default_value(string_index) {
+                        if let Some(InjectorConstField::String(_, value)) = &field.default_value {
+                            injector.set_injector_string(string_index, value.clone());
+                        }
+                    }
+                    string_index += 1;
+                }
+                BasicType::Object | BasicType::Interface | BasicType::Delegate => {
+                    if injector.get_injector_object_default_value(object_index) {
+                        if let Some(default_value) = &field.default_value {
+                            pending.push((object_index, field.is_array, default_value.clone()));
+                        }
+                    }
+                    object_index += 1;
+                }
+                BasicType::Void | BasicType::Null => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// 将注入器字段默认值常量物化为对象 ID（仅对象型默认值）。
+    fn materialize_injector_default_const(
+        &mut self,
+        default_value: &crate::objective::bytecode::InjectorConstField,
+    ) -> VmResult<usize> {
+        use crate::objective::bytecode::InjectorConstField;
+        match default_value {
+            InjectorConstField::InjectObject(class_name, _, fields) => {
+                self.materialize_injector_constant(&crate::objective::bytecode::InjectorConstantDef {
+                    class_name: class_name.clone(),
+                    fields: fields.clone(),
+                })
+            }
+            InjectorConstField::Array(_, elements) => self.materialize_injector_array(elements),
+            InjectorConstField::Object(_, object_id) => Ok(*object_id),
+            _ => Ok(0),
+        }
     }
 
     /// 为注入器常量解析类声明。
@@ -2241,19 +2694,19 @@ impl VirtualMachine {
         &self,
         class_name: &str,
     ) -> std::sync::Arc<crate::objective::declaration::ClassDeclaration> {
-        let resolved = if self.class_table.contains_key(class_name) {
-            Some(class_name.to_string())
-        } else {
-            let simple = class_name.rsplit('.').next().unwrap_or(class_name).to_string();
-            if self.class_table.contains_key(&simple) { Some(simple) } else { None }
-        };
-        if let Some(name) = resolved {
-            if let Some(cls) = self.class_table.get(&name) {
+        // 编译类走 class_table，native 类走 native_class_table（如
+        // ConstantFunctionCurve 等曲线族，仅注册在 native 表）。
+        let simple = class_name.rsplit('.').next().unwrap_or(class_name);
+        let candidates = [class_name, simple];
+        for name in candidates {
+            if let Some(cls) = self.class_table.get(name) {
                 let mut decl = cls.declaration.clone();
-                // 注入器后续会以声明中的类型名查回 VM（如 Environment 中
-                // materialize_injector 的 resolve_registered_class_name），
-                // 因此保存实际注册键而非源码中的全限定名
-                decl.class_type = crate::objective::types::GorgeType::class(name, None);
+                decl.class_type = crate::objective::types::GorgeType::class(name.to_string(), None);
+                return std::sync::Arc::new(decl);
+            }
+            if let Some(native) = self.native_class_table.get(name) {
+                let mut decl = native.declaration();
+                decl.class_type = crate::objective::types::GorgeType::class(name.to_string(), None);
                 return std::sync::Arc::new(decl);
             }
         }
@@ -2274,35 +2727,33 @@ impl VirtualMachine {
     ) -> VmResult<usize> {
         use crate::system::native::array::*;
 
-        // 元素类型：首项为 InjectObject 时取嵌套类名，否则按标量类型取
-        // 对应的基本类型名（Int → "int"，…）
+        // 对象与接口数组统一使用 ObjectArray；标量数组按基本类型映射。
         let elem_type_name = match elements.first() {
-            Some(crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, _)) => {
-                nested_class.rsplit('.').next().unwrap_or(nested_class).to_string()
-            }
+            Some(crate::objective::bytecode::InjectorConstField::InjectObject(..)) => "object".to_string(),
             Some(crate::objective::bytecode::InjectorConstField::Int(..)) => "int".to_string(),
             Some(crate::objective::bytecode::InjectorConstField::Float(..)) => "float".to_string(),
             Some(crate::objective::bytecode::InjectorConstField::Bool(..)) => "bool".to_string(),
             Some(crate::objective::bytecode::InjectorConstField::String(..)) => "string".to_string(),
             _ => "object".to_string(),
         };
-        let array_class = format!("{}Array", {
-            let mut c = elem_type_name.chars();
-            match c.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
-            }
-        });
+        let array_class = Self::native_array_class_name(&elem_type_name).to_string();
 
         // 预分配元素 ID（避免与插入 native 载荷的借用冲突）
         let element_ids: Vec<Option<usize>> = elements.iter()
             .map(|f| match f {
-                crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, fields) => {
+                crate::objective::bytecode::InjectorConstField::InjectObject(nested_class, _, fields) => {
                     let nested = crate::objective::bytecode::InjectorConstantDef {
                         class_name: nested_class.clone(),
                         fields: fields.clone(),
                     };
-                    self.materialize_injector_constant(&nested).ok()
+                    match self.materialize_injector_constant(&nested) {
+                        Ok(id) => {
+                        Some(id)
+                        }
+                        Err(_error) => {
+                            None
+                        }
+                    }
                 }
                 _ => None,
             })
@@ -4032,6 +4483,394 @@ mod tests {
         assert_eq!(vm.objects.get(&obj_id).unwrap().class_name, "S3Ctor");
     }
 
+    #[test]
+    fn test_invoke_injector_constructor_uses_dynamic_injector_class() {
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::system::native::injector::RuntimeInjector;
+        use std::sync::Arc;
+
+        fn empty_constructor() -> CompiledMethod {
+            CompiledMethod {
+                name: "constructor".into(),
+                codes: vec![crate::virtual_machine::ir::CodeWithSpan::new(
+                    IntermediateCode::new(IntermediateOperator::ReturnVoid, Operand::int(0), None, None),
+                    crate::diagnostics::Span::dummy(),
+                )],
+                local_count: 1,
+            }
+        }
+
+        let mut base_declaration = ClassDeclaration::dummy("BaseCurve".into());
+        base_declaration.constructor_count = 1;
+        base_declaration.injector_constructor_impl_id = vec![0];
+        let mut base_class = RuntimeClass::new(base_declaration, None);
+        base_class.register_constructor(0, empty_constructor());
+
+        let mut concrete_declaration = ClassDeclaration::dummy("ConcreteCurve".into());
+        concrete_declaration.constructor_start_id = 1;
+        concrete_declaration.constructor_count = 1;
+        concrete_declaration.injector_constructor_impl_id = vec![1];
+        let injector_declaration = Arc::new(concrete_declaration.clone());
+        let mut concrete_class = RuntimeClass::new(concrete_declaration, None);
+        concrete_class.register_constructor(0, empty_constructor());
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("BaseCurve", Arc::new(base_class));
+        vm.register_runtime_class("ConcreteCurve", Arc::new(concrete_class));
+        vm.register_class_field_counts("ConcreteCurve", TypeCount::zero());
+        vm.push_frame(4);
+        let injector_id = 42;
+        vm.injectors.insert(injector_id, RuntimeInjector::new(injector_declaration));
+        vm.current_injector = Some(injector_id);
+        let result = Address::new(ValueType::Object, 1);
+
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeInjectorConstructor(0),
+            Operand::int(0),
+            Some(Operand::string("BaseCurve")),
+            Some(result),
+        )).expect("动态注入器构造应成功");
+
+        let object_id = *vm.object_stack.read(result.index);
+        assert_eq!(vm.objects.get(&object_id).unwrap().class_name, "ConcreteCurve");
+        assert_eq!(vm.current_injector, Some(injector_id));
+    }
+
+    #[test]
+    fn test_invoke_injector_constructor_converts_native_global_id_to_local_id() {
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::objective::native::{NativeClass, NativeContext};
+        use crate::system::native::injector::RuntimeInjector;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct ConstructorIdNativeClass {
+            field_counts: TypeCount,
+        }
+
+        impl NativeClass for ConstructorIdNativeClass {
+            fn full_name(&self) -> &str {
+                "ConcreteNativeCurve"
+            }
+
+            fn field_type_count(&self) -> &TypeCount {
+                &self.field_counts
+            }
+
+            fn invoke_native_method(
+                &self,
+                _ctx: &mut NativeContext,
+                _object_id: usize,
+                _method_id: usize,
+            ) {
+            }
+
+            fn invoke_native_static(
+                &self,
+                _ctx: &mut NativeContext,
+                _method_id: usize,
+            ) {
+            }
+
+            fn do_construct_native(
+                &self,
+                ctx: &mut NativeContext,
+                _target: Option<usize>,
+                constructor_id: usize,
+            ) -> usize {
+                let object = RuntimeObject::new_simple(
+                    self.full_name().to_string(),
+                    &self.field_counts,
+                );
+                let object_id = ctx.register_object(object);
+                ctx.set_object_int_field(object_id, 0, constructor_id as i64);
+                object_id
+            }
+        }
+
+        let mut declaration = ClassDeclaration::dummy("ConcreteNativeCurve".into());
+        declaration.is_native = true;
+        declaration.constructor_start_id = 1;
+        declaration.constructor_count = 1;
+        declaration.injector_constructor_impl_id = vec![1];
+        let injector_declaration = Arc::new(declaration.clone());
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class(
+            "ConcreteNativeCurve",
+            Arc::new(RuntimeClass::new(declaration, None)),
+        );
+        vm.register_native_class(
+            "ConcreteNativeCurve",
+            Arc::new(ConstructorIdNativeClass {
+                field_counts: TypeCount {
+                    int_count: 1,
+                    ..TypeCount::zero()
+                },
+            }),
+        );
+        vm.push_frame(4);
+        let injector_id = 43;
+        vm.injectors.insert(
+            injector_id,
+            RuntimeInjector::new(injector_declaration),
+        );
+        vm.current_injector = Some(injector_id);
+        let result = Address::new(ValueType::Object, 1);
+
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeInjectorConstructor(0),
+            Operand::int(0),
+            Some(Operand::string("BaseCurve")),
+            Some(result),
+        )).expect("native 动态注入器构造应成功");
+
+        let object_id = *vm.object_stack.read(result.index);
+        let object = vm.objects.get(&object_id).expect("native 构造应创建对象");
+        assert_eq!(object.class_name, "ConcreteNativeCurve");
+        assert_eq!(object.get_int_field(0), 0, "native 构造应接收本地构造 ID");
+    }
+
+    #[test]
+    fn test_object_array_constructor_uses_get_set_and_length_abi() {
+        use crate::system::native::array::{ObjectArray, ObjectArrayClass};
+        use std::sync::Arc;
+
+        let mut vm = VirtualMachine::new();
+        vm.register_native_class("ObjectArray", Arc::new(ObjectArrayClass));
+        vm.push_frame(4);
+        let array_address = Address::new(ValueType::Object, 0);
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeArrayConstructor,
+            Operand::int(2),
+            Some(Operand::string("GorgeFramework.Node")),
+            Some(array_address),
+        )).expect("对象数组构造应成功");
+
+        let wrapper_id = *vm.object_stack.read(array_address.index);
+        let wrapper = vm.objects.get(&wrapper_id).expect("应创建数组包装对象");
+        assert_eq!(wrapper.class_name, "ObjectArray");
+        assert_eq!(wrapper.get_int_field(0), 2);
+        let native_id = wrapper.native_object_id.expect("包装对象应链接 native 载荷");
+        assert_eq!(vm.native_payloads.get(&native_id)
+            .and_then(|value| value.downcast_ref::<ObjectArray>())
+            .unwrap().items, vec![0, 0]);
+
+        vm.param_pool.set_int_param(0, 1);
+        vm.param_pool.set_object_param(0, 123);
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeInstance(1),
+            Operand::Address(array_address),
+            None,
+            None,
+        )).unwrap();
+        vm.param_pool.set_int_param(0, 1);
+        let item_address = Address::new(ValueType::Object, 1);
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeInstance(0),
+            Operand::Address(array_address),
+            None,
+            Some(item_address),
+        )).unwrap();
+        assert_eq!(*vm.object_stack.read(item_address.index), 123);
+
+        let length_address = Address::new(ValueType::Int, 2);
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeInstance(3),
+            Operand::Address(array_address),
+            None,
+            Some(length_address),
+        )).unwrap();
+        assert_eq!(*vm.int_stack.read(length_address.index), 2);
+    }
+
+    /// 空对象数组常量物化：elements 为空时仍走 ObjectArray，不 panic，
+    /// 包装对象 length=0 且载荷为空数组。
+    #[test]
+    fn test_materialize_injector_array_empty_object_array() {
+        use crate::system::native::array::ObjectArray;
+
+        let mut vm = VirtualMachine::new();
+        vm.object_stack.push_frame(2);
+        let wrapper_id = vm.materialize_injector_array(&[]).expect("空数组物化应成功");
+        let wrapper = vm.objects.get(&wrapper_id).expect("空数组应创建包装对象");
+        assert_eq!(wrapper.class_name, "ObjectArray");
+        assert_eq!(wrapper.get_int_field(0), 0, "空数组 length 应为 0");
+        let native_id = wrapper.native_object_id.expect("空数组包装应链接 native 载荷");
+        let payload = vm.native_payloads.get(&native_id)
+            .and_then(|value| value.downcast_ref::<ObjectArray>())
+            .expect("空数组载荷应为 ObjectArray");
+        assert!(payload.items.is_empty());
+    }
+
+    /// 多元素对象数组常量物化：InjectObject 项递归物化为注入器对象 ID，
+    /// 统一写入 ObjectArray 载荷，包装对象 length 等于元素数。
+    #[test]
+    fn test_materialize_injector_array_object_items() {
+        use crate::objective::bytecode::InjectorConstField;
+        use crate::system::native::array::ObjectArray;
+
+        let mut vm = VirtualMachine::new();
+        vm.object_stack.push_frame(2);
+        let elements = vec![
+            InjectorConstField::InjectObject("Chart.Note".into(), String::new(), vec![]),
+            InjectorConstField::InjectObject("Chart.Note".into(), String::new(), vec![]),
+        ];
+        let wrapper_id = vm.materialize_injector_array(&elements).expect("对象数组物化应成功");
+        let wrapper = vm.objects.get(&wrapper_id).expect("应创建包装对象");
+        assert_eq!(wrapper.class_name, "ObjectArray");
+        assert_eq!(wrapper.get_int_field(0), 2, "对象数组 length 应为 2");
+        let native_id = wrapper.native_object_id.expect("包装应链接 native 载荷");
+        let payload = vm.native_payloads.get(&native_id)
+            .and_then(|value| value.downcast_ref::<ObjectArray>())
+            .expect("对象数组载荷应为 ObjectArray");
+        assert_eq!(payload.items.len(), 2);
+        assert!(payload.items.iter().all(|id| *id != 0), "对象数组元素应为非 0 对象 ID");
+    }
+
+    /// 注入器实例化失败路径：构造方法缺失时返回 Err，且 current_injector
+    /// 必须恢复为调用前的值（不得泄漏中途设置的注入器）。
+    #[test]
+    fn test_instantiate_with_injector_restores_current_injector_on_error() {
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use std::sync::Arc;
+
+        let mut decl = ClassDeclaration::dummy("BadCtor".into());
+        decl.constructor_count = 1;
+        decl.constructor_start_id = 0;
+        let cls = Arc::new(RuntimeClass::new(decl, None));
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("BadCtor", cls);
+        vm.register_class_field_counts("BadCtor", crate::objective::types::TypeCount::zero());
+        vm.current_injector = Some(7);
+        let result = vm.instantiate_with_injector("BadCtor", 0, 9);
+        assert!(result.is_err(), "缺失构造实现时应返回错误");
+        assert_eq!(vm.current_injector, Some(7), "失败路径必须恢复 current_injector");
+    }
+
+    /// 嵌套编译构造不得破坏调用者 this 槽：外层构造内 new 内层对象后，
+    /// LoadThis 必须仍读到外层对象，且外层帧 object[0] 在构造返回后恢复。
+    #[test]
+    fn test_invoke_constructor_restores_caller_this_slot() {
+        use crate::objective::class::RuntimeClass;
+        use crate::objective::declaration::ClassDeclaration;
+        use crate::objective::types::TypeCount;
+        use std::sync::Arc;
+
+        fn make_class(name: &str, ctor_codes: Vec<CodeWithSpan>) -> Arc<RuntimeClass> {
+            let mut decl = ClassDeclaration::dummy(name.into());
+            decl.constructor_count = 1;
+            decl.constructor_start_id = 0;
+            let mut cls = RuntimeClass::new(decl, None);
+            cls.register_constructor(0, CompiledMethod {
+                name: "constructor".into(),
+                codes: ctor_codes,
+                local_count: 4,
+            });
+            Arc::new(cls)
+        }
+
+        let inner_codes = vec![CodeWithSpan::new(
+            IntermediateCode::new(
+                IntermediateOperator::ReturnVoid,
+                Operand::int(0),
+                None,
+                None,
+            ),
+            crate::diagnostics::Span::dummy(),
+        )];
+        let inner = make_class("Inner", inner_codes);
+
+        let outer_codes = vec![
+            CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::InvokeConstructor(0),
+                    Operand::int(0),
+                    Some(Operand::string("Inner")),
+                    Some(Address::new(ValueType::Object, 1)),
+                ),
+                crate::diagnostics::Span::dummy(),
+            ),
+            CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::LoadThis,
+                    Operand::int(0),
+                    None,
+                    Some(Address::new(ValueType::Object, 2)),
+                ),
+                crate::diagnostics::Span::dummy(),
+            ),
+            CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::SetObjectField(0),
+                    Operand::Address(Address::new(ValueType::Object, 2)),
+                    Some(Operand::Address(Address::new(ValueType::Object, 1))),
+                    None,
+                ),
+                crate::diagnostics::Span::dummy(),
+            ),
+            CodeWithSpan::new(
+                IntermediateCode::new(
+                    IntermediateOperator::ReturnVoid,
+                    Operand::int(0),
+                    None,
+                    None,
+                ),
+                crate::diagnostics::Span::dummy(),
+            ),
+        ];
+        let outer = make_class("Outer", outer_codes);
+
+        let mut vm = VirtualMachine::new();
+        vm.register_runtime_class("Inner", inner);
+        vm.register_runtime_class("Outer", outer);
+        vm.register_class_field_counts("Inner", TypeCount::zero());
+        vm.register_class_field_counts("Outer", TypeCount {
+            object_count: 1,
+            ..TypeCount::zero()
+        });
+        vm.push_frame(4);
+        vm.object_stack.write(0, 777);
+        let result_addr = Address::new(ValueType::Object, 1);
+
+        vm.execute_one(&IntermediateCode::new(
+            IntermediateOperator::InvokeConstructor(0),
+            Operand::int(0),
+            Some(Operand::string("Outer")),
+            Some(result_addr),
+        )).expect("嵌套构造应成功");
+
+        assert_eq!(
+            *vm.object_stack.read(0),
+            777,
+            "外层调用者 this 槽必须恢复，不得被嵌套构造覆盖",
+        );
+        let outer_id = *vm.object_stack.read(result_addr.index);
+        let inner_id = vm.objects.get(&outer_id)
+            .map(|obj| obj.get_object_field(0))
+            .expect("外层对象字段 0 应写入内层对象 ID");
+        assert_eq!(
+            vm.objects.get(&inner_id).map(|obj| obj.class_name.as_str()),
+            Some("Inner"),
+        );
+    }
+
+    /// native 数组类名映射：标量按基本类型，对象/接口/注入器统一 ObjectArray。
+    #[test]
+    fn test_native_array_class_name_mapping() {
+        assert_eq!(VirtualMachine::native_array_class_name("int"), "IntArray");
+        assert_eq!(VirtualMachine::native_array_class_name("float"), "FloatArray");
+        assert_eq!(VirtualMachine::native_array_class_name("bool"), "BoolArray");
+        assert_eq!(VirtualMachine::native_array_class_name("string"), "StringArray");
+        assert_eq!(VirtualMachine::native_array_class_name("GorgeFramework.Node"), "ObjectArray");
+        assert_eq!(VirtualMachine::native_array_class_name("ITransformer"), "ObjectArray");
+        assert_eq!(VirtualMachine::native_array_class_name(""), "ObjectArray");
+    }
+
     /// class_methods_with_annotation：运行时查询带注解的方法
     #[test]
     fn test_s3_methods_with_annotation_query() {
@@ -4539,6 +5378,7 @@ mod tests {
                 InjectorConstField::Int("id".into(), 7),
                 InjectorConstField::InjectObject(
                     "Chart.Vector2".into(),
+                    String::new(),
                     vec![
                         InjectorConstField::Float("x".into(), 1.5),
                         InjectorConstField::Float("y".into(), -2.0),
@@ -4596,7 +5436,7 @@ mod tests {
         vm.register_runtime_class("Holder", cls);
         vm.injector_constants = vec![InjectorConstantDef {
             class_name: "Chart.Holder".into(),
-            fields: vec![InjectorConstField::Array(vec![
+            fields: vec![InjectorConstField::Array(String::new(), vec![
                 InjectorConstField::Float("".into(), 0.25),
                 InjectorConstField::Float("".into(), 0.75),
             ])],

@@ -165,7 +165,13 @@ impl<'a> NativeContext<'a> {
     pub fn get_object_float_field(&self, obj_id: usize, index: usize) -> f64 {
         self.vm.objects
             .get(&obj_id)
-            .map(|o| o.get_float_field(index))
+            .map(|o| {
+                if index < o.native_field_bounds.float_count + o.compiled_fields.floats.len() {
+                    o.get_float_field(index)
+                } else {
+                    0.0
+                }
+            })
             .unwrap_or(0.0)
     }
 
@@ -173,7 +179,13 @@ impl<'a> NativeContext<'a> {
     pub fn get_object_int_field(&self, obj_id: usize, index: usize) -> i64 {
         self.vm.objects
             .get(&obj_id)
-            .map(|o| o.get_int_field(index))
+            .map(|o| {
+                if index < o.native_field_bounds.int_count + o.compiled_fields.ints.len() {
+                    o.get_int_field(index)
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0)
     }
 
@@ -181,7 +193,13 @@ impl<'a> NativeContext<'a> {
     pub fn get_object_bool_field(&self, obj_id: usize, index: usize) -> bool {
         self.vm.objects
             .get(&obj_id)
-            .map(|o| o.get_bool_field(index))
+            .map(|o| {
+                if index < o.native_field_bounds.bool_count + o.compiled_fields.bools.len() {
+                    o.get_bool_field(index)
+                } else {
+                    false
+                }
+            })
             .unwrap_or(false)
     }
 
@@ -189,7 +207,13 @@ impl<'a> NativeContext<'a> {
     pub fn get_object_string_field(&self, obj_id: usize, index: usize) -> String {
         self.vm.objects
             .get(&obj_id)
-            .map(|o| o.get_string_field(index))
+            .map(|o| {
+                if index < o.native_field_bounds.string_count + o.compiled_fields.strings.len() {
+                    o.get_string_field(index)
+                } else {
+                    String::new()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -197,7 +221,13 @@ impl<'a> NativeContext<'a> {
     pub fn get_object_object_field(&self, obj_id: usize, index: usize) -> usize {
         self.vm.objects
             .get(&obj_id)
-            .map(|o| o.get_object_field(index))
+            .map(|o| {
+                if index < o.native_field_bounds.object_count + o.compiled_fields.objects.len() {
+                    o.get_object_field(index)
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0)
     }
 
@@ -443,11 +473,19 @@ impl<'a> NativeContext<'a> {
 
     // ==================== 数组/集合访问 ====================
 
+    /// 将编译层数组包装对象解析到实际保存 native 载荷的对象 ID。
+    fn native_payload_object_id(&self, obj_id: usize) -> usize {
+        self.vm.objects.get(&obj_id)
+            .and_then(|object| object.native_object_id)
+            .unwrap_or(obj_id)
+    }
+
     /// 获取对象数组的各元素对象 ID 列表
     pub fn object_array_items(&self, obj_id: usize) -> Vec<usize> {
         use crate::system::native::array::ObjectArray;
+        let native_object_id = self.native_payload_object_id(obj_id);
         self.vm.native_payloads
-            .get(&obj_id)
+            .get(&native_object_id)
             .and_then(|p| p.downcast_ref::<ObjectArray>())
             .map(|a| a.items.clone())
             .unwrap_or_default()
@@ -466,8 +504,9 @@ impl<'a> NativeContext<'a> {
     /// 获取整数数组的各元素
     pub fn int_array_items(&self, obj_id: usize) -> Vec<i64> {
         use crate::system::native::array::IntArray;
+        let native_object_id = self.native_payload_object_id(obj_id);
         self.vm.native_payloads
-            .get(&obj_id)
+            .get(&native_object_id)
             .and_then(|p| p.downcast_ref::<IntArray>())
             .map(|a| a.items.clone())
             .unwrap_or_default()
@@ -476,8 +515,9 @@ impl<'a> NativeContext<'a> {
     /// 获取浮点数组的各元素
     pub fn float_array_items(&self, obj_id: usize) -> Vec<f64> {
         use crate::system::native::array::FloatArray;
+        let native_object_id = self.native_payload_object_id(obj_id);
         self.vm.native_payloads
-            .get(&obj_id)
+            .get(&native_object_id)
             .and_then(|p| p.downcast_ref::<FloatArray>())
             .map(|a| a.items.clone())
             .unwrap_or_default()
@@ -486,7 +526,8 @@ impl<'a> NativeContext<'a> {
     /// 向对象数组追加元素
     pub fn object_array_add(&mut self, obj_id: usize, value: usize) {
         use crate::system::native::array::ObjectArray;
-        if let Some(payload) = self.vm.native_payloads.get_mut(&obj_id) {
+        let native_object_id = self.native_payload_object_id(obj_id);
+        if let Some(payload) = self.vm.native_payloads.get_mut(&native_object_id) {
             if let Some(arr) = payload.downcast_mut::<ObjectArray>() {
                 arr.items.push(value);
             }
@@ -701,12 +742,15 @@ pub trait NativeClass: Debug + Send + Sync {
                 crate::objective::declaration::InjectorFieldInfo {
                     name: name.to_string(),
                     field_type: crate::objective::types::GorgeType::new(basic),
+                    is_array: false,
                     has_default_value: false,
+                    default_value: None,
                 }
             })
             .collect();
 
         let mut decl = crate::objective::declaration::ClassDeclaration::dummy(self.full_name().to_string());
+        decl.is_native = true;
         decl.injector_fields = injector_fields;
         decl.injector_field_type_count = type_count;
         decl
@@ -889,5 +933,29 @@ mod tests {
         let ctx = NativeContext::new(&mut vm);
         let items = ctx.int_array_items(arr_id);
         assert_eq!(items, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_object_array_access_resolves_compiled_wrapper() {
+        use crate::system::native::array::ObjectArray;
+
+        let mut vm = make_vm();
+        let native_array_id = 1;
+        let wrapper_id = 2;
+        vm.native_payloads.insert(
+            native_array_id,
+            Box::new(ObjectArray { items: vec![11, 22] }),
+        );
+        let mut wrapper = RuntimeObject::new_simple(
+            "ObjectArray".into(),
+            &TypeCount { int_count: 1, ..TypeCount::zero() },
+        );
+        wrapper.native_object_id = Some(native_array_id);
+        vm.objects.insert(wrapper_id, wrapper);
+
+        let mut ctx = NativeContext::new(&mut vm);
+        assert_eq!(ctx.object_array_items(wrapper_id), vec![11, 22]);
+        ctx.object_array_add(wrapper_id, 33);
+        assert_eq!(ctx.object_array_items(wrapper_id), vec![11, 22, 33]);
     }
 }

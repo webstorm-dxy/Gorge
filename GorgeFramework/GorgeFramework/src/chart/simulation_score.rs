@@ -813,7 +813,7 @@ fn fill_element_period_from_method(
     };
     if constant.class_name == "Array" {
         for element in &constant.fields {
-            if let InjectorConstField::InjectObject(class_name, fields) = element {
+            if let InjectorConstField::InjectObject(class_name, _, fields) = element {
                 period.elements.push(const_object_to_json(class_name, fields, meta));
             }
         }
@@ -837,6 +837,18 @@ fn const_object_to_json(
     fields: &[InjectorConstField],
     meta: &InjectorFieldMetaProvider,
 ) -> serde_json::Value {
+    // 接口/抽象类型的注入器字面量 `Interface^ : {Concrete : {...}}`：
+    // 常量外层类名是接口（如 FunctionCurve），唯一子对象字段名与内层
+    // 具体类名一致（如 AxialSymmetricFunctionCurve），此时应直接输出
+    // 内层具体类，否则物化端按接口名查不到类、元素整体丢失。
+    if fields.len() == 1 {
+        if let InjectorConstField::InjectObject(nested_class, nested_field_name, nested_fields) = &fields[0] {
+            let nested_simple = nested_class.rsplit('.').next().unwrap_or(nested_class);
+            if *nested_field_name == nested_simple {
+                return const_object_to_json(nested_class, nested_fields, meta);
+            }
+        }
+    }
     let mut obj = serde_json::Map::new();
     obj.insert("__type".into(), class_name.into());
 
@@ -852,7 +864,7 @@ fn const_object_to_json(
             }
             InjectorConstField::Float(name, v) => {
                 cursor = advance_past(declared, cursor, name);
-                obj.insert(name.clone(), (*v).into());
+                obj.insert(name.clone(), json_float(*v));
             }
             InjectorConstField::Bool(name, v) => {
                 cursor = advance_past(declared, cursor, name);
@@ -866,23 +878,34 @@ fn const_object_to_json(
                 cursor = advance_past(declared, cursor, name);
                 obj.insert(name.clone(), (*id as i64).into());
             }
-            InjectorConstField::InjectObject(nested_class, nested_fields) => {
-                let field_name = next_object_field_name(declared, &mut cursor)
-                    .unwrap_or_else(|| {
-                        unnamed_count += 1;
-                        format!("__unnamed_{}", unnamed_count)
-                    });
+            InjectorConstField::InjectObject(nested_class, field_name, nested_fields) => {
+                let field_name = if field_name.is_empty() {
+                    // 旧常量/顶层对象无字段名：按声明位置对齐回退
+                    next_object_field_name(declared, &mut cursor)
+                        .unwrap_or_else(|| {
+                            unnamed_count += 1;
+                            format!("__unnamed_{}", unnamed_count)
+                        })
+                } else {
+                    cursor = advance_past(declared, cursor, field_name);
+                    field_name.clone()
+                };
                 obj.insert(
                     field_name,
                     const_object_to_json(nested_class, nested_fields, meta),
                 );
             }
-            InjectorConstField::Array(elements) => {
-                let field_name = next_object_field_name(declared, &mut cursor)
-                    .unwrap_or_else(|| {
-                        unnamed_count += 1;
-                        format!("__unnamed_{}", unnamed_count)
-                    });
+            InjectorConstField::Array(field_name, elements) => {
+                let field_name = if field_name.is_empty() {
+                    next_object_field_name(declared, &mut cursor)
+                        .unwrap_or_else(|| {
+                            unnamed_count += 1;
+                            format!("__unnamed_{}", unnamed_count)
+                        })
+                } else {
+                    cursor = advance_past(declared, cursor, field_name);
+                    field_name.clone()
+                };
                 let arr: Vec<serde_json::Value> = elements
                     .iter()
                     .map(|e| const_element_to_json(e, meta))
@@ -900,17 +923,35 @@ fn const_element_to_json(
     meta: &InjectorFieldMetaProvider,
 ) -> serde_json::Value {
     match field {
-        InjectorConstField::InjectObject(class_name, fields) => {
+        InjectorConstField::InjectObject(class_name, _, fields) => {
             const_object_to_json(class_name, fields, meta)
         }
         InjectorConstField::Int(_, v) => (*v).into(),
-        InjectorConstField::Float(_, v) => (*v).into(),
+        InjectorConstField::Float(_, v) => json_float(*v),
         InjectorConstField::Bool(_, v) => (*v).into(),
         InjectorConstField::String(_, v) => v.clone().into(),
         InjectorConstField::Object(_, id) => (*id as i64).into(),
-        InjectorConstField::Array(elements) => serde_json::Value::Array(
+        InjectorConstField::Array(_, elements) => serde_json::Value::Array(
             elements.iter().map(|e| const_element_to_json(e, meta)).collect(),
         ),
+    }
+}
+
+/// 将浮点值转换为谱面 JSON 值。
+///
+/// serde_json 不支持 ±Infinity/NaN，而真实谱面注入器用
+/// `(-1.0/0.0)` 硬编码负无穷（C# `InjectorHardcodeGenerator.FloatToString`）。
+/// 此处约定非有限浮点编码为字符串 `"Infinity"` / `"-Infinity"` / `"NaN"`，
+/// 由 `materialize_injector` 一侧还原为 f64。
+fn json_float(value: f64) -> serde_json::Value {
+    if value.is_nan() {
+        serde_json::Value::String("NaN".to_string())
+    } else if value == f64::INFINITY {
+        serde_json::Value::String("Infinity".to_string())
+    } else if value == f64::NEG_INFINITY {
+        serde_json::Value::String("-Infinity".to_string())
+    } else {
+        serde_json::Value::from(value)
     }
 }
 
@@ -1366,7 +1407,8 @@ mod tests {
                     // 嵌套注入器（含数组字段）：AudioAsset 声明的 object 槽位
                     InjectorConstField::InjectObject(
                         "GorgeFramework.Inner".into(),
-                        vec![InjectorConstField::Array(vec![
+                        String::new(),
+                        vec![InjectorConstField::Array(String::new(), vec![
                             InjectorConstField::Int("".into(), 11),
                             InjectorConstField::Int("".into(), 22),
                         ])],
@@ -1582,6 +1624,40 @@ mod tests {
         }
     }
 
+    /// 非有限浮点（±Infinity/NaN）必须经字符串约定往返：
+    /// `const_object_to_json` 输出 `"-Infinity"`，不能 panic（serde_json
+    /// 不支持非有限数），且真实谱面 `(-1.0/0.0)` 折叠出的负无穷不丢失。
+    #[test]
+    fn test_const_object_to_json_encodes_non_finite_float_as_string() {
+        use gorge_core::objective::bytecode::InjectorConstField;
+
+        let meta = InjectorFieldMetaProvider::build(&[]);
+        let json = const_object_to_json(
+            "GorgeFramework.FunctionPiece",
+            &[
+                InjectorConstField::Float("startX".into(), f64::NEG_INFINITY),
+                InjectorConstField::Float("endX".into(), f64::INFINITY),
+                InjectorConstField::Float("weight".into(), f64::NAN),
+            ],
+            &meta,
+        );
+        let obj = json.as_object().expect("应输出 JSON 对象");
+        assert_eq!(obj.get("startX").and_then(|v| v.as_str()), Some("-Infinity"));
+        assert_eq!(obj.get("endX").and_then(|v| v.as_str()), Some("Infinity"));
+        assert_eq!(obj.get("weight").and_then(|v| v.as_str()), Some("NaN"));
+
+        // 有限浮点保持 JSON 数字
+        let finite = const_object_to_json(
+            "GorgeFramework.Sample",
+            &[InjectorConstField::Float("value".into(), 1.25)],
+            &meta,
+        );
+        assert_eq!(
+            finite.get("value").and_then(|v| v.as_f64()),
+            Some(1.25),
+        );
+    }
+
     /// 构造一个带 `@AudioStaff` 注解的编译类
     fn make_compiled_class_with_audio_staff() -> gorge_core::objective::bytecode::CompiledClass {
         use gorge_core::objective::bytecode::{CompiledAnnotation, CompiledClass};
@@ -1792,6 +1868,7 @@ mod tests {
                     fields: vec![
                         InjectorConstField::InjectObject(
                             "Test.TapNote".into(),
+                            String::new(),
                             vec![
                                 InjectorConstField::Float("hitTime".into(), 0.5),
                                 InjectorConstField::Float("keepTime".into(), 1.0),
@@ -1799,6 +1876,7 @@ mod tests {
                         ),
                         InjectorConstField::InjectObject(
                             "Test.TapNote".into(),
+                            String::new(),
                             vec![
                                 InjectorConstField::Float("hitTime".into(), 1.5),
                                 InjectorConstField::Float("keepTime".into(), 2.0),
@@ -1918,18 +1996,21 @@ mod tests {
                 gorge_core::objective::bytecode::InjectorFieldDef {
                     name: "name".into(),
                     value_type: ValueType::String,
+                    is_array: false,
                     has_default: false,
                     default_value: None,
                 },
                 gorge_core::objective::bytecode::InjectorFieldDef {
                     name: "drawStartX".into(),
                     value_type: ValueType::Object,
+                    is_array: false,
                     has_default: false,
                     default_value: None,
                 },
                 gorge_core::objective::bytecode::InjectorFieldDef {
                     name: "drawEndX".into(),
                     value_type: ValueType::Object,
+                    is_array: false,
                     has_default: false,
                     default_value: None,
                 },
@@ -1981,14 +2062,17 @@ mod tests {
                     fields: vec![
                         InjectorConstField::InjectObject(
                             "Test.Lane".into(),
+                            String::new(),
                             vec![
                                 InjectorConstField::String("name".into(), "L1".into()),
                                 InjectorConstField::InjectObject(
                                     "GorgeFramework.VariableFloat".into(),
+                                    String::new(),
                                     vec![InjectorConstField::Float("baseValue".into(), 1.0)],
                                 ),
                                 InjectorConstField::InjectObject(
                                     "GorgeFramework.VariableFloat".into(),
+                                    String::new(),
                                     vec![InjectorConstField::Float("baseValue".into(), 2.0)],
                                 ),
                             ],

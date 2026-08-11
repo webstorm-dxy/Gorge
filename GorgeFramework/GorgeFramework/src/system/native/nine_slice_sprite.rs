@@ -16,28 +16,19 @@ pub struct NineSliceSprite {
     pub alive: bool,
     #[gorge_field]
     pub existence_reference: usize,
+    /// 局部位置（Vector3 对象 ID）
     #[gorge_field]
-    pub position_x: f32,
-    #[gorge_field]
-    pub position_y: f32,
-    #[gorge_field]
-    pub position_z: f32,
+    pub position: usize,
     #[gorge_field]
     pub position_reference: usize,
+    /// 局部旋转（Vector3 对象 ID）
     #[gorge_field]
-    pub rotation_x: f32,
-    #[gorge_field]
-    pub rotation_y: f32,
-    #[gorge_field]
-    pub rotation_z: f32,
+    pub rotation: usize,
     #[gorge_field]
     pub rotation_reference: usize,
+    /// 局部缩放（Vector3 对象 ID）
     #[gorge_field]
-    pub size_x: f32,
-    #[gorge_field]
-    pub size_y: f32,
-    #[gorge_field]
-    pub size_z: f32,
+    pub size: usize,
     #[gorge_field]
     pub size_reference: usize,
     // ---- NineSliceSprite 专属字段 ----
@@ -68,17 +59,11 @@ impl NineSliceSprite {
         // Node 字段初始化
         ctx.set_object_bool_field(this, NineSliceSprite::FIELD_INDEX_alive, true);
         ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_existence_reference, 0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_position_x, 0.0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_position_y, 0.0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_position_z, 0.0);
+        ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_position, 0);
         ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_position_reference, 0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_rotation_x, 0.0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_rotation_y, 0.0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_rotation_z, 0.0);
+        ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_rotation, 0);
         ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_rotation_reference, 0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_size_x, 1.0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_size_y, 1.0);
-        ctx.set_object_float_field(this, NineSliceSprite::FIELD_INDEX_size_z, 1.0);
+        ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_size, 0);
         ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_size_reference, 0);
         // 专属字段
         ctx.set_object_object_field(this, NineSliceSprite::FIELD_INDEX_graph, graph);
@@ -124,15 +109,15 @@ impl NineSliceSprite {
             return;
         }
 
-        let px = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_position_x) as f32;
-        let py = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_position_y) as f32;
-        let pz = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_position_z) as f32;
-        let rx = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_rotation_x) as f32;
-        let ry = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_rotation_y) as f32;
-        let rz = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_rotation_z) as f32;
-        let sx = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_size_x) as f32;
-        let sy = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_size_y) as f32;
-        let sz = ctx.get_object_float_field(this, NineSliceSprite::FIELD_INDEX_size_z) as f32;
+        let (px, py, pz) = crate::system::native::node_native::Node::read_vec3_field(
+            ctx, this, NineSliceSprite::FIELD_INDEX_position, false,
+        );
+        let (rx, ry, rz) = crate::system::native::node_native::Node::read_vec3_field(
+            ctx, this, NineSliceSprite::FIELD_INDEX_rotation, false,
+        );
+        let (sx, sy, sz) = crate::system::native::node_native::Node::read_vec3_field(
+            ctx, this, NineSliceSprite::FIELD_INDEX_size, true,
+        );
         let color_id = ctx.get_object_object_field(this, NineSliceSprite::FIELD_INDEX_color);
         let hsl_id = ctx.get_object_object_field(this, NineSliceSprite::FIELD_INDEX_hsl);
         let (ca, cr, cg, cb) = read_color_channels(ctx, color_id);
@@ -179,9 +164,9 @@ mod tests {
     fn make_nss() -> NineSliceSprite {
         NineSliceSprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, slice_left_top: 0, slice_right_bottom: 0, base_size: 0, color: 0, hsl: 0,
         }
     }

@@ -117,6 +117,8 @@ pub struct DelegateImpl {
 pub struct InjectorFieldDef {
     pub name: String,
     pub value_type: ValueType,
+    /// 是否为数组字段（如 `FunctionCurve^[]`），用于单对象自动包装为数组
+    pub is_array: bool,
     pub has_default: bool,
     /// 默认值常量（G4）：@Inject(default = expr) 的编译时常量值
     pub default_value: Option<InjectorConstField>,
@@ -147,9 +149,12 @@ pub enum InjectorConstField {
     /// 对象引用（运行时对象 ID，由 VM 在常量实例化时填充）
     Object(String, usize),
     /// 嵌套的注入器对象常量 `{ field: val, ... }`
-    InjectObject(String, Vec<InjectorConstField>),
-    /// 注入器数组常量 `[elem1, elem2, ...]`
-    Array(Vec<InjectorConstField>),
+    ///
+    /// 参数：类名、外层字段名（顶层注入器为 ""，用于谱面提取时按名字
+    /// 恢复字段，避免源码跳过对象字段时按声明位置对齐错位）、嵌套字段。
+    InjectObject(String, String, Vec<InjectorConstField>),
+    /// 注入器数组常量 `[elem1, elem2, ...]`（参数：外层字段名、元素）
+    Array(String, Vec<InjectorConstField>),
 }
 
 /// 字节码魔数："GORG"
@@ -460,6 +465,7 @@ fn serialize_compiled_class(class: &CompiledClass, buf: &mut Vec<u8>) -> Bytecod
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(name_bytes);
         buf.push(value_type_to_u8(field.value_type));
+        buf.push(if field.is_array { 1 } else { 0 });
         buf.push(if field.has_default { 1 } else { 0 });
         // G4: 若存在默认值，序列化常量字段
         if let Some(dv) = &field.default_value {
@@ -649,12 +655,14 @@ fn serialize_const_fields(fields: &[InjectorConstField], buf: &mut Vec<u8>) {
                 buf.push(4); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
                 buf.extend_from_slice(&(*v as u32).to_le_bytes());
             }
-            InjectorConstField::InjectObject(name, nested) => {
+            InjectorConstField::InjectObject(name, field_name, nested) => {
                 buf.push(5); let nb = name.as_bytes(); buf.extend_from_slice(&(nb.len() as u16).to_le_bytes()); buf.extend_from_slice(nb);
+                let fb = field_name.as_bytes(); buf.extend_from_slice(&(fb.len() as u16).to_le_bytes()); buf.extend_from_slice(fb);
                 serialize_const_fields(nested, buf);
             }
-            InjectorConstField::Array(elements) => {
+            InjectorConstField::Array(field_name, elements) => {
                 buf.push(6);
+                let fb = field_name.as_bytes(); buf.extend_from_slice(&(fb.len() as u16).to_le_bytes()); buf.extend_from_slice(fb);
                 serialize_const_fields(elements, buf);
             }
         }
@@ -831,8 +839,24 @@ fn deserialize_const_fields(data: &[u8], pos: &mut usize) -> BytecodeResult<Vec<
             2 => { if *pos + 1 > data.len() { return Err("读取bool字段值越界".into()); } let v = data[*pos] != 0; *pos += 1; fields.push(InjectorConstField::Bool(fname, v)); }
             3 => { if *pos + 2 > data.len() { return Err("读取string字段长度越界".into()); } let slen = u16::from_le_bytes([data[*pos],data[*pos+1]]) as usize; *pos += 2; if *pos + slen > data.len() { return Err("读取string字段越界".into()); } let sv = String::from_utf8_lossy(&data[*pos..*pos+slen]).to_string(); *pos += slen; fields.push(InjectorConstField::String(fname, sv)); }
             4 => { if *pos + 4 > data.len() { return Err("读取object字段值越界".into()); } let v = u32::from_le_bytes([data[*pos],data[*pos+1],data[*pos+2],data[*pos+3]]) as usize; *pos += 4; fields.push(InjectorConstField::Object(fname, v)); }
-            5 => { let nested = deserialize_const_fields(data, pos)?; fields.push(InjectorConstField::InjectObject(fname, nested)); }
-            6 => { let elements = deserialize_const_fields(data, pos)?; fields.push(InjectorConstField::Array(elements)); }
+            5 => {
+                if *pos + 2 > data.len() { return Err("读取对象字段名长度越界".into()); }
+                let flen = u16::from_le_bytes([data[*pos], data[*pos+1]]) as usize; *pos += 2;
+                if *pos + flen > data.len() { return Err("读取对象字段名越界".into()); }
+                let field_name = String::from_utf8_lossy(&data[*pos..*pos+flen]).to_string();
+                *pos += flen;
+                let nested = deserialize_const_fields(data, pos)?;
+                fields.push(InjectorConstField::InjectObject(fname, field_name, nested));
+            }
+            6 => {
+                if *pos + 2 > data.len() { return Err("读取数组字段名长度越界".into()); }
+                let flen = u16::from_le_bytes([data[*pos], data[*pos+1]]) as usize; *pos += 2;
+                if *pos + flen > data.len() { return Err("读取数组字段名越界".into()); }
+                let field_name = String::from_utf8_lossy(&data[*pos..*pos+flen]).to_string();
+                *pos += flen;
+                let elements = deserialize_const_fields(data, pos)?;
+                fields.push(InjectorConstField::Array(field_name, elements));
+            }
             _ => return Err("未知注入器常量字段类型".into()),
         }
     }
@@ -976,6 +1000,8 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize, _version: u16) -> Byt
         if pos + 2 > data.len() { return Err("读取注入器字段类型越界".into()); }
         let vt = u8_to_value_type(data[pos]);
         pos += 1;
+        let is_array = data[pos] == 1;
+        pos += 1;
         let has_default = data[pos] == 1;
         pos += 1;
         // G4: 读取默认值常量字段
@@ -987,7 +1013,7 @@ fn deserialize_compiled_class(data: &[u8], mut pos: usize, _version: u16) -> Byt
             if pos + 2 <= data.len() { pos += 2; }
             None
         };
-        injector_fields.push(InjectorFieldDef { name, value_type: vt, has_default, default_value });
+        injector_fields.push(InjectorFieldDef { name, value_type: vt, is_array, has_default, default_value });
     }
 
     // 委托实现
@@ -1715,8 +1741,8 @@ mod tests {
             }],
             constructors: vec![],
             injector_fields: vec![
-                InjectorFieldDef { name: "hitTime".into(), value_type: ValueType::Float, has_default: true, default_value: None },
-                InjectorFieldDef { name: "position".into(), value_type: ValueType::Object, has_default: false, default_value: None },
+                InjectorFieldDef { name: "hitTime".into(), value_type: ValueType::Float, is_array: false, has_default: true, default_value: None },
+                InjectorFieldDef { name: "position".into(), value_type: ValueType::Object, is_array: false, has_default: false, default_value: None },
             ],
             delegate_impls: vec![],
             method_start_id: 0,

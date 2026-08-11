@@ -12,7 +12,7 @@ use gorge_compiler::frontend::lexer;
 use gorge_compiler::frontend::parser::Parser;
 
 use gorge_core::diagnostics::Diagnostics;
-use gorge_core::objective::bytecode::{CompiledClass, CompiledModule};
+use gorge_core::objective::bytecode::{CompiledClass, CompiledModule, InjectorConstField};
 use gorge_core::objective::class::RuntimeClass;
 use gorge_core::objective::declaration::{ClassDeclaration, InjectorFieldInfo};
 use gorge_core::objective::types::{BasicType, GorgeType, TypeCount};
@@ -141,18 +141,17 @@ fn register_all_native_classes(vm: &mut VirtualMachine) {
 
 /// 将编译模块中的类注册到 VM
 ///
-/// 逻辑与 GorgeRunner 完全一致：按继承深度排序 → 注册方法 → 注册字段计数 →
-/// 注册字段初始化器（Phase P）→ 注册父类 → 构造 RuntimeClass → 注册委托（V5）。
+/// 按继承深度排序 → 注册方法 → 注册字段计数 → 注册字段初始化器（Phase P）→
+/// 注册父类 → 构造 RuntimeClass → 注册委托（V5）。native 类同样需要把编译期
+/// 声明注册到 class_table，供动态注入器构造读取继承后的构造映射与全局起始 ID。
 fn register_module_to_vm(vm: &mut VirtualMachine, module: &CompiledModule) {
     let compiled_map: HashMap<String, &CompiledClass> = module
         .classes
         .iter()
-        .filter(|c| !c.is_native)
         .map(|c| (simple_name(&c.class_type.full_name()), c))
         .collect();
 
-    let mut ordered: Vec<&CompiledClass> =
-        module.classes.iter().filter(|c| !c.is_native).collect();
+    let mut ordered: Vec<&CompiledClass> = module.classes.iter().collect();
     ordered.sort_by_key(|c| {
         let mut depth = 0;
         let mut cur = c.super_class_name.clone();
@@ -222,7 +221,9 @@ fn register_module_to_vm(vm: &mut VirtualMachine, module: &CompiledModule) {
         injector_fields.extend(cc.injector_fields.iter().map(|field| InjectorFieldInfo {
                 name: field.name.clone(),
                 field_type: injector_field_type(field.value_type),
+                is_array: field.is_array,
                 has_default_value: field.has_default,
+                default_value: field.default_value.clone(),
             }));
         let mut injector_field_type_count = sa.as_ref()
             .map(|parent| parent.declaration.injector_field_type_count.clone())
@@ -236,10 +237,25 @@ fn register_module_to_vm(vm: &mut VirtualMachine, module: &CompiledModule) {
                 ValueType::Object => injector_field_type_count.object_count += 1,
             }
         }
+        // G4: 统计各类型注入器默认值数量（对齐 vm_main.rs）。
+        // 元素构造时 `LoadIntInjectorField` 等会按字段是否声明默认值
+        // 读取 `injector_defaults`，容量不足会直接 panic。
+        let mut default_type_count = TypeCount::zero();
+        for field in &cc.injector_fields {
+            if field.default_value.is_some() {
+                match field.value_type {
+                    ValueType::Int => default_type_count.int_count += 1,
+                    ValueType::Float => default_type_count.float_count += 1,
+                    ValueType::Bool => default_type_count.bool_count += 1,
+                    ValueType::String => default_type_count.string_count += 1,
+                    ValueType::Object => default_type_count.object_count += 1,
+                }
+            }
+        }
 
         let decl = ClassDeclaration {
             class_type: cc.class_type.clone(),
-            is_native: false,
+            is_native: cc.is_native,
             annotations: vec![],
             fields: vec![],
             methods: vec![],
@@ -253,7 +269,7 @@ fn register_module_to_vm(vm: &mut VirtualMachine, module: &CompiledModule) {
             static_method_count: 0,
             constructor_count: cc.constructors.len(),
             injector_field_type_count,
-            injector_field_default_value_type_count: TypeCount::zero(),
+            injector_field_default_value_type_count: default_type_count,
             method_start_id: cc.method_start_id,
             constructor_start_id: cc.constructor_start_id,
             interface_method_impl_id: iface_map,
@@ -264,6 +280,25 @@ fn register_module_to_vm(vm: &mut VirtualMachine, module: &CompiledModule) {
         };
 
         let mut rc = RuntimeClass::new(decl, sa);
+        // G4: 将注入器字段默认值写入 RuntimeClass.injector_defaults，
+        // 使谱面 JSON 未显式提供的字段（如 leadTime 默认 1.5）能取到默认值。
+        for field in &cc.injector_fields {
+            if let Some(ref dv) = field.default_value {
+                // 计算当前字段在同类型默认值中的偏移
+                let mut idx = 0;
+                for fd in &cc.injector_fields {
+                    if fd.name == field.name { break; }
+                    if fd.default_value.is_some() && fd.value_type == field.value_type { idx += 1; }
+                }
+                match (field.value_type, dv) {
+                    (ValueType::Int, InjectorConstField::Int(_, v)) => rc.injector_defaults.set_int(idx, *v),
+                    (ValueType::Float, InjectorConstField::Float(_, v)) => rc.injector_defaults.set_float(idx, *v),
+                    (ValueType::Bool, InjectorConstField::Bool(_, v)) => rc.injector_defaults.set_bool(idx, *v),
+                    (ValueType::String, InjectorConstField::String(_, v)) => rc.injector_defaults.set_string(idx, v.clone()),
+                    _ => {}
+                }
+            }
+        }
         for (i, m) in cc.methods.iter().enumerate() {
             rc.register_method(i, m.clone());
         }
@@ -366,7 +401,10 @@ impl GameLoader {
 
         // 6. 提取仿真资源
         self.runtime_manager
-            .extract_simulation_resources(0.0, 100.0, 1.0, &mut self.vm);
+            // 起始谱面时间对齐 C# 参考实现（RuntimeManager.cs: `new SimulationScore(-1, ...)`）：
+            // 从 -1s 起步，保证 generateTime=0 的轨道（严格 `time > chart_from` 判定）
+            // 在仿真开始时被正常生成，音符 FindAliveLane 才能找到判定线。
+            .extract_simulation_resources(-1.0, 100.0, 1.0, &mut self.vm);
 
         // 7. 资产加载
         eprintln!("[Gorge] 6/7 加载资产...");
@@ -380,7 +418,10 @@ impl GameLoader {
         // 8. 初始化并启动仿真
         eprintln!("[Gorge] 7/7 启动仿真...");
         self.runtime_manager
-            .create_simulation_runtime(0.0, 100.0, 1.0, None);
+            // 仿真机起始谱面时间与谱面资源一致（C# 参考为 -1s）：
+            // 若 SimulationMachine 仍从 0 起步，generateTime=0 的轨道会因
+            // 严格 `time > chart_from` 判定被跳过，音符 FindAliveLane 找不到判定线。
+            .create_simulation_runtime(-1.0, 100.0, 1.0, None);
         self.runtime_manager.load_score(&mut self.vm);
         self.runtime_manager.start_simulation(&mut self.vm);
         let score_element_count = self
@@ -436,9 +477,39 @@ impl GameLoader {
         // 每 2 秒打印一次音频播放状态（开发诊断：验证 SongSimulator 播放触发）
         if self.simulation_time - self.last_audio_diagnostic >= 2.0 {
             self.last_audio_diagnostic = self.simulation_time;
+            let (alive, nodes) = self.runtime_manager.simulation_runtime.as_ref()
+                .map(|runtime| (runtime.chart.alive_elements.len(), runtime.graphics.nodes.len()))
+                .unwrap_or((0, 0));
+            let chart_time = self.runtime_manager.machine.as_ref()
+                .map(|machine| machine.chart_time)
+                .unwrap_or(0.0);
+            let next_generate_time = self.runtime_manager.simulation_runtime.as_ref()
+                .and_then(|runtime| runtime.chart.forward_timed_generate_list.iter()
+                    .map(|(time, _, _)| *time)
+                    .filter(|time| *time > chart_time)
+                    .min_by(|left, right| left.total_cmp(right)));
+            let generate_time_range = self.runtime_manager.simulation_runtime.as_ref()
+                .and_then(|runtime| {
+                    let minimum = runtime.chart.forward_timed_generate_list.iter()
+                        .map(|(time, _, _)| *time)
+                        .min_by(|left, right| left.total_cmp(right))?;
+                    let maximum = runtime.chart.forward_timed_generate_list.iter()
+                        .map(|(time, _, _)| *time)
+                        .max_by(|left, right| left.total_cmp(right))?;
+                    Some((minimum, maximum))
+                });
+            let (_, sprites, nine_slices, curves) = adaptor::render_resource_counts();
             eprintln!(
-                "[Gorge] t={:.2} 音频: {}",
+                "[Gorge] t={:.2} chart_time={:.2} generate_range={:?} next_generate={:?} alive={} nodes={} sprites={} nine_slices={} curves={} 音频: {}",
                 self.simulation_time,
+                chart_time,
+                generate_time_range,
+                next_generate_time,
+                alive,
+                nodes,
+                sprites,
+                nine_slices,
+                curves,
                 adaptor::audio_playback_diagnostics()
             );
         }
@@ -447,5 +518,118 @@ impl GameLoader {
     /// 返回当前仿真时间（秒）
     pub fn simulation_time(&self) -> f32 {
         self.simulation_time
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 加载真实 Dremu 包并用无头平台验证元素、节点和渲染对象确实被创建。
+    #[test]
+    #[ignore = "读取真实谱面资源，作为发布前端到端验收单独运行"]
+    fn dremu_load_creates_visible_elements_with_headless_platform() {
+        use gorge_framework::adaptor::{install_platform, CallEntry, HeadlessPlatform};
+        use gorge_core::system::native::injector::Injector;
+
+        let platform = HeadlessPlatform::new();
+        let call_log = platform.call_log();
+        install_platform(Box::new(platform));
+
+        let mut loader = GameLoader::new();
+        loader.load_all().expect("真实 Dremu 包应能完整加载");
+
+        let runtime = loader.runtime_manager.simulation_runtime.as_ref()
+            .expect("应创建仿真运行时");
+
+        // 1. 生成时间必须非零（此前 Lambda 隐藏方法返回委托对象导致全 0）
+        assert!(
+            !runtime.chart.forward_timed_generate_list.is_empty(),
+            "应存在待生成元素",
+        );
+        assert!(
+            runtime.chart.forward_timed_generate_list.iter().any(|(t, _, _)| *t != 0.0),
+            "生成时间不得全为 0",
+        );
+
+        // 2. 手动实例化首元素（DremuMainLane）与引导轨道，验证完整构造链
+        let (_, injector_id, constructor_id) = runtime.chart.forward_timed_generate_list[0];
+        let class_name = loader.vm.injectors.get(&injector_id)
+            .map(|inj| inj.injection_class_declaration().class_type.full_name())
+            .expect("元素注入器应存在");
+        loader.vm.instantiate_with_injector(&class_name, constructor_id, injector_id)
+            .unwrap_or_else(|error| panic!("首个真实元素构造失败: {}", error));
+
+        if let Some((_t, guide_injector_id, guide_ctor_id)) = runtime.chart.forward_timed_generate_list.iter()
+            .find(|(_, inj_id, _)| loader.vm.injectors.get(inj_id)
+                .map(|inj| inj.injection_class_declaration().class_type.name().contains("GuideLane"))
+                .unwrap_or(false))
+            .copied()
+        {
+            let guide_class = loader.vm.injectors.get(&guide_injector_id)
+                .map(|inj| inj.injection_class_declaration().class_type.full_name())
+                .unwrap_or_default();
+            loader.vm.instantiate_with_injector(&guide_class, guide_ctor_id, guide_injector_id)
+                .unwrap_or_else(|error| panic!("引导轨道构造失败: {}", error));
+        }
+
+        // 3. 驱动仿真 30 秒：真实谱面唯一的长寿命轨道（ArtLine6.5）只在
+        //    7.37s~7.58s 存活，因此用峰值跟踪而不是终点状态验收
+        let mut peak_alive = 0usize;
+        let mut peak_nodes = 0usize;
+        for _ in 0..300 {
+            loader.drive(0.1);
+            if let Some(runtime) = loader.runtime_manager.simulation_runtime.as_ref() {
+                peak_alive = peak_alive.max(runtime.chart.alive_elements.len());
+                peak_nodes = peak_nodes.max(runtime.graphics.nodes.len());
+            }
+        }
+        assert!(peak_alive > 0, "仿真过程中应至少生成过一个元素");
+        assert!(peak_nodes > 0, "仿真过程中应登记过图形节点");
+
+        // 4. 渲染调用日志是累计记录：轨道生命周期内创建的精灵必须出现
+        let calls = call_log.lock().unwrap();
+        assert!(calls.iter().any(|entry| matches!(
+            entry,
+            CallEntry::CreateSprite { .. }
+                | CallEntry::CreateNineSliceSprite { .. }
+                | CallEntry::CreateCurveSprite { .. }
+        )), "应创建至少一种可渲染精灵");
+
+        // 5. 判定线（CurveSprite）必须把真实曲线点坐标上传到平台：
+        //    只传点数会导致平台 points 全为 (0,0)，画面画不出判定线。
+        assert!(calls.iter().any(|entry| matches!(
+            entry,
+            CallEntry::CurveSetPoints { points, .. } if points.iter().any(|(x, y)| *x != 0.0 || *y != 0.0)
+        )), "应上传至少一个非零曲线点坐标（判定线可见性验收）");
+    }
+
+    #[test]
+    fn register_module_to_vm_keeps_native_injector_constructor_metadata() {
+        let (tokens, lexer_diagnostics) = lexer::tokenize(r#"
+native class BaseCurve
+{
+    injector BaseCurve();
+}
+native class ConcreteCurve : BaseCurve
+{
+    ConcreteCurve();
+}
+"#, 0);
+        assert!(lexer_diagnostics.is_empty());
+        let source = Parser::new(tokens)
+            .parse_source_file()
+            .expect("native 注入器构造测试源码应能解析");
+        let module = compile_sources(&[source], false)
+            .expect("native 子类应能继承注入器构造契约");
+
+        let mut vm = VirtualMachine::new();
+        register_module_to_vm(&mut vm, &module);
+
+        let concrete = vm.class_table.get("ConcreteCurve")
+            .expect("native 编译声明应注册到 class_table");
+        assert!(concrete.declaration.is_native);
+        assert_eq!(concrete.declaration.constructor_start_id, 1);
+        assert_eq!(concrete.declaration.injector_constructor_impl_id, vec![1]);
     }
 }

@@ -30,70 +30,62 @@ pub struct Node {
     /// 存活依赖（Node 对象 ID，0=无）
     #[gorge_field]
     pub existence_reference: usize,
-    /// 局部位置 x
+    /// 局部位置（Vector3 对象 ID，0=零向量）
     #[gorge_field]
-    pub position_x: f32,
-    /// 局部位置 y
-    #[gorge_field]
-    pub position_y: f32,
-    /// 局部位置 z
-    #[gorge_field]
-    pub position_z: f32,
+    pub position: usize,
     /// 位置引用（Node 对象 ID，0=使用自己的 position）
     #[gorge_field]
     pub position_reference: usize,
-    /// 局部旋转 x（弧度）
+    /// 局部旋转（Vector3 对象 ID，欧拉角弧度，0=零向量）
     #[gorge_field]
-    pub rotation_x: f32,
-    /// 局部旋转 y
-    #[gorge_field]
-    pub rotation_y: f32,
-    /// 局部旋转 z
-    #[gorge_field]
-    pub rotation_z: f32,
+    pub rotation: usize,
     /// 旋转引用
     #[gorge_field]
     pub rotation_reference: usize,
-    /// 局部缩放 x
+    /// 局部缩放（Vector3 对象 ID，0=单位向量）
     #[gorge_field]
-    pub size_x: f32,
-    /// 局部缩放 y
-    #[gorge_field]
-    pub size_y: f32,
-    /// 局部缩放 z
-    #[gorge_field]
-    pub size_z: f32,
+    pub size: usize,
     /// 缩放引用
     #[gorge_field]
     pub size_reference: usize,
 }
 
 impl Node {
-    /// 读取节点位置
+    /// 读取节点位置/旋转/缩放所引用的 Vector3 对象字段
+    ///
+    /// 供 Node 及派生渲染类（Sprite/NineSliceSprite/CurveSprite）复用：
+    /// Gorge 声明中这些字段是 Vector3 对象，运行时存对象 ID，0 表示
+    /// 零向量；`default_to_one` 为 true 时缺失按单位向量处理（缩放语义）。
+    pub(crate) fn read_vec3_field(
+        ctx: &NativeContext,
+        node_id: usize,
+        field_index: usize,
+        default_to_one: bool,
+    ) -> (f32, f32, f32) {
+        let vec3_id = ctx.get_object_object_field(node_id, field_index);
+        if vec3_id == 0 {
+            return if default_to_one { (1.0, 1.0, 1.0) } else { (0.0, 0.0, 0.0) };
+        }
+        (
+            ctx.get_object_float_field(vec3_id, 0) as f32,
+            ctx.get_object_float_field(vec3_id, 1) as f32,
+            ctx.get_object_float_field(vec3_id, 2) as f32,
+        )
+    }
+
+    /// 读取节点局部位置（Vector3 对象字段 0/1/2；对象缺失按零向量处理）
     fn read_position(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
-        (
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_position_x) as f32,
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_position_y) as f32,
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_position_z) as f32,
-        )
+        Self::read_vec3_field(ctx, node_id, Node::FIELD_INDEX_position, false)
     }
 
-    /// 读取节点旋转
+    /// 读取节点局部旋转（Vector3 对象字段 0/1/2）
     fn read_rotation(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
-        (
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_rotation_x) as f32,
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_rotation_y) as f32,
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_rotation_z) as f32,
-        )
+        Self::read_vec3_field(ctx, node_id, Node::FIELD_INDEX_rotation, false)
     }
 
-    /// 读取节点缩放
+    /// 读取节点局部缩放（Vector3 对象字段 0/1/2；对象缺失按单位向量处理）
     fn read_size(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
-        (
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_size_x) as f32,
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_size_y) as f32,
-            ctx.get_object_float_field(node_id, Node::FIELD_INDEX_size_z) as f32,
-        )
+        Self::read_vec3_field(ctx, node_id, Node::FIELD_INDEX_size, true)
     }
 
     /// 读取节点存活引用
@@ -205,7 +197,7 @@ impl Node {
 // ==================== 内联辅助函数 ====================
 
 /// 计算节点全局位置（递归沿 position_reference 父链）
-fn calc_global_position(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
+pub(crate) fn calc_global_position(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
     let ref_id = ctx.get_object_object_field(node_id, Node::FIELD_INDEX_position_reference);
     if ref_id == 0 {
         return Node::read_position(ctx, node_id);
@@ -222,7 +214,7 @@ fn calc_global_position(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) 
 }
 
 /// 计算节点全局旋转（递归沿 rotation_reference 父链，角度相加）
-fn calc_global_rotation(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
+pub(crate) fn calc_global_rotation(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
     let ref_id = ctx.get_object_object_field(node_id, Node::FIELD_INDEX_rotation_reference);
     if ref_id == 0 {
         return Node::read_rotation(ctx, node_id);
@@ -234,7 +226,7 @@ fn calc_global_rotation(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) 
 }
 
 /// 计算节点全局缩放（递归沿 size_reference 父链，连乘）
-fn calc_global_size(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
+pub(crate) fn calc_global_size(ctx: &NativeContext, node_id: usize) -> (f32, f32, f32) {
     let ref_id = ctx.get_object_object_field(node_id, Node::FIELD_INDEX_size_reference);
     if ref_id == 0 {
         return Node::read_size(ctx, node_id);
@@ -320,6 +312,27 @@ mod tests {
             NativeContext::new(&mut self.vm)
         }
 
+        /// 创建 Vector3 对象（float 字段 0/1/2 = x/y/z）
+        fn make_vec3(&mut self, x: f32, y: f32, z: f32) -> usize {
+            let id = self.vm.next_object_id;
+            self.vm.next_object_id += 1;
+            let object = RuntimeObject::new_simple(
+                "GorgeFramework.Vector3".to_string(),
+                &gorge_core::objective::types::TypeCount {
+                    float_count: 3,
+                    ..gorge_core::objective::types::TypeCount::zero()
+                },
+            );
+            self.vm.objects.insert(id, object);
+            {
+                let obj = self.vm.objects.get_mut(&id).unwrap();
+                obj.set_float_field(0, x as f64);
+                obj.set_float_field(1, y as f64);
+                obj.set_float_field(2, z as f64);
+            }
+            id
+        }
+
         fn make_node(
             &mut self,
             px: f32, py: f32, pz: f32,
@@ -327,14 +340,17 @@ mod tests {
             sx: f32, sy: f32, sz: f32,
             pos_ref: usize, rot_ref: usize, size_ref: usize,
         ) -> usize {
+            let position = self.make_vec3(px, py, pz);
+            let rotation = self.make_vec3(rx, ry, rz);
+            let size = self.make_vec3(sx, sy, sz);
             let n = Node {
                 alive: true,
                 existence_reference: 0,
-                position_x: px, position_y: py, position_z: pz,
+                position,
                 position_reference: pos_ref,
-                rotation_x: rx, rotation_y: ry, rotation_z: rz,
+                rotation,
                 rotation_reference: rot_ref,
-                size_x: sx, size_y: sy, size_z: sz,
+                size,
                 size_reference: size_ref,
             };
             // Node 无构造方法，需手动设置字段
@@ -349,27 +365,15 @@ mod tests {
             self.vm.objects.get_mut(&id).unwrap()
                 .set_object_field(Node::FIELD_INDEX_existence_reference, 0);
             self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_position_x, px as f64);
-            self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_position_y, py as f64);
-            self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_position_z, pz as f64);
+                .set_object_field(Node::FIELD_INDEX_position, position);
             self.vm.objects.get_mut(&id).unwrap()
                 .set_object_field(Node::FIELD_INDEX_position_reference, pos_ref);
             self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_rotation_x, rx as f64);
-            self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_rotation_y, ry as f64);
-            self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_rotation_z, rz as f64);
+                .set_object_field(Node::FIELD_INDEX_rotation, rotation);
             self.vm.objects.get_mut(&id).unwrap()
                 .set_object_field(Node::FIELD_INDEX_rotation_reference, rot_ref);
             self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_size_x, sx as f64);
-            self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_size_y, sy as f64);
-            self.vm.objects.get_mut(&id).unwrap()
-                .set_float_field(Node::FIELD_INDEX_size_z, sz as f64);
+                .set_object_field(Node::FIELD_INDEX_size, size);
             self.vm.objects.get_mut(&id).unwrap()
                 .set_object_field(Node::FIELD_INDEX_size_reference, size_ref);
             id
@@ -382,11 +386,11 @@ mod tests {
         let n = Node {
             alive: true,
             existence_reference: 0,
-            position_x: 3.0, position_y: 4.0, position_z: 5.0,
+            position: 0,
             position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0,
+            rotation: 0,
             rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0,
+            size: 0,
             size_reference: 0,
         };
         let node_id = fx.make_node(3.0, 4.0, 5.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0, 0, 0);
@@ -453,11 +457,11 @@ mod tests {
         let mut fx = Fixture::new();
         let n = Node {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0,
+            position: 0,
             position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0,
+            rotation: 0,
             rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0,
+            size: 0,
             size_reference: 0,
         };
         // 引用节点（已死亡）
@@ -485,11 +489,11 @@ mod tests {
         let mut fx = Fixture::new();
         let n = Node {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0,
+            position: 0,
             position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0,
+            rotation: 0,
             rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0,
+            size: 0,
             size_reference: 0,
         };
         let node_id = fx.make_node(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0, 0, 0);

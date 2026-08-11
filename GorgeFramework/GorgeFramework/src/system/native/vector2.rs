@@ -20,6 +20,13 @@ pub struct Vector2 {
 
 #[gorge_native_impl]
 impl Vector2 {
+    /// 构造方法 0：无参构造（字段由注入器提供）
+    #[gorge_ctor]
+    pub fn new_empty(ctx: &mut NativeContext, this: usize) {
+        let _ = (ctx, this);
+    }
+
+    /// 构造方法 1：指定 x/y
     #[gorge_ctor]
     pub fn new(ctx: &mut NativeContext, this: usize, x: f32, y: f32) {
         ctx.set_object_float_field(this, Vector2::FIELD_INDEX_x, x as f64);

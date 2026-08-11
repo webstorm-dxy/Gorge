@@ -178,7 +178,12 @@ impl ChartManager {
                 .into_iter().map(|(id, ann)| (id, ann.clone())).collect())
             .unwrap_or_default();
         for (ctor_id, ann) in fwd_ctors {
-            let time = Self::resolve_annotation_time(&ann, &class_name, vm);
+            let time = Self::resolve_annotation_time(
+                &ann,
+                &class_name,
+                gameplay_injector_id,
+                vm,
+            );
             self.forward_timed_generate_list.push((time, gameplay_injector_id, ctor_id));
         }
 
@@ -188,7 +193,12 @@ impl ChartManager {
                 .into_iter().map(|(id, ann)| (id, ann.clone())).collect())
             .unwrap_or_default();
         for (ctor_id, ann) in bwd_ctors {
-            let time = Self::resolve_annotation_time(&ann, &class_name, vm);
+            let time = Self::resolve_annotation_time(
+                &ann,
+                &class_name,
+                gameplay_injector_id,
+                vm,
+            );
             self.backward_timed_generate_list.push((time, gameplay_injector_id, ctor_id));
         }
     }
@@ -358,7 +368,7 @@ impl ChartManager {
                     int_index += 1;
                 }
                 BasicType::Float => {
-                    if let Some(number) = json_scalar(field_value).and_then(serde_json::Value::as_f64) {
+                    if let Some(number) = json_scalar(field_value).and_then(json_value_as_f64) {
                         injector.set_injector_float(float_index, number);
                     }
                     float_index += 1;
@@ -376,8 +386,30 @@ impl ChartManager {
                     string_index += 1;
                 }
                 BasicType::Object | BasicType::Interface | BasicType::Delegate => {
-                    if let Some(nested) = field_value.and_then(|v| self.materialize_injector(v, vm)) {
-                        injector.set_injector_object(object_index, nested);
+                    // 数组字段（如 FunctionCurve^[]）：逐元素物化为注入器后
+                    // 统一写入 ObjectArray 编译层包装，供 `arr.length`/`arr[i]` 访问。
+                    if let Some(array) = field_value.and_then(serde_json::Value::as_array) {
+                        let mut item_ids = Vec::with_capacity(array.len());
+                        for item in array {
+                            if let Some(item_id) = self.materialize_injector(item, vm) {
+                                item_ids.push(item_id);
+                            }
+                        }
+                        if let Ok(array_id) = vm.materialize_object_array(&item_ids) {
+                            injector.set_injector_object(object_index, array_id);
+                        }
+                    } else if let Some(nested) = field_value.and_then(|v| self.materialize_injector(v, vm)) {
+                        // 声明为数组但谱面提供单对象（如 laneLines 只给一条
+                        // 曲线）：按 C# 注入器语义自动包装为单元素数组，
+                        // 否则字段初始化器 `new (^field)[^field.length]`
+                        // 会把数组物化为空，判定线曲线全部丢失。
+                        if field.is_array {
+                            if let Ok(array_id) = vm.materialize_object_array(&[nested]) {
+                                injector.set_injector_object(object_index, array_id);
+                            }
+                        } else {
+                            injector.set_injector_object(object_index, nested);
+                        }
                     }
                     object_index += 1;
                 }
@@ -388,6 +420,11 @@ impl ChartManager {
         let injector_id = vm.next_object_id;
         vm.next_object_id += 1;
         vm.injectors.insert(injector_id, injector);
+        // 补齐类声明的默认值（metadata `auto defaultValue`）：JSON 未提供的
+        // 字段（如 animation 的 LinearFunctionCurve 默认值）在这里物化。
+        if let Err(error) = vm.apply_injector_defaults(injector_id) {
+            eprintln!("[Gorge] 注入器默认值物化失败 {}: {}", class_name, error);
+        }
         Some(injector_id)
     }
 
@@ -395,20 +432,56 @@ impl ChartManager {
     fn resolve_annotation_time(
         ann: &gorge_core::objective::declaration::MethodAnnotation,
         class_name: &str,
+        injector_id: usize,
         vm: &mut gorge_core::virtual_machine::vm::VirtualMachine,
     ) -> f32 {
         use gorge_core::objective::declaration::AnnotationValue;
-        match ann.find_parameter("time") {
+        let saved_injector = vm.current_injector;
+        vm.current_injector = Some(injector_id);
+        vm.param_pool.set_object_param(0, injector_id);
+        let time = match ann.find_parameter("time") {
             Some(AnnotationValue::Float(f)) => *f as f32,
             Some(AnnotationValue::Delegate(method_id)) => {
-                if vm.invoke_method_by_id(class_name, None, *method_id).is_ok() {
-                    vm.return_float.unwrap_or(0.0) as f32
-                } else {
-                    0.0
+                match vm.invoke_method_by_id(class_name, None, *method_id) {
+                    Ok(()) => match vm.return_float {
+                        Some(v) => v as f32,
+                        None => {
+                            // 隐藏方法调用成功但未返回 Float（如 Lambda 被编译成
+                            // 返回委托对象）——显式报错，不再静默当作 0。
+                            eprintln!(
+                                "[Gorge] 生成时间委托未返回 Float {}#{} injector={}（return_float 为空）",
+                                class_name,
+                                method_id,
+                                injector_id,
+                            );
+                            0.0
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!(
+                            "[Gorge] 生成时间委托调用失败 {}#{} injector={}: {}",
+                            class_name,
+                            method_id,
+                            injector_id,
+                            error,
+                        );
+                        0.0
+                    }
                 }
             }
-            _ => 0.0,
-        }
+            Some(AnnotationValue::Int(i)) => *i as f32,
+            _ => {
+                // 找不到 time 参数同样需要可见诊断，避免整条生成表静默全 0。
+                eprintln!(
+                    "[Gorge] 注解 `{}` 缺少 time 参数（类 {}），生成时间按 0 处理",
+                    ann.name,
+                    class_name,
+                );
+                0.0
+            }
+        };
+        vm.current_injector = saved_injector;
+        time
     }
 }
 
@@ -464,6 +537,23 @@ fn json_scalar(value: Option<&serde_json::Value>) -> Option<&serde_json::Value> 
     match value {
         Some(serde_json::Value::Object(object)) => object.get("value").or(value),
         _ => value,
+    }
+}
+
+/// 将谱面 JSON 值解析为 f64。
+///
+/// 除标准 JSON 数字外，还支持字符串 `"Infinity"` / `"-Infinity"` / `"NaN"`
+/// ——真实谱面用 `(-1.0/0.0)` 硬编码负无穷，`const_object_to_json` 按约定
+/// 将其序列化为字符串，此处还原为 IEEE 754 浮点值。
+fn json_value_as_f64(value: &serde_json::Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    match value.as_str() {
+        Some("Infinity") => Some(f64::INFINITY),
+        Some("-Infinity") => Some(f64::NEG_INFINITY),
+        Some("NaN") => Some(f64::NAN),
+        _ => None,
     }
 }
 
@@ -1317,6 +1407,26 @@ mod tests {
         SimulationScore::new(0.0, 100.0, 1.0)
     }
 
+    /// 谱面 JSON 中按字符串约定编码的 ±Infinity/NaN 必须还原为 IEEE 754
+    /// 浮点值（真实谱面 `(-1.0/0.0)` 折叠后经 const_object_to_json 输出）。
+    #[test]
+    fn test_json_value_as_f64_restores_non_finite_strings() {
+        assert_eq!(
+            json_value_as_f64(&serde_json::json!("-Infinity")),
+            Some(f64::NEG_INFINITY),
+        );
+        assert_eq!(
+            json_value_as_f64(&serde_json::json!("Infinity")),
+            Some(f64::INFINITY),
+        );
+        assert!(json_value_as_f64(&serde_json::json!("NaN")).unwrap().is_nan());
+        assert_eq!(
+            json_value_as_f64(&serde_json::json!(3.25)),
+            Some(3.25),
+        );
+        assert_eq!(json_value_as_f64(&serde_json::json!("其他")), None);
+    }
+
     /// 构造测试用 SimulationMachine（与 empty_score 的时间范围一致）
     fn test_machine() -> crate::runtime::simulation_machine::SimulationMachine {
         crate::runtime::simulation_machine::SimulationMachine::new(0.0, 100.0, 1.0)
@@ -1548,7 +1658,9 @@ mod tests {
         declaration.injector_fields.push(InjectorFieldInfo {
             name: "value".into(),
             field_type: GorgeType::new(BasicType::Int),
+            is_array: false,
             has_default_value: false,
+            default_value: None,
         });
         declaration.injector_field_type_count = TypeCount { int_count: 1, ..TypeCount::zero() };
         declaration.field_type_count = TypeCount { object_count: 5, ..TypeCount::zero() };
@@ -1620,7 +1732,9 @@ mod tests {
         base_decl.injector_fields.push(InjectorFieldInfo {
             name: "fvalue".into(),
             field_type: GorgeType::new(BasicType::Float),
+            is_array: false,
             has_default_value: false,
+            default_value: None,
         });
         base_decl.injector_field_type_count = TypeCount { float_count: 1, ..TypeCount::zero() };
         base_decl.method_count = 1;
@@ -1688,7 +1802,9 @@ mod tests {
         child_decl.injector_fields.push(InjectorFieldInfo {
             name: "value".into(),
             field_type: GorgeType::new(BasicType::Int),
+            is_array: false,
             has_default_value: false,
+            default_value: None,
         });
         child_decl.injector_field_type_count = TypeCount {
             int_count: 1, float_count: 1, ..TypeCount::zero()
@@ -1808,6 +1924,156 @@ mod tests {
             "非元素类不应进入初始化创生表");
         assert!(runtime.chart.forward_timed_generate_list.is_empty());
         assert!(runtime.chart.backward_timed_generate_list.is_empty());
+    }
+
+    /// 回归：@ForwardTimedGenerate 的 time 是隐藏方法 Delegate（编译器把
+    /// Lambda 函数体编译进隐藏方法返回 float）。框架解析必须拿到非零
+    /// 真实时间（hitTime - leadTime），而不是静默 0。
+    ///
+    /// 此前隐藏方法被错误编译为“返回委托对象”，return_float 为空，
+    /// `resolve_annotation_time` 静默 `unwrap_or(0.0)` 导致生成表全 0。
+    #[test]
+    fn test_add_score_element_lambda_time_delegate_resolves_nonzero() {
+        use gorge_core::diagnostics::Span;
+        use gorge_core::objective::class::RuntimeClass;
+        use gorge_core::objective::declaration::{AnnotationValue, InjectorFieldInfo, MethodAnnotation};
+        use gorge_core::objective::types::{GorgeType, TypeCount};
+        use gorge_core::virtual_machine::ir::{
+            Address, CodeWithSpan, CompiledMethod, IntermediateCode, IntermediateOperator,
+            Operand, ValueType,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // 基类链：Demo.Tap → Demo.TapBase → GorgeFramework.Element
+        let mut base_decl = gorge_core::objective::declaration::ClassDeclaration::dummy("Demo.TapBase".into());
+        base_decl.super_class = Some(Box::new(
+            gorge_core::objective::declaration::ClassDeclaration::dummy("GorgeFramework.Element".into()),
+        ));
+        base_decl.injector_fields.push(InjectorFieldInfo {
+            name: "hitTime".into(),
+            field_type: GorgeType::new(BasicType::Float),
+            is_array: false,
+            has_default_value: false,
+            default_value: None,
+        });
+        base_decl.injector_fields.push(InjectorFieldInfo {
+            name: "leadTime".into(),
+            field_type: GorgeType::new(BasicType::Float),
+            is_array: false,
+            has_default_value: false,
+            default_value: None,
+        });
+        base_decl.injector_field_type_count = TypeCount {
+            float_count: 2,
+            ..TypeCount::zero()
+        };
+        let base_class = RuntimeClass::new(base_decl.clone(), None);
+
+        // 子类：构造注解 @ForwardTimedGenerate(time=Delegate(0))。
+        // method_count=1：与真实 loader 一致（methods 含隐藏方法）。
+        let mut child_decl = gorge_core::objective::declaration::ClassDeclaration::dummy("Demo.Tap".into());
+        child_decl.super_class = Some(Box::new(base_decl.clone()));
+        child_decl.constructor_count = 1;
+        child_decl.method_count = 1;
+        // 注入器字段池容量需覆盖继承来的两个 float（hitTime/leadTime）
+        child_decl.injector_field_type_count = TypeCount {
+            float_count: 2,
+            ..TypeCount::zero()
+        };
+        child_decl.constructor_annotations = HashMap::from([(
+            0,
+            vec![MethodAnnotation {
+                name: "ForwardTimedGenerate".into(),
+                parameters: vec![("time".into(), AnnotationValue::Delegate(0))],
+            }],
+        )]);
+
+        // 隐藏方法 IR：`noteInjector.^hitTime - noteInjector.^leadTime` → ReturnFloat
+        let hidden_codes = vec![
+            CodeWithSpan::new(IntermediateCode {
+                result: Some(Address::new(ValueType::Object, 1)),
+                operator: IntermediateOperator::LoadInjector,
+                left: Operand::int(0),
+                right: None,
+            }, Span::dummy()),
+            CodeWithSpan::new(IntermediateCode {
+                result: Some(Address::new(ValueType::Float, 1)),
+                operator: IntermediateOperator::LoadFloatInjectorField(0),
+                left: Operand::Address(Address::new(ValueType::Object, 1)),
+                right: None,
+            }, Span::dummy()),
+            CodeWithSpan::new(IntermediateCode {
+                result: Some(Address::new(ValueType::Float, 2)),
+                operator: IntermediateOperator::LoadFloatInjectorField(1),
+                left: Operand::Address(Address::new(ValueType::Object, 1)),
+                right: None,
+            }, Span::dummy()),
+            CodeWithSpan::new(IntermediateCode {
+                result: Some(Address::new(ValueType::Float, 3)),
+                operator: IntermediateOperator::FloatSub,
+                left: Operand::Address(Address::new(ValueType::Float, 1)),
+                right: Some(Operand::Address(Address::new(ValueType::Float, 2))),
+            }, Span::dummy()),
+            CodeWithSpan::new(IntermediateCode {
+                result: None,
+                operator: IntermediateOperator::ReturnFloat,
+                left: Operand::Address(Address::new(ValueType::Float, 3)),
+                right: None,
+            }, Span::dummy()),
+        ];
+
+        let mut child_class = RuntimeClass::new(child_decl, Some(Arc::new(base_class.clone())));
+        child_class.register_constructor(0, CompiledMethod {
+            name: "ctor".into(),
+            codes: vec![CodeWithSpan::new(IntermediateCode {
+                result: None,
+                operator: IntermediateOperator::ReturnInt,
+                left: Operand::int(0),
+                right: None,
+            }, Span::dummy())],
+            local_count: 0,
+        });
+        child_class.register_method(0, CompiledMethod {
+            name: "__annotation_ForwardTimedGenerate_time".into(),
+            codes: hidden_codes,
+            local_count: 4,
+        });
+
+        let mut vm = gorge_core::virtual_machine::vm::VirtualMachine::new();
+        let child_class = Arc::new(child_class);
+        vm.register_class_super("Demo.Tap", "Demo.TapBase");
+        vm.register_class_super("Demo.TapBase", "GorgeFramework.Element");
+        vm.class_table.insert("Demo.Tap".into(), child_class.clone());
+        vm.class_table.insert("Demo.TapBase".into(), Arc::new(base_class));
+
+        // 谱面记载注入器：hitTime=1.0、leadTime=0.2
+        let original_id = vm.next_object_id;
+        vm.next_object_id += 1;
+        let mut injector = RuntimeInjector::new(Arc::new(child_class.declaration.clone()));
+        injector.set_injector_float(0, 1.0);
+        injector.set_injector_float(1, 0.2);
+        vm.injectors.insert(original_id, injector);
+
+        let mut runtime = GorgeSimulationRuntime::new();
+        let period_config = crate::chart::period::PeriodConfig {
+            time_offset: 0.373,
+            min_length: 10.0,
+            active: true,
+        };
+        runtime.chart.add_score_element(original_id, &period_config, &mut vm);
+
+        assert_eq!(runtime.chart.forward_timed_generate_list.len(), 1);
+        let (time, _gameplay_id, _ctor) = runtime.chart.forward_timed_generate_list[0];
+        // 期望 = hitTime - leadTime = 1.0 - 0.2 = 0.8（非零，且是隐藏方法求值结果）
+        assert!(
+            (time - 0.8).abs() < 0.001,
+            "生成时间应为 0.8，实际 {time}",
+        );
+        assert!(
+            runtime.chart.backward_timed_generate_list.is_empty(),
+            "未声明 BackwardTimedGenerate 不应有反向生成表项",
+        );
     }
 
     #[test]

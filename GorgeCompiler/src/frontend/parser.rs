@@ -1764,6 +1764,27 @@ impl Parser {
                     self.advance(); // [
                     let size = self.parse_expression()?;
                     self.expect_token(&Token::RBracket)?;
+                    // `new laneLines[i](args)`：`[size]` 后紧跟 `(` 说明
+                    // 目标是注入器数组元素（动态构造），而非数组构造。
+                    if self.check(&Token::LParen) {
+                        let array_name = match &class_type {
+                            TypeRef::Simple { name, .. } => name.clone(),
+                            _ => String::new(),
+                        };
+                        let target = Expression::ArrayAccess {
+                            array: Box::new(Expression::Identifier(array_name, span)),
+                            index: Box::new(size),
+                            span,
+                        };
+                        self.advance(); // 消费 (
+                        let args = self.parse_argument_list()?;
+                        self.expect_token(&Token::RParen)?;
+                        return Ok(Expression::DynamicNew {
+                            target: Box::new(target),
+                            args,
+                            span,
+                        });
+                    }
                     let mut args = vec![size];
                     // 可选的数组初始器 { elem1, elem2, ... } 或 {,}（空数组）
                     if self.check(&Token::LBrace) {
@@ -1960,9 +1981,20 @@ impl Parser {
             return Ok(Expression::InjectorObject { class_name: String::new(), fields: Vec::new(), span });
         }
 
-        // 有内容：lookahead 判读是 key:value 对还是纯表达式列表
+        // 有内容：lookahead 判读是 key:value 对还是纯表达式列表。
+        // 键名首字母大写时按「具体类注入器」处理（如
+        // `FunctionCurve^ : {AxialSymmetricFunctionCurve : {...}}` 的
+        // content 是单个具体类对象，不是字段表）；字段名约定小写开头。
         let saved = self.pos;
-        let is_object = self.match_identifier().is_some() && self.check(&Token::Colon);
+        let first_is_class = match self.peek().map(|t| &t.token) {
+            Some(Token::Identifier(name)) if !name.is_empty() => {
+                name.chars().next().unwrap().is_uppercase()
+            }
+            _ => false,
+        };
+        let is_object = self.match_identifier().is_some()
+            && self.check(&Token::Colon)
+            && !first_is_class;
         self.pos = saved; // 回退
 
         if is_object {
@@ -2307,6 +2339,11 @@ fn expr_as_dotted_name(expr: &Expression) -> String {
             let base = expr_as_dotted_name(object);
             if base.is_empty() {
                 member.clone()
+            } else if member == "^" {
+                // 注入器类型后缀 `Type^` 的 ^ 是类型标记，不是类名一部分
+                // （如 `GorgeFramework.FunctionCurve^ : {...}` 的类名应为
+                // `GorgeFramework.FunctionCurve`），否则物化端查不到类。
+                base
             } else {
                 format!("{}.{}", base, member)
             }

@@ -460,15 +460,42 @@ fn render_nine_slice(state: &InnerState, index: usize) {
 fn render_curve(state: &InnerState, index: usize) {
     let c = &state.curves[index];
     let color = to_macroquad_color(c.color);
+    // 一次性诊断：第一条非零曲线的 y 范围（区分直线与真实曲线）
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHAPE_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !SHAPE_LOGGED.load(Ordering::Relaxed) {
+        let (mut min_y, mut max_y, mut min_x, mut max_x) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for (x, y) in &c.points {
+            min_y = min_y.min(*y); max_y = max_y.max(*y);
+            min_x = min_x.min(*x); max_x = max_x.max(*x);
+        }
+        if max_y > min_y || max_x > min_x {
+            SHAPE_LOGGED.store(true, Ordering::Relaxed);
+            eprintln!(
+                "[Gorge] 曲线形状诊断 idx={} x=[{:.2},{:.2}] y=[{:.2},{:.2}] 点数={}",
+                index, min_x, max_x, min_y, max_y, c.points.len(),
+            );
+        }
+    }
+    // 线宽与坐标同尺度缩放（谱面 width 单位，如 0.1），并保底 1px，
+    // 否则默认 0.1px 的判定线在屏幕上不可见。
+    let line_width = (c.width * 64.0).max(1.0);
+    // 谱面坐标 → 屏幕坐标（平台适配）：
+    // 判定线谱面 x 约 -10~10（横贯）、y 为曲线偏移（-25~163），
+    // 以 1280x720 视口中心为原点：x 每单位 64px、y 每单位 4px（y 向下）。
+    let center_x = 640.0;
+    let center_y = 360.0;
+    let scale_x = 64.0;
+    let scale_y = 4.0;
     for j in 1..c.points.len() {
         let (x0, y0) = c.points[j - 1];
         let (x1, y1) = c.points[j];
         draw_line(
-            c.position.0 + x0 * c.scale.0,
-            c.position.1 + y0 * c.scale.1,
-            c.position.0 + x1 * c.scale.0,
-            c.position.1 + y1 * c.scale.1,
-            c.width,
+            center_x + (c.position.0 + x0) * scale_x,
+            center_y + (c.position.1 + y0) * scale_y,
+            center_x + (c.position.0 + x1) * scale_x,
+            center_y + (c.position.1 + y1) * scale_y,
+            line_width,
             color,
         );
     }
@@ -606,9 +633,9 @@ impl ICurveSprite for MacroquadCurve {
         }
     }
 
-    fn set_line(&self, point_count: usize) {
+    fn set_points(&self, points: &[(f32, f32)]) {
         if let Some(c) = self.state.lock().unwrap().curves.get_mut(self.index) {
-            c.points.resize(point_count, (0.0, 0.0));
+            c.points = points.to_vec();
         }
     }
 
@@ -948,7 +975,7 @@ mod tests {
         let platform = MacroquadPlatform::new();
 
         let cs = platform.create_curve_sprite();
-        cs.set_line(3);
+        cs.set_points(&[(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]);
         cs.set_width(5.0);
         cs.set_color(50, 100, 200, 255);
         cs.set_position(0.0, 0.0, 1.0);
@@ -956,7 +983,7 @@ mod tests {
         {
             let state = platform.state.lock().unwrap();
             let c = &state.curves[0];
-            assert_eq!(c.points.len(), 3);
+            assert_eq!(c.points, vec![(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]);
             assert_eq!(c.width, 5.0);
             assert_eq!(c.color, (50, 100, 200, 255));
             assert_eq!(c.position, (0.0, 0.0, 1.0));

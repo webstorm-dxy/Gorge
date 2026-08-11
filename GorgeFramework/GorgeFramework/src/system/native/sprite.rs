@@ -22,39 +22,21 @@ pub struct Sprite {
     /// 存活依赖（Node 对象 ID）
     #[gorge_field]
     pub existence_reference: usize,
-    /// 局部位置 x
+    /// 局部位置（Vector3 对象 ID）
     #[gorge_field]
-    pub position_x: f32,
-    /// 局部位置 y
-    #[gorge_field]
-    pub position_y: f32,
-    /// 局部位置 z
-    #[gorge_field]
-    pub position_z: f32,
+    pub position: usize,
     /// 位置引用（Node 对象 ID）
     #[gorge_field]
     pub position_reference: usize,
-    /// 局部旋转 x
+    /// 局部旋转（Vector3 对象 ID）
     #[gorge_field]
-    pub rotation_x: f32,
-    /// 局部旋转 y
-    #[gorge_field]
-    pub rotation_y: f32,
-    /// 局部旋转 z
-    #[gorge_field]
-    pub rotation_z: f32,
+    pub rotation: usize,
     /// 旋转引用
     #[gorge_field]
     pub rotation_reference: usize,
-    /// 局部缩放 x
+    /// 局部缩放（Vector3 对象 ID）
     #[gorge_field]
-    pub size_x: f32,
-    /// 局部缩放 y
-    #[gorge_field]
-    pub size_y: f32,
-    /// 局部缩放 z
-    #[gorge_field]
-    pub size_z: f32,
+    pub size: usize,
     /// 缩放引用
     #[gorge_field]
     pub size_reference: usize,
@@ -74,17 +56,11 @@ impl Sprite {
         // Node 字段初始化
         ctx.set_object_bool_field(this, Sprite::FIELD_INDEX_alive, true);
         ctx.set_object_object_field(this, Sprite::FIELD_INDEX_existence_reference, 0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_position_x, 0.0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_position_y, 0.0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_position_z, 0.0);
+        ctx.set_object_object_field(this, Sprite::FIELD_INDEX_position, 0);
         ctx.set_object_object_field(this, Sprite::FIELD_INDEX_position_reference, 0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_rotation_x, 0.0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_rotation_y, 0.0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_rotation_z, 0.0);
+        ctx.set_object_object_field(this, Sprite::FIELD_INDEX_rotation, 0);
         ctx.set_object_object_field(this, Sprite::FIELD_INDEX_rotation_reference, 0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_size_x, 1.0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_size_y, 1.0);
-        ctx.set_object_float_field(this, Sprite::FIELD_INDEX_size_z, 1.0);
+        ctx.set_object_object_field(this, Sprite::FIELD_INDEX_size, 0);
         ctx.set_object_object_field(this, Sprite::FIELD_INDEX_size_reference, 0);
         // Sprite 字段
         ctx.set_object_object_field(this, Sprite::FIELD_INDEX_graph, graph);
@@ -109,15 +85,15 @@ impl Sprite {
         }
 
         // 先读取所有字段值（避免与 get_payload_mut 的借用冲突）
-        let px = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_position_x) as f32;
-        let py = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_position_y) as f32;
-        let pz = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_position_z) as f32;
-        let rx = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_rotation_x) as f32;
-        let ry = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_rotation_y) as f32;
-        let rz = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_rotation_z) as f32;
-        let sx = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_size_x) as f32;
-        let sy = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_size_y) as f32;
-        let sz = ctx.get_object_float_field(this, Sprite::FIELD_INDEX_size_z) as f32;
+        let (px, py, pz) = crate::system::native::node_native::Node::read_vec3_field(
+            ctx, this, Sprite::FIELD_INDEX_position, false,
+        );
+        let (rx, ry, rz) = crate::system::native::node_native::Node::read_vec3_field(
+            ctx, this, Sprite::FIELD_INDEX_rotation, false,
+        );
+        let (sx, sy, sz) = crate::system::native::node_native::Node::read_vec3_field(
+            ctx, this, Sprite::FIELD_INDEX_size, true,
+        );
         let graph = ctx.get_object_object_field(this, Sprite::FIELD_INDEX_graph);
         let color_id = ctx.get_object_object_field(this, Sprite::FIELD_INDEX_color);
         let (ca, cr, cg, cb) = read_color_channels(ctx, color_id);
@@ -170,17 +146,17 @@ mod tests {
 
         let s = Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         };
         let mut vm = make_vm();
         vm.register_native_class(s.full_name(), std::sync::Arc::new(Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         }));
 
@@ -191,10 +167,23 @@ mod tests {
 
         // 设置位置
         {
+            let vec3_id = vm.next_object_id;
+            vm.next_object_id += 1;
+            vm.objects.insert(
+                vec3_id,
+                gorge_core::objective::object::RuntimeObject::new_simple(
+                    "GorgeFramework.Vector3".into(),
+                    &gorge_core::objective::types::TypeCount {
+                        float_count: 3,
+                        ..gorge_core::objective::types::TypeCount::zero()
+                    },
+                ),
+            );
             let mut ctx = NativeContext::new(&mut vm);
-            ctx.set_object_float_field(id, Sprite::FIELD_INDEX_position_x, 100.0);
-            ctx.set_object_float_field(id, Sprite::FIELD_INDEX_position_y, 200.0);
-            ctx.set_object_float_field(id, Sprite::FIELD_INDEX_position_z, 0.0);
+            ctx.set_object_float_field(vec3_id, 0, 100.0);
+            ctx.set_object_float_field(vec3_id, 1, 200.0);
+            ctx.set_object_float_field(vec3_id, 2, 0.0);
+            ctx.set_object_object_field(id, Sprite::FIELD_INDEX_position, vec3_id);
         }
 
         // UpdateNode
@@ -212,17 +201,17 @@ mod tests {
 
         let s = Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         };
         let mut vm = make_vm();
         vm.register_native_class(s.full_name(), std::sync::Arc::new(Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         }));
 
@@ -241,17 +230,17 @@ mod tests {
 
         let s = Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         };
         let mut vm = make_vm();
         vm.register_native_class(s.full_name(), std::sync::Arc::new(Sprite {
             alive: true, existence_reference: 0,
-            position_x: 0.0, position_y: 0.0, position_z: 0.0, position_reference: 0,
-            rotation_x: 0.0, rotation_y: 0.0, rotation_z: 0.0, rotation_reference: 0,
-            size_x: 1.0, size_y: 1.0, size_z: 1.0, size_reference: 0,
+            position: 0, position_reference: 0,
+            rotation: 0, rotation_reference: 0,
+            size: 0, size_reference: 0,
             graph: 0, color: 0,
         }));
 

@@ -38,6 +38,14 @@ pub fn read_color_channels(ctx: &NativeContext, color_id: usize) -> (f32, f32, f
     if color_id == 0 {
         return (1.0, 1.0, 1.0, 1.0);
     }
+    // 防御：color 字段指向非 ColorArgb 对象（字段不足）时回退白色，
+    // 避免 UpdateNode 因布局不一致而越界 panic
+    let float_count = ctx.vm.objects.get(&color_id)
+        .map(|o| o.native_field_bounds.float_count + o.compiled_fields.floats.len())
+        .unwrap_or(0);
+    if float_count < 4 {
+        return (1.0, 1.0, 1.0, 1.0);
+    }
     let a = ctx.get_object_float_field(color_id, ColorArgb::FIELD_INDEX_a) as f32;
     let r = ctx.get_object_float_field(color_id, ColorArgb::FIELD_INDEX_r) as f32;
     let g = ctx.get_object_float_field(color_id, ColorArgb::FIELD_INDEX_g) as f32;

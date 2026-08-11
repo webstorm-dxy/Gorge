@@ -593,6 +593,14 @@ pub enum Expression {
         args: Vec<Expression>,
         span: Span,
     },
+    /// 动态注入器构造 `new expr(args)`：目标表达式是运行时的注入器
+    /// 对象（如注入器数组元素 `laneLines[i]`），按 C# 语义从该注入器
+    /// 构造具体类实例。
+    DynamicNew {
+        target: Box<Expression>,
+        args: Vec<Expression>,
+        span: Span,
+    },
 }
 
 impl Expression {
@@ -623,6 +631,7 @@ impl Expression {
             Expression::Null(span) => *span,
             Expression::InjectorFieldRef(_, span) => *span,
             Expression::InjectorNew { span, .. } => *span,
+            Expression::DynamicNew { span, .. } => *span,
         }
     }
 }

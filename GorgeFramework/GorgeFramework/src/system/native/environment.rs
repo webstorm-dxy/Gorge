@@ -181,7 +181,15 @@ impl Environment {
     pub fn find_alive_lane(_ctx: &mut NativeContext, type_name: String, lane_name: String) -> usize {
         crate::runtime::environment::global::with_env_global(|env| {
             env.alive_elements.iter()
-                .find(|info| info.class_name == type_name && info.name == lane_name)
+                // Demo 以短类名注册编译类，而谱面源码按全限定名查找
+                // （如 `FindAliveLane("Dremu.DremuMainLane", ...)`），
+                // 因此按全名/末段短名双向匹配，避免音符找不到判定线。
+                .find(|info| {
+                    info.name == lane_name
+                        && (info.class_name == type_name
+                            || info.class_name.rsplit('.').next() == Some(type_name.as_str())
+                            || type_name.rsplit('.').next() == Some(info.class_name.as_str()))
+                })
                 .map(|info| info.element_id)
                 .unwrap_or(0)
         })

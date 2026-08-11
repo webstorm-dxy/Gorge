@@ -152,7 +152,12 @@ pub struct ParameterInfo {
 pub struct InjectorFieldInfo {
     pub name: String,
     pub field_type: GorgeType,
+    /// 是否为数组字段（如 `FunctionCurve^[]`），供物化端单对象自动包装
+    pub is_array: bool,
     pub has_default_value: bool,
+    /// 字段默认值常量（`auto defaultValue = ...` 的编译产物）；
+    /// 物化注入器时对谱面未提供的字段应用此默认值。
+    pub default_value: Option<crate::objective::bytecode::InjectorConstField>,
 }
 
 /// 注解信息
